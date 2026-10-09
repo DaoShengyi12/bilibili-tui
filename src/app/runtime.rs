@@ -64,18 +64,21 @@ impl App {
         Ok(())
     }
 
+    fn current_page_uses_full_area(&self) -> bool {
+        match &self.current_page {
+            Page::Login(_)
+            | Page::VideoDetail(_)
+            | Page::DynamicDetail(_)
+            | Page::ArticleDetail(_)
+            | Page::BangumiDetail(_) => true,
+            Page::Up(page) => !page.is_sidebar_page,
+            _ => false,
+        }
+    }
+
     /// Get the content area excluding sidebar
     fn get_content_area(&self, area: Rect) -> Rect {
-        // Login page, VideoDetail, DynamicDetail, and BangumiDetail use full area
-        if matches!(
-            self.current_page,
-            Page::Login(_)
-                | Page::VideoDetail(_)
-                | Page::DynamicDetail(_)
-                | Page::ArticleDetail(_)
-                | Page::BangumiDetail(_)
-                | Page::Up(_)
-        ) {
+        if self.current_page_uses_full_area() {
             return area;
         }
 
@@ -96,16 +99,7 @@ impl App {
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
 
-        // Login page, VideoDetail, DynamicDetail, and BangumiDetail don't show sidebar
-        if matches!(
-            self.current_page,
-            Page::Login(_)
-                | Page::VideoDetail(_)
-                | Page::DynamicDetail(_)
-                | Page::ArticleDetail(_)
-                | Page::BangumiDetail(_)
-                | Page::Up(_)
-        ) {
+        if self.current_page_uses_full_area() {
             match &mut self.current_page {
                 Page::Login(page) => page.draw(frame, area, &self.theme, &self.keybindings),
                 Page::VideoDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
@@ -359,5 +353,127 @@ impl App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::minimal_app;
+    use crate::application::AppAction;
+    use crate::presentation::tui::{NavItem, SettingsPage, UpPage};
+
+    fn logged_in_minimal_app() -> App {
+        let (mut app, _commands) = minimal_app();
+        app.credentials = Some(crate::infrastructure::persistence::Credentials {
+            sessdata: String::new(),
+            bili_jct: String::new(),
+            dede_user_id: "1".into(),
+            dede_user_id_ckmd5: None,
+            refresh_token: None,
+        });
+        app
+    }
+
+    fn select_own_space(app: &mut App) {
+        app.sidebar.select(NavItem::MySpace);
+        app.current_page = Page::Up(Box::new(UpPage::new_sidebar(1)));
+    }
+
+    #[tokio::test]
+    async fn minimal_sidebar_tab_cycle_reaches_settings_after_own_space() {
+        let mut app = logged_in_minimal_app();
+        app.sidebar.select(NavItem::Settings);
+        app.current_page =
+            Page::Settings(Box::new(SettingsPage::default().with_minimal_mode(true)));
+        for expected in [
+            NavItem::Search,
+            NavItem::Dynamic,
+            NavItem::History,
+            NavItem::Favorites,
+            NavItem::MySpace,
+            NavItem::Settings,
+        ] {
+            app.handle_input(KeyCode::Tab, KeyModifiers::NONE).await;
+            assert_eq!(app.sidebar.selected, expected);
+        }
+        assert!(matches!(app.current_page, Page::Settings(_)));
+    }
+
+    #[tokio::test]
+    async fn minimal_sidebar_reverse_tab_crosses_own_space_while_loading() {
+        let mut app = logged_in_minimal_app();
+        app.sidebar.select(NavItem::Settings);
+        app.current_page = Page::Settings(Box::default());
+        app.handle_input(KeyCode::BackTab, KeyModifiers::SHIFT)
+            .await;
+        assert!(
+            matches!(&app.current_page, Page::Up(page) if page.is_sidebar_page && page.loading)
+        );
+        app.handle_input(KeyCode::BackTab, KeyModifiers::SHIFT)
+            .await;
+        assert_eq!(app.sidebar.selected, NavItem::Favorites);
+        assert!(matches!(app.current_page, Page::Favorites(_)));
+    }
+
+    #[tokio::test]
+    async fn minimal_own_space_escape_keeps_sidebar_navigation_reachable() {
+        let mut app = logged_in_minimal_app();
+        select_own_space(&mut app);
+        app.handle_input(KeyCode::Esc, KeyModifiers::NONE).await;
+        assert_eq!(app.sidebar.selected, NavItem::Favorites);
+        app.handle_input(KeyCode::Tab, KeyModifiers::NONE).await;
+        app.handle_input(KeyCode::Tab, KeyModifiers::NONE).await;
+        assert_eq!(app.sidebar.selected, NavItem::Settings);
+        assert!(matches!(app.current_page, Page::Settings(_)));
+    }
+
+    #[tokio::test]
+    async fn minimal_video_back_restores_own_space_before_tab_to_settings() {
+        let mut app = logged_in_minimal_app();
+        select_own_space(&mut app);
+        app.handle_action(AppAction::OpenVideoDetail("BV1test".into(), 1))
+            .await;
+        app.handle_input(KeyCode::Esc, KeyModifiers::NONE).await;
+        assert!(matches!(&app.current_page, Page::Up(page) if page.is_sidebar_page));
+        assert_eq!(app.sidebar.selected, NavItem::MySpace);
+        app.handle_input(KeyCode::Tab, KeyModifiers::NONE).await;
+        assert!(matches!(app.current_page, Page::Settings(_)));
+    }
+
+    #[tokio::test]
+    async fn minimal_own_space_error_keeps_configured_navigation_keys_working() {
+        let mut app = logged_in_minimal_app();
+        select_own_space(&mut app);
+        if let Page::Up(page) = &mut app.current_page {
+            page.set_error("加载失败".into());
+        }
+        app.keybindings.nav_next_page = "n".into();
+        app.handle_input(KeyCode::Char('n'), KeyModifiers::NONE)
+            .await;
+        assert_eq!(app.sidebar.selected, NavItem::Settings);
+        assert!(matches!(app.current_page, Page::Settings(_)));
+    }
+
+    #[tokio::test]
+    async fn minimal_own_space_draw_keeps_sidebar_and_content_area_consistent() {
+        let mut app = logged_in_minimal_app();
+        select_own_space(&mut app);
+        let area = Rect::new(0, 0, 100, 30);
+        assert_eq!(app.get_content_area(area), Rect::new(16, 0, 84, 30));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content.replace(' ', "").contains("我的主页"));
+        assert!(content.replace(' ', "").contains("设置"));
+        app.current_page = Page::Up(Box::new(UpPage::new(1)));
+        assert_eq!(app.get_content_area(area), area);
     }
 }

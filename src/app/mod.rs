@@ -181,7 +181,7 @@ mod tests {
     use crate::domain::playback::PlaybackEvent;
     use crate::presentation::tui::{FavoritesPage, HomePage, NavItem, Page, VideoDetailPage};
 
-    fn minimal_app() -> (
+    pub(super) fn minimal_app() -> (
         App,
         std::sync::mpsc::Receiver<crate::application::network::NetworkCommand>,
     ) {

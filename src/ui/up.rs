@@ -23,6 +23,8 @@ pub enum UpTab {
 
 pub struct UpPage {
     pub mid: i64,
+    /// Own space opened as a sidebar destination rather than a nested detail.
+    pub is_sidebar_page: bool,
     pub profile: Option<SpaceInfo>,
     pub relation: Option<RelationStat>,
     pub tab: UpTab,
@@ -48,6 +50,7 @@ impl UpPage {
     pub fn new(mid: i64) -> Self {
         Self {
             mid,
+            is_sidebar_page: false,
             profile: None,
             relation: None,
             tab: UpTab::Videos,
@@ -67,6 +70,13 @@ impl UpPage {
             loading: true,
             loading_more: false,
             error: None,
+        }
+    }
+
+    pub fn new_sidebar(mid: i64) -> Self {
+        Self {
+            is_sidebar_page: true,
+            ..Self::new(mid)
         }
     }
 
@@ -290,29 +300,47 @@ impl Component for UpPage {
             );
         }
 
+        let mut shortcuts = vec![
+            ("1/2".into(), "投稿/收藏夹".into(), theme.info),
+            (
+                format!("{}/{}", keys.page_up, keys.page_down),
+                "翻页".into(),
+                theme.fg_accent,
+            ),
+            ("o".into(), "最新/热门".into(), theme.info),
+            ("s".into(), "顺序/倒序/随机".into(), theme.info),
+            (keys.play.clone(), "连播".into(), theme.success),
+            (keys.confirm.clone(), "打开".into(), theme.success),
+            (keys.back.clone(), "返回".into(), theme.info),
+        ];
+        if self.is_sidebar_page {
+            shortcuts.insert(
+                0,
+                (
+                    format!("{}/{}", keys.nav_next_page, keys.nav_prev_page),
+                    "切换页面".into(),
+                    theme.info,
+                ),
+            );
+        }
         frame.render_widget(
-            Paragraph::new(shortcut_footer(
-                theme,
-                [
-                    ("1/2".into(), "投稿/收藏夹".into(), theme.info),
-                    (
-                        format!("{}/{}", keys.page_up, keys.page_down),
-                        "翻页".into(),
-                        theme.fg_accent,
-                    ),
-                    ("o".into(), "最新/热门".into(), theme.info),
-                    ("s".into(), "顺序/倒序/随机".into(), theme.info),
-                    (keys.play.clone(), "连播".into(), theme.success),
-                    (keys.confirm.clone(), "打开".into(), theme.success),
-                    (keys.back.clone(), "返回".into(), theme.info),
-                ],
-            ))
-            .alignment(Alignment::Center),
+            Paragraph::new(shortcut_footer(theme, shortcuts)).alignment(Alignment::Center),
             chunks[3],
         );
     }
 
     fn handle_input(&mut self, key: KeyCode, keys: &Keybindings) -> Option<AppAction> {
+        if self.is_sidebar_page {
+            if keys.matches_nav_next(key) {
+                return Some(AppAction::NavNext);
+            }
+            if keys.matches_nav_prev(key) {
+                return Some(AppAction::NavPrev);
+            }
+            if keys.matches_quit(key) {
+                return Some(AppAction::Quit);
+            }
+        }
         if keys.matches_back(key) || keys.matches_quit(key) {
             if self.tab == UpTab::Favorites && self.pending_folder.take().is_some() {
                 self.loading = false;
@@ -322,7 +350,11 @@ impl Component for UpPage {
                 self.favorite_videos.clear();
                 return Some(AppAction::None);
             }
-            return Some(AppAction::BackToList);
+            return Some(if self.is_sidebar_page {
+                AppAction::NavPrev
+            } else {
+                AppAction::BackToList
+            });
         }
         match key {
             KeyCode::Char('1') => {
@@ -487,5 +519,41 @@ mod tests {
         assert!(matches!(action, Some(AppAction::None)));
         assert_eq!(page.pending_folder, None);
         assert!(!page.loading);
+    }
+}
+
+#[cfg(test)]
+mod sidebar_navigation_tests {
+    use super::*;
+
+    #[test]
+    fn nested_up_page_preserves_detail_tab_and_back_behavior() {
+        let keys = Keybindings::default();
+        let mut page = UpPage::new(1);
+        assert!(matches!(
+            page.handle_input(KeyCode::Tab, &keys),
+            Some(AppAction::None)
+        ));
+        assert!(matches!(
+            page.handle_input(KeyCode::Esc, &keys),
+            Some(AppAction::BackToList)
+        ));
+    }
+
+    #[test]
+    fn own_space_folder_escape_stays_on_sidebar_page_before_leaving() {
+        let keys = Keybindings::default();
+        let mut page = UpPage::new_sidebar(1);
+        page.tab = UpTab::Favorites;
+        page.pending_folder = Some(2);
+        assert!(matches!(
+            page.handle_input(KeyCode::Esc, &keys),
+            Some(AppAction::None)
+        ));
+        assert!(!page.loading);
+        assert!(matches!(
+            page.handle_input(KeyCode::Esc, &keys),
+            Some(AppAction::NavPrev)
+        ));
     }
 }

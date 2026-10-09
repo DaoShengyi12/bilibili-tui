@@ -1090,7 +1090,7 @@ impl App {
                     .as_ref()
                     .and_then(|credentials| credentials.dede_user_id.parse::<i64>().ok())
                 {
-                    let page = UpPage::new(mid);
+                    let page = UpPage::new_sidebar(mid);
                     self.current_page = Page::Up(Box::new(page));
                     let req_id = self.next_request_id("up_page");
                     self.send_network_command(network::NetworkCommand::LoadUpPage {
