@@ -49,6 +49,8 @@ pub struct SettingsPage {
     pub is_logged_in: bool,
     pub danmaku: DanmakuConfig,
     pub auto_play: bool,
+    pub minimal_mode: bool,
+    pub minimal_mode_error: Option<String>,
     pub video_quality: VideoQuality,
     section_index: usize,
     pub editing_keybind: bool,
@@ -85,6 +87,8 @@ impl SettingsPage {
             is_logged_in,
             danmaku,
             auto_play,
+            minimal_mode: false,
+            minimal_mode_error: None,
             video_quality,
             section_index: 0,
             editing_keybind: false,
@@ -93,6 +97,11 @@ impl SettingsPage {
             theme_scroll: 0,
             keybind_scroll: 0,
         }
+    }
+
+    pub fn with_minimal_mode(mut self, enabled: bool) -> Self {
+        self.minimal_mode = enabled;
+        self
     }
 
     fn keybind_labels(&self) -> Vec<(&'static str, &str)> {
@@ -374,7 +383,7 @@ impl Component for SettingsPage {
                         (self.selected_danmaku_index + 1).min(Self::DANMAKU_ROWS - 1);
                 }
                 SettingsSection::Playback => {
-                    self.selected_playback_index = (self.selected_playback_index + 1).min(1);
+                    self.selected_playback_index = (self.selected_playback_index + 1).min(2);
                 }
                 SettingsSection::Account => {}
             }
@@ -428,6 +437,10 @@ impl SettingsPage {
             0 => {
                 self.auto_play = !self.auto_play;
                 AppAction::SaveAutoPlay(self.auto_play)
+            }
+            2 => {
+                self.minimal_mode = !self.minimal_mode;
+                AppAction::SaveMinimalMode(self.minimal_mode)
             }
             _ => {
                 self.video_quality = self.video_quality.cycle(direction);
@@ -635,10 +648,18 @@ impl SettingsPage {
                 if self.auto_play { "开启" } else { "关闭" }
             ),
             format!("默认视频画质：{}", self.video_quality.label()),
+            format!(
+                "极简模式（屏蔽推荐流）：{}",
+                if self.minimal_mode {
+                    "开启"
+                } else {
+                    "关闭"
+                }
+            ),
         ];
 
         let chunks = Layout::vertical([
-            Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Min(0),
         ])
@@ -662,6 +683,19 @@ impl SettingsPage {
             Paragraph::new("  按 ←/→ 或 Enter 更改并立即保存")
                 .style(Style::default().fg(theme.fg_secondary)),
             chunks[1],
+        );
+        frame.render_widget(
+            Paragraph::new(
+                self.minimal_mode_error
+                    .as_deref()
+                    .unwrap_or("  极简模式保留搜索、关注动态、历史、收藏和我的主页"),
+            )
+            .style(Style::default().fg(if self.minimal_mode_error.is_some() {
+                theme.error
+            } else {
+                theme.fg_muted
+            })),
+            chunks[2],
         );
     }
 
@@ -763,7 +797,11 @@ impl SettingsPage {
 
         // Scroll hint when there are more items
         if self.theme_choices.len() > visible {
-            let hint = format!(" {}/{} ", self.selected_theme_index + 1, self.theme_choices.len());
+            let hint = format!(
+                " {}/{} ",
+                self.selected_theme_index + 1,
+                self.theme_choices.len()
+            );
             let hint_area = Rect {
                 x: inner.x + inner.width.saturating_sub(hint.len() as u16 + 1),
                 y: inner.y + inner.height.saturating_sub(1),
@@ -954,6 +992,27 @@ mod tests {
         page.handle_input(KeyCode::Esc, &keys);
         assert!(!page.editing_keybind);
         assert_eq!(page.keybindings.quit, original);
+    }
+
+    #[test]
+    fn minimal_mode_row_toggles_and_emits_save_action() {
+        let keys = Keybindings::default();
+        let mut page = SettingsPage {
+            current_section: SettingsSection::Playback,
+            selected_playback_index: 1,
+            ..SettingsPage::default()
+        };
+        page.handle_input(KeyCode::Down, &keys);
+        assert_eq!(page.selected_playback_index, 2);
+        assert!(matches!(
+            page.handle_input(KeyCode::Enter, &keys),
+            Some(AppAction::SaveMinimalMode(true))
+        ));
+        assert!(page.minimal_mode);
+        assert!(matches!(
+            page.handle_input(KeyCode::Left, &keys),
+            Some(AppAction::SaveMinimalMode(false))
+        ));
     }
 
     #[test]

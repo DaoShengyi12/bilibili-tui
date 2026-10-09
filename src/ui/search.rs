@@ -23,6 +23,7 @@ pub struct SearchPage {
     pub hotword_error: Option<String>,
     pub hotword_loading: bool,
     pub show_hot_list: bool,
+    hotwords_enabled: bool,
     hot_selected: Option<usize>,
     pub page: i32,
     pub total_results: i32,
@@ -43,6 +44,7 @@ impl SearchPage {
             hotword_error: None,
             hotword_loading: false,
             show_hot_list: true,
+            hotwords_enabled: true,
             hot_selected: None,
             page: 1,
             total_results: 0,
@@ -50,6 +52,15 @@ impl SearchPage {
             last_click_time: None,
             last_click_index: None,
         }
+    }
+
+    pub fn disable_hotwords(&mut self) {
+        self.hotwords_enabled = false;
+        self.show_hot_list = false;
+        self.hotword_loading = false;
+        self.hotwords.clear();
+        self.hot_selected = None;
+        self.hotword_error = None;
     }
 
     pub fn set_results(&mut self, results: Vec<SearchVideoItem>, total: i32) {
@@ -416,7 +427,7 @@ impl Component for SearchPage {
             match key {
                 KeyCode::Char(c) => {
                     self.query.push(c);
-                    self.show_hot_list = true;
+                    self.show_hot_list = self.hotwords_enabled;
                     if self.hot_selected.is_none() && !self.hotwords.is_empty() {
                         self.hot_selected = Some(0);
                     }
@@ -424,7 +435,7 @@ impl Component for SearchPage {
                 }
                 KeyCode::Backspace => {
                     self.query.pop();
-                    self.show_hot_list = true;
+                    self.show_hot_list = self.hotwords_enabled;
                     if self.hot_selected.is_none() && !self.hotwords.is_empty() {
                         self.hot_selected = Some(0);
                     }
@@ -492,7 +503,7 @@ impl Component for SearchPage {
             }
             if keys.matches_search_focus(key) {
                 self.input_mode = true;
-                self.show_hot_list = true;
+                self.show_hot_list = self.hotwords_enabled;
                 return Some(AppAction::None);
             }
             if keys.matches_nav_next(key) {
@@ -552,7 +563,7 @@ impl Component for SearchPage {
             }
             if keys.matches_search_focus(key) {
                 self.input_mode = true;
-                self.show_hot_list = true;
+                self.show_hot_list = self.hotwords_enabled;
                 if self.hot_selected.is_none() && !self.hotwords.is_empty() {
                     self.hot_selected = Some(0);
                 }
@@ -701,6 +712,27 @@ impl Component for SearchPage {
                 None
             }
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod minimal_mode_tests {
+    use super::*;
+
+    #[test]
+    fn typing_and_refocusing_search_keeps_hotwords_disabled() {
+        let mut page = SearchPage::new();
+        page.disable_hotwords();
+        let keys = Keybindings::default();
+        for key in [
+            KeyCode::Char('x'),
+            KeyCode::Backspace,
+            KeyCode::Esc,
+            KeyCode::Char('/'),
+        ] {
+            page.handle_input(key, &keys);
+            assert!(!page.show_hot_list);
         }
     }
 }

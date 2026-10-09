@@ -114,6 +114,7 @@ pub enum AppAction {
     SaveDanmakuConfig(Box<DanmakuConfig>),
     /// Save the auto-play-on-video-open preference.
     SaveAutoPlay(bool),
+    SaveMinimalMode(bool),
     SaveVideoQuality(VideoQuality),
     /// Logout and return to login page
     Logout,

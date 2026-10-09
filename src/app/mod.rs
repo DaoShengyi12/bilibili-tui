@@ -110,15 +110,20 @@ impl App {
             configured_theme_id
         };
 
-        // Always start from home. Login is now an optional flow.
-        let current_page = Page::Home(HomePage::new());
+        let current_page = if config.minimal_mode {
+            Page::Search(crate::presentation::tui::SearchPage::new())
+        } else {
+            Page::Home(HomePage::new())
+        };
+        let mut sidebar = Sidebar::new();
+        sidebar.set_minimal_mode(config.minimal_mode);
 
         Self {
             current_page,
             should_quit: false,
             api_client,
             credentials,
-            sidebar: Sidebar::new(),
+            sidebar,
             show_sidebar: true,
             previous_page: None,
             navigation_stack: Vec::new(),
@@ -175,6 +180,161 @@ mod tests {
     use crate::application::AppAction;
     use crate::domain::playback::PlaybackEvent;
     use crate::presentation::tui::{FavoritesPage, HomePage, NavItem, Page, VideoDetailPage};
+
+    fn minimal_app() -> (
+        App,
+        std::sync::mpsc::Receiver<crate::application::network::NetworkCommand>,
+    ) {
+        let mut app = App::new();
+        app.config.minimal_mode = true;
+        app.sidebar.set_minimal_mode(true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.network_command_tx = tx;
+        (app, rx)
+    }
+
+    #[tokio::test]
+    async fn minimal_startup_and_back_navigation_do_not_request_recommendations() {
+        let (mut app, rx) = minimal_app();
+        app.current_page = Page::Home(HomePage::new());
+        app.init_current_page().await;
+        assert!(
+            matches!(&app.current_page, Page::Search(page) if !page.show_hot_list && !page.hotword_loading)
+        );
+        app.handle_action(AppAction::BackToList).await;
+        assert!(matches!(app.current_page, Page::Search(_)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn minimal_mode_rejects_feed_actions_before_sending_requests() {
+        let (mut app, rx) = minimal_app();
+        app.current_page = Page::Search(crate::presentation::tui::SearchPage::new());
+        for action in [
+            AppAction::SwitchToHome,
+            AppAction::RefreshHome,
+            AppAction::SwitchHomeFeed(crate::api::recommend::HomeFeed::Popular),
+            AppAction::LoadMoreRecommendations,
+            AppAction::SwitchToLive,
+            AppAction::RefreshLive,
+            AppAction::LoadMoreLive,
+            AppAction::SwitchToBangumi,
+            AppAction::RefreshBangumi,
+            AppAction::LoadMoreBangumi,
+        ] {
+            app.handle_action(action).await;
+            assert!(matches!(app.current_page, Page::Search(_)));
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn minimal_video_details_disable_related_requests_and_keep_search_navigation() {
+        use crate::application::network::NetworkCommand;
+        let (mut app, rx) = minimal_app();
+        app.current_page = Page::Search(crate::presentation::tui::SearchPage::new());
+        app.handle_action(AppAction::OpenVideoDetail("BV1test".into(), 1))
+            .await;
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            NetworkCommand::LoadVideoDetail {
+                include_related: false,
+                ..
+            }
+        ));
+        assert!(
+            matches!(&app.current_page, Page::VideoDetail(page) if !page.recommendations_enabled)
+        );
+        app.handle_action(AppAction::BackToList).await;
+        assert!(matches!(app.current_page, Page::Search(_)));
+    }
+
+    #[tokio::test]
+    async fn minimal_mode_keeps_explicit_search_requests() {
+        let (mut app, rx) = minimal_app();
+        app.current_page = Page::Search(crate::presentation::tui::SearchPage::new());
+        app.init_current_page().await;
+        app.handle_action(AppAction::Search("rust".into())).await;
+        assert!(
+            matches!(rx.try_recv().unwrap(), crate::application::network::NetworkCommand::Search { keyword, page: 1, .. } if keyword == "rust")
+        );
+    }
+
+    #[tokio::test]
+    async fn minimal_mode_keeps_followed_dynamics_and_own_space_accessible() {
+        let (mut app, rx) = minimal_app();
+        app.credentials = Some(crate::infrastructure::persistence::Credentials {
+            sessdata: String::new(),
+            bili_jct: String::new(),
+            dede_user_id: "1".into(),
+            dede_user_id_ckmd5: None,
+            refresh_token: None,
+        });
+        app.sidebar.select(NavItem::Search);
+        app.current_page = Page::Search(crate::presentation::tui::SearchPage::new());
+        app.handle_action(AppAction::NavNext).await;
+        assert!(matches!(app.current_page, Page::Dynamic(_)));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            crate::application::network::NetworkCommand::CancelPending
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            crate::application::network::NetworkCommand::LoadDynamicInit { .. }
+        ));
+        app.sidebar.select(NavItem::Favorites);
+        app.handle_action(AppAction::NavNext).await;
+        assert!(matches!(&app.current_page, Page::Up(page) if page.mid == 1));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            crate::application::network::NetworkCommand::CancelPending
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            crate::application::network::NetworkCommand::LoadUpPage { mid: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabling_minimal_mode_restores_home_and_hotword_requests() {
+        let (mut app, rx) = minimal_app();
+        app.current_page = Page::Search(crate::presentation::tui::SearchPage::new());
+        app.apply_minimal_mode(false);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            crate::application::network::NetworkCommand::CancelPending
+        ));
+        app.handle_action(AppAction::SwitchToHome).await;
+        assert!(matches!(app.current_page, Page::Home(_)));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            crate::application::network::NetworkCommand::LoadHome { .. }
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            crate::application::network::NetworkCommand::LoadHotwords { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn enabling_minimal_mode_discards_cached_feeds_and_invalidates_pending_results() {
+        let (mut app, rx) = minimal_app();
+        let old_req_id = app.next_request_id("hotwords");
+        app.cached_home = Some(HomePage::new());
+        app.cached_bangumi = Some(crate::presentation::tui::BangumiPage::new());
+        app.navigation_stack.push(Page::Home(HomePage::new()));
+        app.previous_page = Some(super::PreviousPage::Home);
+        app.apply_minimal_mode(true);
+        assert!(app.cached_home.is_none() && app.cached_bangumi.is_none());
+        assert!(app.navigation_stack.is_empty() && app.previous_page.is_none());
+        assert!(!app.is_latest_request("hotwords", old_req_id));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            crate::application::network::NetworkCommand::CancelPending
+        ));
+        app.apply_minimal_mode(false);
+        assert_eq!(app.sidebar.items(), NavItem::all());
+    }
 
     #[test]
     fn request_tracking_latest_wins_per_key() {

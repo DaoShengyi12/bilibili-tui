@@ -48,6 +48,23 @@ impl App {
     }
 
     pub(super) async fn handle_action(&mut self, action: AppAction) {
+        if self.config.minimal_mode
+            && matches!(
+                action,
+                AppAction::SwitchToHome
+                    | AppAction::RefreshHome
+                    | AppAction::SwitchHomeFeed(_)
+                    | AppAction::LoadMoreRecommendations
+                    | AppAction::SwitchToLive
+                    | AppAction::RefreshLive
+                    | AppAction::LoadMoreLive
+                    | AppAction::SwitchToBangumi
+                    | AppAction::RefreshBangumi
+                    | AppAction::LoadMoreBangumi
+            )
+        {
+            return;
+        }
         match action {
             AppAction::Quit => self.should_quit = true,
             AppAction::SwitchToHome => {
@@ -279,7 +296,9 @@ impl App {
                 }
             }
             AppAction::OpenVideoDetail(bvid, aid) => {
-                let detail_page = crate::presentation::tui::VideoDetailPage::new(bvid.clone(), aid);
+                let mut detail_page =
+                    crate::presentation::tui::VideoDetailPage::new(bvid.clone(), aid);
+                detail_page.recommendations_enabled = !self.config.minimal_mode;
                 let previous = std::mem::replace(
                     &mut self.current_page,
                     Page::VideoDetail(Box::new(detail_page)),
@@ -290,6 +309,7 @@ impl App {
                     req_id,
                     bvid,
                     aid,
+                    include_related: !self.config.minimal_mode,
                 });
             }
             AppAction::OpenUpPage(mid) => {
@@ -471,6 +491,11 @@ impl App {
                             self.current_page = Page::Home(HomePage::new());
                             self.init_current_page().await;
                         }
+                    }
+                    Some(PreviousPage::Search) if self.config.minimal_mode => {
+                        self.sidebar.select(NavItem::Search);
+                        self.current_page = Page::Search(SearchPage::new());
+                        self.init_current_page().await;
                     }
                     Some(PreviousPage::Search) => {
                         // Search now lives inside Home; return there with the search pane open.
@@ -733,7 +758,8 @@ impl App {
                     self.config.danmaku.clone(),
                     self.config.auto_play,
                     self.config.video_quality,
-                );
+                )
+                .with_minimal_mode(self.config.minimal_mode);
                 self.current_page = Page::Settings(Box::new(page));
             }
             AppAction::Logout => {
@@ -814,6 +840,23 @@ impl App {
                 self.danmaku_config_tx
                     .send_replace(self.config.danmaku.clone());
                 let _ = persistence::save_config(&self.config);
+            }
+            AppAction::SaveMinimalMode(enabled) => {
+                self.apply_minimal_mode(enabled);
+                let save_failed = persistence::save_config(&self.config).is_err();
+                if let Page::Settings(page) = &mut self.current_page {
+                    page.minimal_mode = enabled;
+                    page.minimal_mode_error = save_failed
+                        .then(|| "极简模式已生效，但保存失败；请检查配置目录权限".to_string());
+                }
+                if !matches!(self.current_page, Page::Settings(_)) {
+                    self.current_page = if enabled {
+                        Page::Search(SearchPage::new())
+                    } else {
+                        Page::Home(HomePage::new())
+                    };
+                    self.init_current_page().await;
+                }
             }
             AppAction::SaveAutoPlay(enabled) => {
                 self.config.auto_play = enabled;
@@ -1041,6 +1084,35 @@ impl App {
                     }
                 }
             }
+            NavItem::MySpace => {
+                if let Some(mid) = self
+                    .credentials
+                    .as_ref()
+                    .and_then(|credentials| credentials.dede_user_id.parse::<i64>().ok())
+                {
+                    let page = UpPage::new(mid);
+                    self.current_page = Page::Up(Box::new(page));
+                    let req_id = self.next_request_id("up_page");
+                    self.send_network_command(network::NetworkCommand::LoadUpPage {
+                        req_id,
+                        mid,
+                        order: crate::api::space::SpaceVideoOrder::Latest,
+                    });
+                } else {
+                    self.sidebar.select(NavItem::Settings);
+                    self.current_page = Page::Settings(Box::new(
+                        SettingsPage::new(
+                            self.keybindings.clone(),
+                            self.theme_id.clone(),
+                            false,
+                            self.config.danmaku.clone(),
+                            self.config.auto_play,
+                            self.config.video_quality,
+                        )
+                        .with_minimal_mode(self.config.minimal_mode),
+                    ));
+                }
+            }
             NavItem::Search => {
                 if !matches!(self.current_page, Page::Search(_)) {
                     self.current_page = Page::Search(SearchPage::new());
@@ -1070,14 +1142,17 @@ impl App {
                         self.init_current_page().await;
                     }
                 } else {
-                    self.current_page = Page::Settings(Box::new(SettingsPage::new(
-                        self.keybindings.clone(),
-                        self.theme_id.clone(),
-                        false,
-                        self.config.danmaku.clone(),
-                        self.config.auto_play,
-                        self.config.video_quality,
-                    )));
+                    self.current_page = Page::Settings(Box::new(
+                        SettingsPage::new(
+                            self.keybindings.clone(),
+                            self.theme_id.clone(),
+                            false,
+                            self.config.danmaku.clone(),
+                            self.config.auto_play,
+                            self.config.video_quality,
+                        )
+                        .with_minimal_mode(self.config.minimal_mode),
+                    ));
                 }
             }
             NavItem::Settings => {
@@ -1089,7 +1164,8 @@ impl App {
                         self.config.danmaku.clone(),
                         self.config.auto_play,
                         self.config.video_quality,
-                    );
+                    )
+                    .with_minimal_mode(self.config.minimal_mode);
                     self.current_page = Page::Settings(Box::new(page));
                 }
             }
@@ -1113,6 +1189,15 @@ impl App {
     }
 
     pub(super) async fn init_current_page(&mut self) {
+        if self.config.minimal_mode
+            && matches!(
+                self.current_page,
+                Page::Home(_) | Page::Live(_) | Page::Bangumi(_)
+            )
+        {
+            self.sidebar.select(NavItem::Search);
+            self.current_page = Page::Search(SearchPage::new());
+        }
         match &mut self.current_page {
             Page::Login(page) => {
                 let client = self.api_client.clone();
@@ -1145,6 +1230,10 @@ impl App {
                 });
             }
             Page::Search(page) => {
+                if self.config.minimal_mode {
+                    page.disable_hotwords();
+                    return;
+                }
                 page.start_hotword_loading();
                 let req_id = self.next_request_id("hotwords");
                 self.send_network_command(network::NetworkCommand::LoadHotwords { req_id });
@@ -1207,6 +1296,26 @@ impl App {
                 // UpPage is initialized by OpenUpPage with an identity-bound request.
             }
         }
+    }
+
+    pub(super) fn apply_minimal_mode(&mut self, enabled: bool) {
+        self.config.minimal_mode = enabled;
+        self.sidebar.set_minimal_mode(enabled);
+        self.cached_home = None;
+        self.cached_bangumi = None;
+        self.navigation_stack.clear();
+        self.previous_page = None;
+        for key in [
+            "home",
+            "home_more",
+            "hotwords",
+            "live_init",
+            "live_more",
+            "bangumi_index",
+        ] {
+            self.next_request_id(key);
+        }
+        self.send_network_command(network::NetworkCommand::CancelPending);
     }
 
     fn save_theme_to_config(&mut self) {

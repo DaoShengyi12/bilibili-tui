@@ -28,6 +28,7 @@ pub struct VideoDetailPage {
     pub video_info: Option<VideoInfo>,
     pub comments: Vec<CommentItem>,
     pub related_videos: Vec<RelatedVideoItem>,
+    pub recommendations_enabled: bool,
     pub related_card_grid: VideoCardGrid,
     pub loading: bool,
     pub error_message: Option<String>,
@@ -64,6 +65,7 @@ impl VideoDetailPage {
             video_info: None,
             comments: Vec::new(),
             related_videos: Vec::new(),
+            recommendations_enabled: true,
             related_card_grid,
             loading: true,
             error_message: None,
@@ -149,32 +151,33 @@ impl VideoDetailPage {
         }
 
         // Load related videos
-        match api_client.get_related_videos(&self.bvid).await {
-            Ok(videos) => {
-                self.related_videos = videos.clone();
-                // Populate video card grid
-                self.related_card_grid.clear();
-                for video in &videos {
-                    let card = VideoCard::new(
-                        video.bvid.clone(),
-                        video.aid,
-                        video.title.clone().unwrap_or_else(|| "无标题".to_string()),
-                        video.author_name().to_string(),
-                        video.format_views(),
-                        video.format_duration(),
-                        video.cover_url(),
-                    )
-                    .with_uploader_mid(video.owner.as_ref().and_then(|owner| owner.mid));
-                    self.related_card_grid.add_card(card);
+        if self.recommendations_enabled {
+            match api_client.get_related_videos(&self.bvid).await {
+                Ok(videos) => {
+                    self.related_videos = videos.clone();
+                    // Populate video card grid
+                    self.related_card_grid.clear();
+                    for video in &videos {
+                        let card = VideoCard::new(
+                            video.bvid.clone(),
+                            video.aid,
+                            video.title.clone().unwrap_or_else(|| "无标题".to_string()),
+                            video.author_name().to_string(),
+                            video.format_views(),
+                            video.format_duration(),
+                            video.cover_url(),
+                        )
+                        .with_uploader_mid(video.owner.as_ref().and_then(|owner| owner.mid));
+                        self.related_card_grid.add_card(card);
+                    }
                 }
-            }
-            Err(e) => {
-                if self.error_message.is_none() {
-                    self.error_message = Some(format!("加载相关视频失败: {}", e));
+                Err(e) => {
+                    if self.error_message.is_none() {
+                        self.error_message = Some(format!("加载相关视频失败: {}", e));
+                    }
                 }
             }
         }
-
         self.loading = false;
     }
 
@@ -673,6 +676,16 @@ impl Component for VideoDetailPage {
                         .border_type(BorderType::Rounded),
                 );
             frame.render_widget(error_widget, chunks[1]);
+        } else if !self.recommendations_enabled {
+            if self.has_multiple_pages() {
+                let content =
+                    Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+                        .split(chunks[1]);
+                self.render_comments(frame, content[0], theme);
+                self.render_episodes(frame, content[1], theme);
+            } else {
+                self.render_comments(frame, chunks[1], theme);
+            }
         } else {
             // Comments and Related split
             let content_chunks = Layout::default()
@@ -822,7 +835,13 @@ impl Component for VideoDetailPage {
         }
         // Tab switches focus between Comments, Episodes, and Related (page-specific, not nav)
         if key == KeyCode::Tab {
-            self.focus = if self.has_multiple_pages() {
+            self.focus = if !self.recommendations_enabled {
+                if self.has_multiple_pages() && self.focus == DetailFocus::Comments {
+                    DetailFocus::Episodes
+                } else {
+                    DetailFocus::Comments
+                }
+            } else if self.has_multiple_pages() {
                 match self.focus {
                     DetailFocus::Comments => DetailFocus::Episodes,
                     DetailFocus::Episodes => DetailFocus::Related,
@@ -1022,6 +1041,9 @@ impl Component for VideoDetailPage {
                     .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
                     .split(chunks[1]);
 
+                if !self.recommendations_enabled {
+                    return None;
+                }
                 let related_area = content_chunks[1];
 
                 if !related_area.contains(ratatui::layout::Position::new(event.column, event.row)) {
@@ -1077,5 +1099,64 @@ fn truncate_str(s: &str, max_len: usize) -> String {
             + "..."
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod minimal_mode_tests {
+    use super::*;
+
+    #[test]
+    fn minimal_mode_tab_never_focuses_related_videos() {
+        let mut page = VideoDetailPage::new("BV1test".into(), 1);
+        page.recommendations_enabled = false;
+        let keys = Keybindings::default();
+        for _ in 0..3 {
+            page.handle_input(KeyCode::Tab, &keys);
+            assert!(matches!(page.focus, DetailFocus::Comments));
+        }
+    }
+
+    #[test]
+    fn minimal_mode_keeps_multipart_episodes_in_tab_cycle() {
+        let mut page = VideoDetailPage::new("BV1test".into(), 1);
+        page.recommendations_enabled = false;
+        page.video_info = Some(serde_json::from_value(serde_json::json!({
+            "bvid": "BV1test", "aid": 1, "cid": 1, "title": "test", "owner": {"mid": 1, "name": "test", "face": ""},
+            "stat": {"view": 0, "danmaku": 0, "like": 0, "coin": 0, "favorite": 0, "share": 0},
+            "pages": [{"cid": 1, "page": 1, "part": "one", "duration": 10}, {"cid": 2, "page": 2, "part": "two", "duration": 10}]
+        })).unwrap());
+        let keys = Keybindings::default();
+        page.handle_input(KeyCode::Tab, &keys);
+        assert!(matches!(page.focus, DetailFocus::Episodes));
+        page.handle_input(KeyCode::Tab, &keys);
+        assert!(matches!(page.focus, DetailFocus::Comments));
+    }
+
+    #[test]
+    fn minimal_mode_draw_omits_recommendation_panel() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let mut page = VideoDetailPage::new("BV1test".into(), 1);
+        page.loading = false;
+        page.recommendations_enabled = false;
+        terminal
+            .draw(|frame| {
+                page.draw(
+                    frame,
+                    frame.area(),
+                    &Theme::default(),
+                    &Keybindings::default(),
+                )
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!content.contains("相关推荐"));
     }
 }

@@ -474,6 +474,9 @@ pub struct AppConfig {
     pub danmaku: DanmakuConfig,
     #[serde(default = "default_true")]
     pub auto_play: bool,
+    /// Hide recommendation feeds and start with intentional browsing.
+    #[serde(default)]
+    pub minimal_mode: bool,
     #[serde(default)]
     pub video_quality: VideoQuality,
 }
@@ -485,6 +488,7 @@ impl Default for AppConfig {
             keybindings: Keybindings::default(),
             danmaku: DanmakuConfig::default(),
             auto_play: true,
+            minimal_mode: false,
             video_quality: VideoQuality::default(),
         }
     }
@@ -682,6 +686,18 @@ mod config_tests {
         let config: AppConfig = serde_json::from_value(value).expect("legacy config");
         assert_eq!(config.danmaku, DanmakuConfig::default());
         assert_eq!(config.video_quality, VideoQuality::Best);
+        assert!(!config.minimal_mode);
+    }
+
+    #[test]
+    fn minimal_mode_round_trips() {
+        let config = AppConfig {
+            minimal_mode: true,
+            ..AppConfig::default()
+        };
+        let restored: AppConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert!(restored.minimal_mode);
     }
 
     #[test]

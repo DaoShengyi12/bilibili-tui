@@ -36,7 +36,7 @@ impl App {
                 }
             }
             network::NetworkEvent::HotwordsLoaded { req_id, hotwords } => {
-                if !self.is_latest_request("hotwords", req_id) {
+                if self.config.minimal_mode || !self.is_latest_request("hotwords", req_id) {
                     return;
                 }
                 match &mut self.current_page {
@@ -187,8 +187,11 @@ impl App {
                 video_info,
                 comments,
                 has_more_comments,
-                related_videos,
+                mut related_videos,
             } => {
+                if self.config.minimal_mode {
+                    related_videos.clear();
+                }
                 if !self.is_latest_request("video_detail", req_id) {
                     return;
                 }

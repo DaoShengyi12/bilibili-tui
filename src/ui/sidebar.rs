@@ -14,6 +14,7 @@ pub enum NavItem {
     Live,
     Bangumi,
     Settings,
+    MySpace,
 }
 
 impl NavItem {
@@ -26,6 +27,7 @@ impl NavItem {
             NavItem::Favorites => "⭐ 收藏夹",
             NavItem::Live => "📡 直播",
             NavItem::Bangumi => "🎬 番剧",
+            NavItem::MySpace => "👤 我的主页",
             NavItem::Settings => "⚙️ 设置",
         }
     }
@@ -45,12 +47,36 @@ impl NavItem {
 
 pub struct Sidebar {
     pub selected: NavItem,
+    minimal_mode: bool,
 }
 
 impl Sidebar {
     pub fn new() -> Self {
         Self {
             selected: NavItem::Home,
+            minimal_mode: false,
+        }
+    }
+
+    pub fn set_minimal_mode(&mut self, enabled: bool) {
+        self.minimal_mode = enabled;
+        if !self.items().contains(&self.selected) {
+            self.selected = self.items()[0];
+        }
+    }
+
+    pub fn items(&self) -> &'static [NavItem] {
+        if self.minimal_mode {
+            &[
+                NavItem::Search,
+                NavItem::Dynamic,
+                NavItem::History,
+                NavItem::Favorites,
+                NavItem::MySpace,
+                NavItem::Settings,
+            ]
+        } else {
+            NavItem::all()
         }
     }
 
@@ -114,7 +140,8 @@ impl Sidebar {
         frame.render_widget(separator, chunks[1]);
 
         // Nav items with modern block selection indicator
-        let items: Vec<ListItem> = NavItem::all()
+        let items: Vec<ListItem> = self
+            .items()
             .iter()
             .map(|item| {
                 let is_selected = *item == self.selected;
@@ -140,14 +167,14 @@ impl Sidebar {
     }
 
     pub fn next(&mut self) {
-        let items = NavItem::all();
+        let items = self.items();
         let current_idx = items.iter().position(|i| *i == self.selected).unwrap_or(0);
         let next_idx = (current_idx + 1) % items.len();
         self.selected = items[next_idx];
     }
 
     pub fn prev(&mut self) {
-        let items = NavItem::all();
+        let items = self.items();
         let current_idx = items.iter().position(|i| *i == self.selected).unwrap_or(0);
         let prev_idx = if current_idx == 0 {
             items.len() - 1
@@ -165,5 +192,33 @@ impl Sidebar {
 impl Default for Sidebar {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimal_mode_navigation_skips_recommendation_pages_in_both_directions() {
+        let mut sidebar = Sidebar::new();
+        sidebar.set_minimal_mode(true);
+        assert_eq!(sidebar.selected, NavItem::Search);
+        for &item in sidebar.items() {
+            assert!(!matches!(
+                item,
+                NavItem::Home | NavItem::Live | NavItem::Bangumi
+            ));
+        }
+        sidebar.prev();
+        assert_eq!(sidebar.selected, NavItem::Settings);
+        sidebar.next();
+        assert_eq!(sidebar.selected, NavItem::Search);
+        sidebar.select(NavItem::Favorites);
+        sidebar.next();
+        assert_eq!(sidebar.selected, NavItem::MySpace);
+        sidebar.set_minimal_mode(false);
+        assert_eq!(sidebar.items(), NavItem::all());
+        assert_eq!(sidebar.selected, NavItem::Home);
     }
 }

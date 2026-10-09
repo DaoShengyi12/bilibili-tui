@@ -85,6 +85,7 @@ bilibili-tui 是一个现代化的终端应用程序，让你能够在终端中�
 - **键位绑定**: Vim 风格的导航键位
 - **主题切换**: 实时切换界面主题
 - **配置持久化**: 自动保存用户偏好设置
+- **极简模式**: 在设置 → 播放中开启，保留搜索、关注动态、历史、收藏夹和我的主页；隐藏首页、直播及番剧推荐入口，停用搜索热词和视频相关推荐。默认关闭，重启后保留设置。
 - **账户管理**: 登录/登出账户管理
 
 ## 🛠️ 技术栈
@@ -419,6 +420,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 ```json
 {
   "theme": "silkcircuit-neon",
+  "minimal_mode": false,
   "keybindings": {
     "quit": "q",
     "nav_up": "k",

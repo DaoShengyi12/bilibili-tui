@@ -87,6 +87,7 @@ pub enum NetworkCommand {
         req_id: u64,
         bvid: String,
         aid: i64,
+        include_related: bool,
     },
     LoadUpPage {
         req_id: u64,
@@ -796,7 +797,12 @@ async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> 
                 Err(e) => failed(req_id, "live_more", e),
             }
         }
-        NetworkCommand::LoadVideoDetail { req_id, bvid, aid } => {
+        NetworkCommand::LoadVideoDetail {
+            req_id,
+            bvid,
+            aid,
+            include_related,
+        } => {
             let video_info = match api_client.get_video_info(&bvid).await {
                 Ok(info) => info,
                 Err(e) => return failed(req_id, "video_detail", e),
@@ -812,10 +818,14 @@ async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> 
                 }
                 Err(_) => (Vec::new(), false),
             };
-            let related_videos = api_client
-                .get_related_videos(&bvid)
-                .await
-                .unwrap_or_default();
+            let related_videos = if include_related {
+                api_client
+                    .get_related_videos(&bvid)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             NetworkEvent::VideoDetailLoaded {
                 req_id,
                 bvid,
