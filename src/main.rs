@@ -11,6 +11,9 @@ async fn main() -> io::Result<()> {
     let mut terminal = ratatui::init();
     terminal.clear()?;
 
+    // Must run before anything else reads stdin; see `init_image_picker`.
+    bilibili_tui::presentation::tui::init_image_picker();
+
     // Enable mouse capture
     execute!(std::io::stdout(), EnableMouseCapture)?;
 

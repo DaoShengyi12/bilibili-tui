@@ -229,7 +229,7 @@ pub struct VideoCardGrid {
 
 impl VideoCardGrid {
     pub fn new() -> Self {
-        let picker = Arc::new(Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()));
+        let picker = super::image_picker();
         let (cover_tx, cover_rx) = mpsc::channel(32);
 
         Self {

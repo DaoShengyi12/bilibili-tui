@@ -44,6 +44,57 @@ use ratatui::{
     prelude::{Color, Line, Modifier, Rect, Span, Style},
 };
 
+static IMAGE_PICKER: std::sync::OnceLock<std::sync::Arc<ratatui_image::picker::Picker>> =
+    std::sync::OnceLock::new();
+
+/// Query the terminal's image capabilities once, before the event loop reads
+/// stdin. The query reads terminal replies from stdin on a helper thread; doing
+/// it while crossterm is also reading lets crossterm consume the reply, so the
+/// helper times out but stays blocked in `read()` and swallows the next key.
+pub fn init_image_picker() {
+    use ratatui_image::picker::{Picker, cap_parser::QueryStdioOptions};
+    const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    IMAGE_PICKER.get_or_init(|| {
+        let started = std::time::Instant::now();
+        let picker = Picker::from_query_stdio_with_options(QueryStdioOptions {
+            timeout: QUERY_TIMEOUT,
+            ..QueryStdioOptions::default()
+        })
+        .unwrap_or_else(|_| Picker::halfblocks());
+        if started.elapsed() >= QUERY_TIMEOUT {
+            release_stalled_query_reader();
+        }
+        std::sync::Arc::new(picker)
+    });
+}
+
+/// A timed-out query (for example inside tmux without `allow-passthrough`,
+/// which drops the wrapped queries) leaves its helper thread blocked reading
+/// stdin. Ask for a plain Device Status Report, which every terminal and tmux
+/// answer natively, so that thread reads the reply and exits instead of
+/// consuming the user's first key.
+fn release_stalled_query_reader() {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    if stdout
+        .write_all(b"\x1b[5n")
+        .and_then(|()| stdout.flush())
+        .is_ok()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Shared image picker. Falls back to halfblocks without touching stdin when
+/// [`init_image_picker`] has not run (for example in tests).
+pub(crate) fn image_picker() -> std::sync::Arc<ratatui_image::picker::Picker> {
+    IMAGE_PICKER
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks()))
+}
+
 /// Build the centered, bracketed shortcut footer used across list pages.
 /// Each tuple is `(shortcut, label, color)`; shortcut text is emphasized while
 /// labels and brackets use the secondary foreground.

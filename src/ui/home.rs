@@ -180,7 +180,7 @@ impl HomePage {
     pub fn new() -> Self {
         // Try to detect terminal graphics protocol (Kitty/Sixel/iTerm2)
         // Fall back to halfblocks if detection fails
-        let picker = Arc::new(Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()));
+        let picker = super::image_picker();
 
         // Create channel for background image downloads
         let (cover_tx, cover_rx) = mpsc::channel(32);

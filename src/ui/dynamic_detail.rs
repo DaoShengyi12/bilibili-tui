@@ -51,7 +51,7 @@ pub struct DynamicDetailPage {
 
 impl DynamicDetailPage {
     pub fn new(dynamic_id: String) -> Self {
-        let picker = Arc::new(Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()));
+        let picker = super::image_picker();
         let (image_tx, image_rx) = mpsc::channel(8);
 
         Self {

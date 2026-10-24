@@ -71,7 +71,7 @@ impl HistoryPage {
     const INITIAL_VISIBLE_ROWS: usize = 3;
 
     pub fn new() -> Self {
-        let picker = Arc::new(Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()));
+        let picker = super::image_picker();
         let (tx, rx) = mpsc::channel(32);
 
         Self {
