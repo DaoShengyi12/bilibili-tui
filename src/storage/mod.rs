@@ -1,6 +1,6 @@
 //! Credential storage and persistence
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -467,18 +467,26 @@ impl Default for DanmakuConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub theme: String,
     pub keybindings: Keybindings,
-    #[serde(default)]
     pub danmaku: DanmakuConfig,
-    #[serde(default = "default_true")]
     pub auto_play: bool,
     /// Hide recommendation feeds and start with intentional browsing.
-    #[serde(default)]
     pub minimal_mode: bool,
-    #[serde(default)]
+    /// Unknown values (for example from a newer release) fall back to the
+    /// default instead of rejecting the whole config.
+    #[serde(deserialize_with = "deserialize_video_quality_lenient")]
     pub video_quality: VideoQuality,
+}
+
+fn deserialize_video_quality_lenient<'de, D>(deserializer: D) -> Result<VideoQuality, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 impl Default for AppConfig {
@@ -580,10 +588,6 @@ impl VideoQuality {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
-
 /// Get the config directory path
 fn get_config_dir() -> Result<PathBuf> {
     let config_dir = dirs::config_dir()
@@ -636,28 +640,52 @@ pub fn delete_credentials() -> Result<()> {
 pub fn save_config(config: &AppConfig) -> Result<()> {
     let path = get_config_path()?;
     let json = serde_json::to_string_pretty(config)?;
-    fs::write(path, json)?;
-    Ok(())
+    // Write through a temporary file and rename so a crash or full disk
+    // cannot leave a truncated config behind.
+    write_private_file(&path, json.as_bytes())
 }
 
 /// Load app config from disk
 pub fn load_config() -> Result<AppConfig> {
-    let path = get_config_path()?;
-    if path.exists() {
-        let json = fs::read_to_string(path)?;
-        let mut config: AppConfig = serde_json::from_str(&json)?;
-        // Backward compatibility for dynamic UP navigation defaults:
-        // old defaults were h/l, and a previous regression used [ and /.
-        if (config.keybindings.up_prev == "h" && config.keybindings.up_next == "l")
-            || (config.keybindings.up_prev == "[" && config.keybindings.up_next == "/")
-        {
-            config.keybindings.up_prev = "[".to_string();
-            config.keybindings.up_next = "]".to_string();
-        }
-        Ok(config)
-    } else {
-        Ok(AppConfig::default())
+    load_config_from(&get_config_path()?)
+}
+
+fn load_config_from(path: &std::path::Path) -> Result<AppConfig> {
+    if !path.exists() {
+        return Ok(AppConfig::default());
     }
+    let json = fs::read_to_string(path)?;
+    match parse_config(&json) {
+        Ok(config) => Ok(config),
+        Err(error) => {
+            // Keep the unreadable file so the next save of default settings
+            // cannot destroy what the user had.
+            let backup = path.with_extension(format!(
+                "json.broken-{}",
+                chrono::Utc::now().format("%Y%m%d%H%M%S")
+            ));
+            fs::rename(path, &backup).with_context(|| {
+                format!("failed to back up unreadable config {}", path.display())
+            })?;
+            Err(error.context(format!(
+                "config could not be parsed; moved it to {}",
+                backup.display()
+            )))
+        }
+    }
+}
+
+fn parse_config(json: &str) -> Result<AppConfig> {
+    let mut config: AppConfig = serde_json::from_str(json)?;
+    // Backward compatibility for dynamic UP navigation defaults:
+    // old defaults were h/l, and a previous regression used [ and /.
+    if (config.keybindings.up_prev == "h" && config.keybindings.up_next == "l")
+        || (config.keybindings.up_prev == "[" && config.keybindings.up_next == "/")
+    {
+        config.keybindings.up_prev = "[".to_string();
+        config.keybindings.up_next = "]".to_string();
+    }
+    Ok(config)
 }
 
 /// Export cookies in Netscape format for yt-dlp
@@ -756,6 +784,44 @@ mod config_tests {
         assert_eq!(config.danmaku, DanmakuConfig::default());
         assert_eq!(config.video_quality, VideoQuality::Best);
         assert!(!config.minimal_mode);
+    }
+
+    #[test]
+    fn config_without_theme_or_keybindings_keeps_other_settings() {
+        let config = parse_config(r#"{"auto_play": false, "minimal_mode": true}"#).unwrap();
+        assert_eq!(config.theme, AppConfig::default().theme);
+        assert!(!config.auto_play);
+        assert!(config.minimal_mode);
+    }
+
+    #[test]
+    fn unknown_video_quality_falls_back_without_losing_config() {
+        let config = parse_config(r#"{"video_quality": "q8k", "auto_play": false}"#).unwrap();
+        assert_eq!(config.video_quality, VideoQuality::Best);
+        assert!(!config.auto_play);
+    }
+
+    #[test]
+    fn unreadable_config_is_backed_up_instead_of_overwritten() {
+        let dir = std::env::temp_dir().join(format!(
+            "bilibili-tui-config-test-{}-{}",
+            std::process::id(),
+            COOKIE_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(&path, r#"{"theme": "my-theme", "auto_pl"#).unwrap();
+
+        assert!(load_config_from(&path).is_err());
+        assert!(!path.exists());
+        let backups: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| fs::read_to_string(entry.path()).unwrap())
+            .collect();
+        assert_eq!(backups, [r#"{"theme": "my-theme", "auto_pl"#]);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
