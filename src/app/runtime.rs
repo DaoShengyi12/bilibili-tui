@@ -1,6 +1,5 @@
 use crate::app::App;
 use crate::presentation::tui::{Component, Page};
-use crossterm::event::MouseEventKind;
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent},
@@ -18,11 +17,6 @@ impl App {
         // Store the last content area for mouse handling
         let mut last_content_area = Rect::default();
 
-        // Scroll accumulator for high-resolution mouse wheel throttling
-        // Many modern mice generate multiple scroll events per physical "click"
-        const SCROLL_THRESHOLD: i32 = 15; // Accumulate 15 events before scrolling
-        let mut scroll_accumulator: i32 = 0;
-
         while !self.should_quit {
             terminal.draw(|frame| {
                 last_content_area = self.get_content_area(frame.area());
@@ -34,26 +28,9 @@ impl App {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         self.handle_input(key.code, key.modifiers).await;
                     }
-                    Event::Mouse(mouse) => match mouse.kind {
-                        MouseEventKind::ScrollDown => {
-                            scroll_accumulator += 1;
-                            if scroll_accumulator >= SCROLL_THRESHOLD {
-                                scroll_accumulator = 0;
-                                self.handle_mouse(mouse, last_content_area).await;
-                            }
-                        }
-                        MouseEventKind::ScrollUp => {
-                            scroll_accumulator -= 1;
-                            if scroll_accumulator <= -SCROLL_THRESHOLD {
-                                scroll_accumulator = 0;
-                                self.handle_mouse(mouse, last_content_area).await;
-                            }
-                        }
-                        _ => {
-                            // Other mouse events (clicks) are handled immediately
-                            self.handle_mouse(mouse, last_content_area).await;
-                        }
-                    },
+                    // Terminals report one wheel event per notch, so each
+                    // event scrolls one step.
+                    Event::Mouse(mouse) => self.handle_mouse(mouse, last_content_area).await,
                     _ => {}
                 }
             }
