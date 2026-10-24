@@ -273,14 +273,6 @@ impl DynamicDetailPage {
 
 impl Component for DynamicDetailPage {
     fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, keys: &Keybindings) {
-        // Poll for completed image downloads
-        self.poll_image_results();
-
-        // Start image downloads if needed
-        if !self.image_urls.is_empty() {
-            self.start_image_downloads();
-        }
-
         // Adjust layout based on input mode
         let chunks = if self.input_mode {
             Layout::default()

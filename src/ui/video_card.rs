@@ -231,6 +231,9 @@ pub struct VideoCardGrid {
     pub pending_downloads: HashSet<usize>,
     pub cached_visible_rows: usize,
     pub list_layout: bool,
+    /// Where each visible card was drawn last frame, for mouse hit-testing.
+    /// Rows stretch beyond `card_height`, so positions cannot be computed.
+    card_areas: Vec<(usize, Rect)>,
 }
 
 impl VideoCardGrid {
@@ -250,6 +253,7 @@ impl VideoCardGrid {
             pending_downloads: HashSet::new(),
             cached_visible_rows: 3,
             list_layout: false,
+            card_areas: Vec::new(),
         }
     }
 
@@ -266,6 +270,7 @@ impl VideoCardGrid {
         self.selected_index = 0;
         self.scroll_row = 0;
         self.pending_downloads.clear();
+        self.card_areas.clear();
     }
 
     pub fn add_card(&mut self, card: VideoCard) {
@@ -451,7 +456,8 @@ impl VideoCardGrid {
             .constraints(row_constraints)
             .split(area);
 
-        let mut card_areas: Vec<(usize, Rect)> = Vec::new();
+        let mut card_areas = std::mem::take(&mut self.card_areas);
+        card_areas.clear();
 
         for (row_offset, row_area) in rows.iter().enumerate() {
             let actual_row = self.scroll_row + row_offset;
@@ -479,7 +485,7 @@ impl VideoCardGrid {
             }
         }
 
-        for (video_idx, col_area) in card_areas {
+        for &(video_idx, col_area) in &card_areas {
             let is_selected = video_idx == self.selected_index;
             if self.list_layout {
                 self.cards[video_idx].render_list(frame, col_area, is_selected, theme);
@@ -487,21 +493,27 @@ impl VideoCardGrid {
                 self.cards[video_idx].render(frame, col_area, is_selected, theme);
             }
         }
+        self.card_areas = card_areas;
     }
 
+    /// The card drawn at a screen position in the last frame.
+    pub fn index_at(&self, column: u16, row: u16) -> Option<usize> {
+        let position = Position::new(column, row);
+        self.card_areas
+            .iter()
+            .find(|(_, area)| area.contains(position))
+            .map(|(index, _)| *index)
+            .filter(|index| *index < self.cards.len())
+    }
+
+    /// Select the card in the clicked row of a single-column list.
     pub fn select_at(&mut self, row: u16, area: Rect) -> bool {
-        if !area.contains(Position::new(area.x, row)) || row < area.y {
+        let Some(index) = self.index_at(area.x, row) else {
             return false;
-        }
-        let visible_row = ((row - area.y) / self.card_height) as usize;
-        let index = (self.scroll_row + visible_row) * self.columns;
-        if index < self.cards.len() {
-            self.selected_index = index;
-            self.update_scroll(self.cached_visible_rows);
-            true
-        } else {
-            false
-        }
+        };
+        self.selected_index = index;
+        self.update_scroll(self.cached_visible_rows);
+        true
     }
 
     pub fn selected_card(&self) -> Option<&VideoCard> {
@@ -535,6 +547,36 @@ mod tests {
             "00:00".to_string(),
             Some(url.to_string()),
         )
+    }
+
+    #[test]
+    fn clicks_hit_the_card_drawn_there_including_stretched_rows_and_scroll() {
+        let mut grid = VideoCardGrid::new();
+        grid.columns = 2;
+        grid.card_height = 8;
+        for index in 0..10 {
+            grid.add_card(card_with_cover(&format!("https://i0.test/{index}.jpg")));
+        }
+        grid.scroll_row = 2;
+        let theme = Theme::default();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+        // 29 usable rows hold three 8-row cards; layout stretches them to fill.
+        let area = Rect::new(10, 1, 60, 29);
+        terminal
+            .draw(|frame| grid.render(frame, area, &theme))
+            .unwrap();
+
+        assert_eq!(
+            grid.index_at(11, 1),
+            Some(4),
+            "first visible row after scrolling"
+        );
+        assert_eq!(grid.index_at(69, 1), Some(5));
+        assert_eq!(grid.index_at(11, 28), Some(8), "stretched last row");
+        assert_eq!(grid.index_at(5, 5), None, "left of the grid (sidebar)");
+
+        grid.clear();
+        assert_eq!(grid.index_at(11, 1), None);
     }
 
     #[test]

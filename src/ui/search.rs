@@ -30,6 +30,8 @@ pub struct SearchPage {
     pub loading_more: bool,
     last_click_time: Option<Instant>,
     last_click_index: Option<usize>,
+    /// First hot-list row drawn last frame; clicks map through it.
+    hot_list_offset: std::cell::Cell<usize>,
 }
 
 impl SearchPage {
@@ -51,6 +53,7 @@ impl SearchPage {
             loading_more: false,
             last_click_time: None,
             last_click_index: None,
+            hot_list_offset: std::cell::Cell::new(0),
         }
     }
 
@@ -254,8 +257,11 @@ impl SearchPage {
             .highlight_style(Style::default().fg(theme.bilibili_pink))
             .highlight_symbol("▶ ");
 
-        let mut state = ListState::default().with_selected(self.hot_selected);
+        let mut state = ListState::default()
+            .with_offset(self.hot_list_offset.get())
+            .with_selected(self.hot_selected);
         frame.render_stateful_widget(list, area, &mut state);
+        self.hot_list_offset.set(state.offset());
     }
 }
 
@@ -610,7 +616,7 @@ impl Component for SearchPage {
                 MouseEventKind::Down(MouseButton::Left) => {
                     // Convert click position to list index (account for top border)
                     let row_offset = event.row.saturating_sub(list_area.y + 1);
-                    let idx = row_offset as usize;
+                    let idx = self.hot_list_offset.get() + row_offset as usize;
                     if idx < self.hotwords.len() {
                         self.select_hotword(idx);
                         return self.search_selected_hotword();
@@ -658,35 +664,7 @@ impl Component for SearchPage {
                 None
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Min(10),
-                        Constraint::Length(2),
-                    ])
-                    .split(area);
-
-                let header_height = 2u16;
-                let grid_area = Rect {
-                    y: chunks[1].y + header_height,
-                    height: chunks[1].height.saturating_sub(header_height),
-                    x: chunks[1].x,
-                    width: chunks[1].width,
-                };
-
-                if !grid_area.contains(ratatui::layout::Position::new(event.column, event.row)) {
-                    return None;
-                }
-
-                let relative_y = event.row - grid_area.y;
-                let click_row = (relative_y / self.grid.card_height) as usize;
-                let actual_row = self.grid.scroll_row + click_row;
-
-                let card_width = grid_area.width / self.grid.columns as u16;
-                let click_col = (event.column.saturating_sub(grid_area.x) / card_width) as usize;
-
-                let click_idx = actual_row * self.grid.columns + click_col;
+                let click_idx = self.grid.index_at(event.column, event.row)?;
 
                 if click_idx < self.grid.cards.len() {
                     let now = Instant::now();

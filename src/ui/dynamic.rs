@@ -65,6 +65,8 @@ pub struct DynamicPage {
     pub dynamic_items: Vec<DynamicItem>,
     last_click_time: Option<Instant>,
     last_click_index: Option<usize>,
+    /// First UP-list row drawn last frame; clicks map through it.
+    up_list_offset: std::cell::Cell<usize>,
 }
 
 impl DynamicPage {
@@ -86,6 +88,7 @@ impl DynamicPage {
             dynamic_items: Vec::new(),
             last_click_time: None,
             last_click_index: None,
+            up_list_offset: std::cell::Cell::new(0),
         }
     }
 
@@ -386,8 +389,11 @@ impl DynamicPage {
             } else {
                 theme.bilibili_cyan
             }));
-        let mut state = ListState::default().with_selected(Some(self.selected_up_index));
+        let mut state = ListState::default()
+            .with_offset(self.up_list_offset.get())
+            .with_selected(Some(self.selected_up_index));
         frame.render_stateful_widget(list, area, &mut state);
+        self.up_list_offset.set(state.offset());
     }
 }
 
@@ -637,7 +643,8 @@ impl Component for DynamicPage {
                     return Some(AppAction::SelectUpMaster(self.selected_up_index - 1));
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    let row = event.row.saturating_sub(panes[0].y + 1) as usize;
+                    let row = self.up_list_offset.get()
+                        + event.row.saturating_sub(panes[0].y + 1) as usize;
                     if row <= self.up_list.len() {
                         self.focus_up_list = true;
                         if row != self.selected_up_index {
@@ -670,29 +677,7 @@ impl Component for DynamicPage {
                 None
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(5),
-                        Constraint::Min(10),
-                        Constraint::Length(2),
-                    ])
-                    .split(panes[1]);
-
-                let grid_area = chunks[1];
-
-                if !grid_area.contains(ratatui::layout::Position::new(event.column, event.row)) {
-                    return None;
-                }
-
-                let relative_y = event.row - grid_area.y;
-                let click_row = (relative_y / self.grid.card_height) as usize;
-                let actual_row = self.grid.scroll_row + click_row;
-
-                let card_width = grid_area.width / self.grid.columns as u16;
-                let click_col = (event.column.saturating_sub(grid_area.x) / card_width) as usize;
-
-                let click_idx = actual_row * self.grid.columns + click_col;
+                let click_idx = self.grid.index_at(event.column, event.row)?;
 
                 if click_idx < self.grid.cards.len() {
                     let now = Instant::now();

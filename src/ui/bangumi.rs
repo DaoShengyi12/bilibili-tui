@@ -221,42 +221,33 @@ impl Component for BangumiPage {
         Some(AppAction::None)
     }
 
-    fn handle_mouse(&mut self, event: MouseEvent, area: Rect) -> Option<AppAction> {
-        let MouseEvent {
-            kind, row, column, ..
-        } = event;
-
-        let content_top = area.y + 3; // skip title
-        if row < content_top {
-            return None;
-        }
-
-        // Approximate grid click handling
-        let rel_row = (row - content_top) as usize;
-        let rel_col = column as usize;
-        let columns = self.index_grid.columns;
-        let card_height = self.index_grid.card_height as usize;
-        let visible_row = rel_row / card_height;
-        let approx_idx = visible_row * columns + rel_col / 20; // rough estimate
-
-        if approx_idx < self.index_grid.cards.len() {
-            self.index_grid.selected_index = approx_idx;
-
-            if kind == MouseEventKind::Down(MouseButton::Left) {
-                let now = Instant::now();
-                let is_double = self
-                    .last_click_time
-                    .and_then(|t| now.duration_since(t).as_millis().le(&500).then_some(()))
-                    .is_some()
-                    && self.last_click_index == Some(approx_idx);
-
-                self.last_click_time = Some(now);
-                self.last_click_index = Some(approx_idx);
-
-                if is_double {
-                    return self.selected_index_action();
-                }
+    fn handle_mouse(&mut self, event: MouseEvent, _area: Rect) -> Option<AppAction> {
+        match event.kind {
+            MouseEventKind::ScrollDown => {
+                self.index_grid.move_down();
+                return Some(AppAction::None);
             }
+            MouseEventKind::ScrollUp => {
+                self.index_grid.move_up();
+                return Some(AppAction::None);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {}
+            _ => return None,
+        }
+        // The grid records where it drew each card, which accounts for the
+        // sidebar offset, the header and the scroll position.
+        let index = self.index_grid.index_at(event.column, event.row)?;
+        self.index_grid.selected_index = index;
+
+        let now = Instant::now();
+        let is_double = self.last_click_index == Some(index)
+            && self
+                .last_click_time
+                .is_some_and(|time| now.duration_since(time).as_millis() <= 500);
+        self.last_click_time = Some(now);
+        self.last_click_index = Some(index);
+        if is_double {
+            return self.selected_index_action();
         }
 
         None

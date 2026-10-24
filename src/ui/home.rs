@@ -60,11 +60,14 @@ pub struct HomePage {
     loading_more: bool,
     cached_visible_rows: usize,
     footer_notice: Option<String>,
+    /// Where each visible card was drawn last frame, for mouse hit-testing.
+    card_areas: Vec<(usize, Rect)>,
     // Double-click detection
     last_click_time: Option<Instant>,
     last_click_index: Option<usize>,
     feed: HomeFeed,
-    pub search: SearchPage,
+    /// Boxed to keep `Page::Home` close to the other page variants in size.
+    pub search: Box<SearchPage>,
     pub focus_sources: bool,
     pub selected_source: usize,
 }
@@ -214,10 +217,11 @@ impl HomePage {
             loading_more: false,
             cached_visible_rows: Self::INITIAL_VISIBLE_ROWS,
             footer_notice: None,
+            card_areas: Vec::new(),
             last_click_time: None,
             last_click_index: None,
             feed: HomeFeed::Recommended,
-            search: SearchPage::new(),
+            search: Box::default(),
             focus_sources: true,
             selected_source: 1,
         }
@@ -743,45 +747,30 @@ impl Component for HomePage {
                 None
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let content_top = panes[1].y + 3;
-                let content_bottom = panes[1].bottom().saturating_sub(2);
+                if let Some(click_idx) = self.card_at(event.column, event.row) {
+                    // Check for double-click (same card within 500ms)
+                    let now = Instant::now();
+                    let is_double_click = self.last_click_index == Some(click_idx)
+                        && self
+                            .last_click_time
+                            .is_some_and(|t| now.duration_since(t).as_millis() < 500);
 
-                if event.row >= content_top && event.row < content_bottom {
-                    // Calculate which card was clicked
-                    let relative_y = event.row - content_top;
-                    let click_row = (relative_y / self.card_height) as usize;
-                    let actual_row = self.scroll_row + click_row;
-
-                    let card_width = panes[1].width / self.columns as u16;
-                    let click_col = (event.column.saturating_sub(panes[1].x) / card_width) as usize;
-
-                    let click_idx = actual_row * self.columns + click_col.min(self.columns - 1);
-
-                    if click_idx < self.videos.len() {
-                        // Check for double-click (same card within 500ms)
-                        let now = Instant::now();
-                        let is_double_click = self.last_click_index == Some(click_idx)
-                            && self
-                                .last_click_time
-                                .is_some_and(|t| now.duration_since(t).as_millis() < 500);
-
-                        if is_double_click {
-                            // Double-click: open video detail
-                            self.last_click_time = None;
-                            self.last_click_index = None;
-                            if let Some(card) = self.videos.get(click_idx)
-                                && let Some(bvid) = &card.video.bvid
-                            {
-                                let aid = card.video.id;
-                                return Some(AppAction::OpenVideoDetail(bvid.clone(), aid));
-                            }
-                        } else {
-                            // Single click: select card and record for potential double-click
-                            self.selected_index = click_idx;
-                            self.update_scroll(self.cached_visible_rows);
-                            self.last_click_time = Some(now);
-                            self.last_click_index = Some(click_idx);
+                    if is_double_click {
+                        // Double-click: open video detail
+                        self.last_click_time = None;
+                        self.last_click_index = None;
+                        if let Some(card) = self.videos.get(click_idx)
+                            && let Some(bvid) = &card.video.bvid
+                        {
+                            let aid = card.video.id;
+                            return Some(AppAction::OpenVideoDetail(bvid.clone(), aid));
                         }
+                    } else {
+                        // Single click: select card and record for potential double-click
+                        self.selected_index = click_idx;
+                        self.update_scroll(self.cached_visible_rows);
+                        self.last_click_time = Some(now);
+                        self.last_click_index = Some(click_idx);
                     }
                 }
                 None
@@ -816,7 +805,8 @@ impl HomePage {
             .split(area);
 
         // Collect all card areas first
-        let mut card_areas: Vec<(usize, Rect)> = Vec::new();
+        let mut card_areas = std::mem::take(&mut self.card_areas);
+        card_areas.clear();
 
         for (row_offset, row_area) in rows.iter().enumerate() {
             let actual_row = self.scroll_row + row_offset;
@@ -845,10 +835,21 @@ impl HomePage {
         }
 
         // Now render each card with mutable access
-        for (video_idx, col_area) in card_areas {
+        for &(video_idx, col_area) in &card_areas {
             let is_selected = video_idx == self.selected_index;
             self.render_video_card(frame, col_area, video_idx, is_selected, theme);
         }
+        self.card_areas = card_areas;
+    }
+
+    /// The card drawn at a screen position in the last frame.
+    fn card_at(&self, column: u16, row: u16) -> Option<usize> {
+        let position = Position::new(column, row);
+        self.card_areas
+            .iter()
+            .find(|(_, area)| area.contains(position))
+            .map(|(index, _)| *index)
+            .filter(|index| *index < self.videos.len())
     }
 
     fn render_video_card(

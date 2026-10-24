@@ -29,6 +29,8 @@ pub struct FavoritesPage {
     pub error: Option<String>,
     last_click_time: Option<Instant>,
     last_click_index: Option<usize>,
+    /// First source-list row drawn last frame; clicks map through it.
+    sources_offset: std::cell::Cell<usize>,
 }
 
 impl FavoritesPage {
@@ -48,6 +50,7 @@ impl FavoritesPage {
             error: None,
             last_click_time: None,
             last_click_index: None,
+            sources_offset: std::cell::Cell::new(0),
         }
     }
 
@@ -231,7 +234,6 @@ impl Component for FavoritesPage {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(28), Constraint::Min(30)])
             .split(area);
-        let sources = self.sources();
         let mut items = vec![
             ListItem::new("其他收藏").style(
                 Style::default()
@@ -275,7 +277,9 @@ impl Component for FavoritesPage {
         } else {
             self.selected_source + 3
         };
-        let mut state = ListState::default().with_selected(Some(state_index));
+        let mut state = ListState::default()
+            .with_offset(self.sources_offset.get())
+            .with_selected(Some(state_index));
         frame.render_stateful_widget(
             List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(" 收藏 "))
@@ -288,6 +292,7 @@ impl Component for FavoritesPage {
             chunks[0],
             &mut state,
         );
+        self.sources_offset.set(state.offset());
 
         let right = Layout::default()
             .direction(Direction::Vertical)
@@ -336,7 +341,6 @@ impl Component for FavoritesPage {
             .alignment(Alignment::Center),
             right[2],
         );
-        let _ = sources;
     }
 
     fn handle_input(&mut self, key: KeyCode, keys: &Keybindings) -> Option<AppAction> {
@@ -453,7 +457,8 @@ impl Component for FavoritesPage {
             }
             MouseEventKind::Down(MouseButton::Left) if panes[0].contains(position) => {
                 self.focus_sources = true;
-                let item_row = event.row.saturating_sub(panes[0].y + 1) as usize;
+                let item_row =
+                    self.sources_offset.get() + event.row.saturating_sub(panes[0].y + 1) as usize;
                 let source_index = if item_row == 1 {
                     Some(0)
                 } else if (3..3 + self.created.len()).contains(&item_row) {
@@ -463,9 +468,10 @@ impl Component for FavoritesPage {
                     (item_row >= first_collected)
                         .then_some(1 + self.created.len() + item_row - first_collected)
                 };
-                if let Some(index) = source_index.filter(|index| *index < self.sources().len()) {
+                let sources = self.sources();
+                if let Some(index) = source_index.filter(|index| *index < sources.len()) {
                     self.selected_source = index;
-                    if let Some(source) = self.sources().get(index)
+                    if let Some(source) = sources.get(index)
                         && *source != self.active_source
                     {
                         return Some(AppAction::SelectFavoriteSource(source.clone()));

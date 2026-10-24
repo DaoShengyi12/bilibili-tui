@@ -708,19 +708,26 @@ impl Component for HistoryPage {
                 }
 
                 let card_height = Self::CARD_HEIGHT;
-                let card_width = inner.width / cols as u16;
+                // Panes narrower than the column count would otherwise divide by zero.
+                let card_width = (inner.width / cols as u16).max(1);
 
                 let relative_y = event.row - inner.y;
                 let click_row = (relative_y / card_height) as usize;
                 let actual_row = self.scroll_offset + click_row;
 
                 let click_col = (event.column.saturating_sub(inner.x) / card_width) as usize;
+                if click_col >= cols {
+                    return None;
+                }
 
                 let click_idx = actual_row * cols + click_col;
 
                 if click_idx < self.items.len() {
                     let now = Instant::now();
-                    let is_double_click = self.last_click_index == Some(click_idx)
+                    // While items are selected for deletion, clicks only move
+                    // the cursor; opening an item would abandon the selection.
+                    let is_double_click = self.mode == HistoryMode::Browse
+                        && self.last_click_index == Some(click_idx)
                         && self
                             .last_click_time
                             .is_some_and(|t| now.duration_since(t).as_millis() < 500);
@@ -1024,6 +1031,35 @@ mod tests {
                 kid: 2,
             }])
         );
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicks_in_a_pane_narrower_than_the_columns_do_not_panic() {
+        let mut page = history_page();
+        for width in 0..8 {
+            page.handle_mouse(left_click(1, 1), Rect::new(0, 0, width, 20));
+        }
+    }
+
+    #[test]
+    fn double_click_during_selection_does_not_open_the_item() {
+        let keys = Keybindings::default();
+        let mut page = history_page();
+        page.handle_input_with_modifiers(KeyCode::Char(' '), KeyModifiers::NONE, &keys);
+        assert_eq!(page.mode, HistoryMode::Selecting);
+        let area = Rect::new(0, 0, 120, 40);
+        assert!(page.handle_mouse(left_click(2, 2), area).is_none());
+        assert!(page.handle_mouse(left_click(2, 2), area).is_none());
+        assert_eq!(page.mode, HistoryMode::Selecting);
     }
 
     #[test]

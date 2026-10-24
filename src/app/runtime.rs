@@ -393,6 +393,14 @@ impl App {
                 page.poll_image_results();
                 page.start_image_downloads();
             }
+            Page::DynamicDetail(page) => {
+                page.poll_image_results();
+                page.start_image_downloads();
+            }
+            Page::Live(page) => {
+                page.poll_cover_results();
+                page.start_cover_downloads();
+            }
             Page::History(page) => {
                 page.poll_cover_results();
                 page.start_cover_downloads();

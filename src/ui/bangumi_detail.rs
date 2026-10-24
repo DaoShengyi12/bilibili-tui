@@ -25,6 +25,10 @@ pub struct BangumiDetailPage {
     flat_episodes: Vec<FlatEpisode>,
     last_click_time: Option<Instant>,
     last_click_index: Option<usize>,
+    /// Episode list area and first visible row from the last frame, so
+    /// clicks map to the row the user actually saw.
+    episode_list_area: std::cell::Cell<Rect>,
+    episode_list_offset: std::cell::Cell<usize>,
 }
 
 #[derive(Clone)]
@@ -48,6 +52,8 @@ impl BangumiDetailPage {
             flat_episodes: Vec::new(),
             last_click_time: None,
             last_click_index: None,
+            episode_list_area: std::cell::Cell::new(Rect::default()),
+            episode_list_offset: std::cell::Cell::new(0),
         }
     }
 
@@ -286,15 +292,36 @@ impl BangumiDetailPage {
             .style(Style::default().fg(theme.fg_primary))
             .scroll_padding(2);
 
-        let mut state = ListState::default();
-        // Adjust for section headers in scroll - we render headers inline so
-        // the selected index maps directly to items including headers.
-        // Wait, we need to account for section headers in the list.
-        // Let me recalculate: each section header adds 1 item before its episodes.
-        // Actually, I need to pre-compute the mapping.
-        state.select(Some(self.list_index_for_episode(self.selected_episode)));
+        // Section headers are list rows too, so the selection is mapped.
+        let mut state = ListState::default()
+            .with_offset(self.episode_list_offset.get())
+            .with_selected(Some(self.list_index_for_episode(self.selected_episode)));
 
         frame.render_stateful_widget(list, inner, &mut state);
+        self.episode_list_area.set(inner);
+        self.episode_list_offset.set(state.offset());
+    }
+
+    /// Inverse of `list_index_for_episode`; section header rows map to `None`.
+    fn episode_at_list_index(&self, list_index: usize) -> Option<usize> {
+        let mut row = 0;
+        // Same header rule as the renderer: a header precedes every change
+        // of section title, starting from an empty title.
+        let mut last_section = "";
+        for (episode_index, flat) in self.flat_episodes.iter().enumerate() {
+            if flat.section_title != last_section {
+                last_section = &flat.section_title;
+                if row == list_index {
+                    return None;
+                }
+                row += 1;
+            }
+            if row == list_index {
+                return Some(episode_index);
+            }
+            row += 1;
+        }
+        None
     }
 
     /// Map episode index to list index (accounting for section headers)
@@ -403,34 +430,17 @@ impl Component for BangumiDetailPage {
         Some(AppAction::None)
     }
 
-    fn handle_mouse(&mut self, event: MouseEvent, area: Rect) -> Option<AppAction> {
-        let MouseEvent { kind, row, .. } = event;
+    fn handle_mouse(&mut self, event: MouseEvent, _area: Rect) -> Option<AppAction> {
+        let MouseEvent {
+            kind, row, column, ..
+        } = event;
 
-        // Only process in episode list area (lower chunk)
-        let info_height = 6;
-        let list_top = area.y + info_height + 1; // +1 for border
-        if row < list_top {
+        let list_area = self.episode_list_area.get();
+        if !list_area.contains(Position::new(column, row)) {
             return None;
         }
-
-        let rel_row = (row - list_top) as usize + self.episode_scroll;
-
-        // Map list row to episode index (skip section headers)
-        let mut list_idx = 0;
-        let mut last_section = String::new();
-        let mut target_ep_idx = None;
-
-        for (ep_idx, fe) in self.flat_episodes.iter().enumerate() {
-            if fe.section_title != last_section {
-                last_section = fe.section_title.clone();
-                list_idx += 1;
-            }
-            if list_idx == rel_row {
-                target_ep_idx = Some(ep_idx);
-                break;
-            }
-            list_idx += 1;
-        }
+        let list_index = self.episode_list_offset.get() + (row - list_area.y) as usize;
+        let target_ep_idx = self.episode_at_list_index(list_index);
 
         if let Some(idx) = target_ep_idx {
             self.selected_episode = idx;
@@ -459,6 +469,60 @@ impl Component for BangumiDetailPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn episode_rows_round_trip_through_section_headers() {
+        let season: SeasonResult = serde_json::from_value(serde_json::json!({
+            "title": "season",
+            "season_id": 7,
+            "cover": "",
+            "square_cover": "",
+            "episodes": [
+                {"aid": 1, "cid": 1, "id": 11, "title": "1"},
+                {"aid": 2, "cid": 2, "id": 12, "title": "2"}
+            ],
+            "section": [
+                {"id": 3, "title": "PV", "type": 1, "episodes": [{"aid": 3, "cid": 3, "id": 13, "title": "PV1"}]}
+            ]
+        }))
+        .unwrap();
+        let mut page = BangumiDetailPage::new(7);
+        page.set_season(season);
+        assert_eq!(page.episode_at_list_index(0), None, "section header");
+        for episode in 0..page.flat_episodes.len() {
+            let row = page.list_index_for_episode(episode);
+            assert_eq!(page.episode_at_list_index(row), Some(episode));
+        }
+        assert_eq!(page.episode_at_list_index(3), None, "second header");
+    }
+
+    #[test]
+    fn click_maps_through_the_drawn_list_offset() {
+        let mut page = BangumiDetailPage::new(7);
+        page.flat_episodes = (0..30)
+            .map(|index| FlatEpisode {
+                section_title: "正片".to_string(),
+                _ep_index: index,
+                episode: serde_json::from_value(
+                    serde_json::json!({"aid": index, "cid": index, "id": index}),
+                )
+                .unwrap(),
+            })
+            .collect();
+        page.episode_list_area.set(Rect::new(0, 10, 40, 10));
+        page.episode_list_offset.set(15);
+        page.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 12,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 80, 40),
+        );
+        // Row 2 of the list shows list index 17, i.e. episode 16 after the header.
+        assert_eq!(page.selected_episode, 16);
+    }
 
     #[test]
     fn history_episode_is_preselected_for_auto_play() {

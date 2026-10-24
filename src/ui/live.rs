@@ -43,6 +43,8 @@ pub struct LivePage {
     cover_tx: mpsc::Sender<CoverResult>,
     cover_rx: mpsc::Receiver<CoverResult>,
     pending_downloads: HashSet<i64>,
+    /// Where each visible card was drawn last frame, for mouse hit-testing.
+    card_areas: Vec<(usize, Rect)>,
     last_load_time: Option<Instant>,
     loading_more: bool,
 }
@@ -72,6 +74,7 @@ impl LivePage {
             cover_tx: tx,
             cover_rx: rx,
             pending_downloads: HashSet::new(),
+            card_areas: Vec::new(),
             last_load_time: None,
             loading_more: false,
         }
@@ -209,8 +212,9 @@ impl LivePage {
         }
     }
 
-    /// Start background downloads for visible covers
-    fn start_cover_downloads(&mut self) {
+    /// Start background downloads for visible covers. Called from the app
+    /// tick, never from `draw`.
+    pub fn start_cover_downloads(&mut self) {
         let prefetch_rows = self.cached_visible_rows + Self::PREFETCH_BUFFER_ROWS;
         let start_idx = self.scroll_offset * self.columns;
         let end_idx = std::cmp::min(start_idx + prefetch_rows * self.columns, self.rooms.len());
@@ -244,7 +248,7 @@ impl LivePage {
     }
 
     /// Poll for completed cover downloads
-    fn poll_cover_results(&mut self) {
+    pub fn poll_cover_results(&mut self) {
         while let Ok(result) = self.cover_rx.try_recv() {
             // Handle cover download result
             self.pending_downloads.remove(&result.room_id);
@@ -316,9 +320,6 @@ impl Default for LivePage {
 
 impl Component for LivePage {
     fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, keys: &Keybindings) {
-        self.poll_cover_results();
-        self.start_cover_downloads();
-
         // Split area into header/content/footer like home page
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -487,19 +488,17 @@ impl Component for LivePage {
         Some(AppAction::None)
     }
 
-    fn handle_mouse(&mut self, event: MouseEvent, area: Rect) -> Option<AppAction> {
+    fn handle_mouse(&mut self, event: MouseEvent, _area: Rect) -> Option<AppAction> {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // Calculate which card was clicked
-                let x = event.column.saturating_sub(area.x + 1);
-                let y = event.row.saturating_sub(area.y + 1);
-
-                let card_width = area.width.saturating_sub(2) / self.columns as u16;
-                let col = (x / card_width) as usize;
-                let row = (y / Self::CARD_HEIGHT) as usize + self.scroll_offset;
-
-                let idx = row * self.columns + col;
-                if idx < self.rooms.len() && col < self.columns {
+                // Hit-test against where the cards were drawn: the header,
+                // scroll offset and narrow widths are already accounted for.
+                let position = Position::new(event.column, event.row);
+                if let Some(&(idx, _)) = self
+                    .card_areas
+                    .iter()
+                    .find(|(idx, card)| *idx < self.rooms.len() && card.contains(position))
+                {
                     self.selected_index = idx;
                 }
                 None
@@ -541,8 +540,9 @@ impl LivePage {
             .constraints(row_constraints)
             .split(area);
 
-        // Collect all card areas first
-        let mut card_areas: Vec<(usize, Rect)> = Vec::new();
+        // Collect all card areas first; they are kept for mouse hit-testing.
+        let mut card_areas = std::mem::take(&mut self.card_areas);
+        card_areas.clear();
 
         for (row_offset, row_area) in rows.iter().enumerate() {
             let actual_row = self.scroll_offset + row_offset;
@@ -571,10 +571,11 @@ impl LivePage {
         }
 
         // Now render each card with mutable access
-        for (room_idx, col_area) in card_areas {
+        for &(room_idx, col_area) in &card_areas {
             let is_selected = room_idx == self.selected_index;
             self.render_live_card(frame, col_area, room_idx, is_selected, theme);
         }
+        self.card_areas = card_areas;
     }
 
     fn render_live_card(

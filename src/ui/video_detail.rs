@@ -993,14 +993,7 @@ impl Component for VideoDetailPage {
                     return None;
                 }
 
-                let relative_y = event.row - related_area.y;
-                let click_row = (relative_y / self.related_card_grid.card_height) as usize;
-                let actual_row = self.related_card_grid.scroll_row + click_row;
-
-                let card_width = related_area.width / self.related_card_grid.columns as u16;
-                let click_col = (event.column.saturating_sub(related_area.x) / card_width) as usize;
-
-                let click_idx = actual_row * self.related_card_grid.columns + click_col;
+                let click_idx = self.related_card_grid.index_at(event.column, event.row)?;
 
                 if click_idx < self.related_card_grid.cards.len() {
                     let now = Instant::now();
