@@ -540,6 +540,15 @@ impl NetworkCommand {
     }
 }
 
+/// Upper bound on pages fetched while building one playlist.
+const MAX_PLAYLIST_PAGES: i32 = 250;
+
+/// Stop paging on an empty page even when the API still claims more results,
+/// and after `MAX_PLAYLIST_PAGES`, so a misbehaving endpoint cannot loop forever.
+fn playlist_has_next_page(page: i32, page_len: usize, has_more: bool) -> bool {
+    has_more && page_len > 0 && page < MAX_PLAYLIST_PAGES
+}
+
 async fn handle_command(
     api_client: Arc<ApiClient>,
     command: NetworkCommand,
@@ -820,7 +829,7 @@ async fn handle_tracked_command(
                     Err(error) => return failed(req_id, "playlist_build", error),
                 };
                 let total = data.page.count as usize;
-                let empty = data.list.vlist.is_empty();
+                let page_len = data.list.vlist.len();
                 items.extend(data.list.vlist.into_iter().map(|video| PlaylistItem {
                     bvid: video.bvid,
                     aid: video.aid,
@@ -830,7 +839,7 @@ async fn handle_tracked_command(
                     duration: video.duration,
                     page: None,
                 }));
-                if empty || items.len() >= total {
+                if !playlist_has_next_page(page, page_len, items.len() < total) {
                     break;
                 }
                 page += 1;
@@ -866,6 +875,7 @@ async fn handle_tracked_command(
                     Err(error) => return failed(req_id, "playlist_build", error),
                 };
                 let has_more = data.has_more.unwrap_or(false);
+                let page_len = data.medias.len();
                 items.extend(data.medias.into_iter().filter_map(|media| {
                     Some(PlaylistItem {
                         bvid: media.bvid?,
@@ -877,7 +887,7 @@ async fn handle_tracked_command(
                         page: None,
                     })
                 }));
-                if !has_more {
+                if !playlist_has_next_page(page, page_len, has_more) {
                     break;
                 }
                 page += 1;
@@ -1289,7 +1299,17 @@ pub(crate) fn redact_url_queries(message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{NetworkCommand, survives_cancel_pending};
+    use super::{
+        MAX_PLAYLIST_PAGES, NetworkCommand, playlist_has_next_page, survives_cancel_pending,
+    };
+
+    #[test]
+    fn playlist_paging_stops_on_empty_page_despite_has_more() {
+        assert!(playlist_has_next_page(1, 40, true));
+        assert!(!playlist_has_next_page(2, 0, true));
+        assert!(!playlist_has_next_page(1, 40, false));
+        assert!(!playlist_has_next_page(MAX_PLAYLIST_PAGES, 40, true));
+    }
 
     #[test]
     fn unrelated_requests_do_not_share_a_cancel_key() {
