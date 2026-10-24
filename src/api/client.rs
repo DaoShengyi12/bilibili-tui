@@ -312,31 +312,44 @@ impl ApiClient {
             return Ok(());
         }
 
+        // The nav endpoint answers guests and expired sessions with code -101
+        // while still including `data.wbi_img`, so the code is not checked here.
+        let url = self.build_url(BilibiliApiDomain::Main, "/x/web-interface/nav");
+        let value = self
+            .get_json(&url)
+            .await
+            .context("failed to fetch WBI keys from nav")?;
+        let keys = Self::parse_nav_wbi_keys(&value)?;
+
+        *self.wbi_keys.write().expect("wbi_keys lock poisoned") = Some(keys);
+
+        Ok(())
+    }
+
+    fn parse_nav_wbi_keys(value: &serde_json::Value) -> Result<WbiKeys> {
         #[derive(Deserialize)]
         struct WbiImg {
             img_url: String,
             sub_url: String,
         }
 
-        #[derive(Deserialize)]
-        struct NavData {
-            wbi_img: WbiImg,
-        }
+        let wbi_img = value
+            .get("data")
+            .and_then(|data| data.get("wbi_img"))
+            .cloned()
+            .ok_or_else(|| {
+                let code = value.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+                anyhow!("nav response has no wbi_img (code {code})")
+            })?;
+        let wbi_img: WbiImg =
+            serde_json::from_value(wbi_img).context("invalid wbi_img in nav response")?;
 
-        let url = self.build_url(BilibiliApiDomain::Main, "/x/web-interface/nav");
-        let resp: ApiResponse<NavData> = self.get(&url).await?;
+        let img_key = wbi::extract_key_from_url(&wbi_img.img_url)
+            .ok_or_else(|| anyhow!("Failed to extract img_key"))?;
+        let sub_key = wbi::extract_key_from_url(&wbi_img.sub_url)
+            .ok_or_else(|| anyhow!("Failed to extract sub_key"))?;
 
-        if let Some(data) = resp.data {
-            let img_key = wbi::extract_key_from_url(&data.wbi_img.img_url)
-                .ok_or_else(|| anyhow::anyhow!("Failed to extract img_key"))?;
-            let sub_key = wbi::extract_key_from_url(&data.wbi_img.sub_url)
-                .ok_or_else(|| anyhow::anyhow!("Failed to extract sub_key"))?;
-
-            *self.wbi_keys.write().expect("wbi_keys lock poisoned") =
-                Some(WbiKeys { img_key, sub_key });
-        }
-
-        Ok(())
+        Ok(WbiKeys { img_key, sub_key })
     }
 
     // Auth APIs
@@ -1540,6 +1553,31 @@ mod live_contract_tests {
     use super::ApiClient;
     use crate::api::space::SpaceVideoOrder;
     use crate::storage::VideoQuality;
+
+    #[test]
+    fn nav_wbi_keys_are_read_from_guest_response() {
+        let value = serde_json::json!({
+            "code": -101,
+            "message": "账号未登录",
+            "data": {
+                "isLogin": false,
+                "wbi_img": {
+                    "img_url": "https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png",
+                    "sub_url": "https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png"
+                }
+            }
+        });
+        let keys = ApiClient::parse_nav_wbi_keys(&value).unwrap();
+        assert_eq!(keys.img_key, "7cd084941338484aae1ad9425b84077c");
+        assert_eq!(keys.sub_key, "4932caff0ff746eab6f01bf08b70ac45");
+    }
+
+    #[test]
+    fn nav_without_wbi_img_is_an_error() {
+        let value = serde_json::json!({"code": -101, "message": "账号未登录", "data": null});
+        let error = ApiClient::parse_nav_wbi_keys(&value).unwrap_err();
+        assert!(error.to_string().contains("code -101"));
+    }
 
     #[test]
     fn bangumi_v2_playurl_extracts_nested_video_info() {
