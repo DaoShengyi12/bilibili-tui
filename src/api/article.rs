@@ -91,6 +91,7 @@ fn document_from_html(content: &str) -> ArticleDocument {
     let html = Html::parse_fragment(content);
     let blocks = Selector::parse("h1,h2,h3,h4,p,blockquote,li,pre,figure,img").expect("selector");
     let images = Selector::parse("img").expect("selector");
+    let captions = Selector::parse("figcaption").expect("selector");
     let links = Selector::parse("a[href]").expect("selector");
     let mut document_blocks = Vec::new();
     let mut image_urls = Vec::new();
@@ -109,14 +110,16 @@ fn document_from_html(content: &str) -> ArticleDocument {
                     });
                 }
             }
+            if let Some(caption) = element.select(&captions).next() {
+                let caption = element_text(&caption);
+                if !caption.is_empty() {
+                    document_blocks.push(ArticleBlock::Text(caption));
+                }
+            }
             continue;
         }
         if name == "img" {
-            let inside_figure = element.ancestors().any(|node| {
-                scraper::ElementRef::wrap(node)
-                    .is_some_and(|parent| parent.value().name() == "figure")
-            });
-            if inside_figure {
+            if has_ancestor(&element, &["figure"]) {
                 continue;
             }
             if let Some(placeholder) = embedded_placeholder(&element) {
@@ -135,8 +138,13 @@ fn document_from_html(content: &str) -> ArticleDocument {
             continue;
         }
 
-        let text = element.text().collect::<Vec<_>>().join("");
-        let text = text.trim();
+        // The outermost block already includes the text of nested blocks such
+        // as `<blockquote><p>`, and figures render their own captions.
+        if has_ancestor(&element, &TEXT_BLOCKS) || has_ancestor(&element, &["figure"]) {
+            continue;
+        }
+        let text = element_text(&element);
+        let text = text.as_str();
         if text.is_empty() {
             continue;
         }
@@ -169,6 +177,18 @@ fn document_from_html(content: &str) -> ArticleDocument {
         image_urls,
         blocks: document_blocks,
     }
+}
+
+const TEXT_BLOCKS: [&str; 8] = ["h1", "h2", "h3", "h4", "p", "blockquote", "li", "pre"];
+
+fn has_ancestor(element: &scraper::ElementRef<'_>, names: &[&str]) -> bool {
+    element.ancestors().any(|node| {
+        scraper::ElementRef::wrap(node).is_some_and(|parent| names.contains(&parent.value().name()))
+    })
+}
+
+fn element_text(element: &scraper::ElementRef<'_>) -> String {
+    element.text().collect::<String>().trim().to_string()
 }
 
 fn document_from_json(content: &str) -> ArticleDocument {
@@ -347,6 +367,22 @@ mod tests {
             "{:?}",
             document.blocks
         );
+    }
+
+    #[test]
+    fn html_nested_blocks_render_once_and_keep_figure_captions() {
+        let document = document_from_html(
+            r#"<blockquote><p>引用</p></blockquote><ul><li><p>条目</p></li></ul><figure><img src="//i.test/a.jpg"><figcaption><p>图注</p></figcaption></figure>"#,
+        );
+        assert_eq!(document.body.matches("引用").count(), 1);
+        assert!(document.body.contains("> 引用"));
+        assert_eq!(document.body.matches("条目").count(), 1);
+        assert!(document.body.contains("• 条目"));
+        assert_eq!(document.body.matches("图注").count(), 1);
+        assert!(matches!(
+            &document.blocks[3],
+            ArticleBlock::Text(text) if text == "图注"
+        ));
     }
 
     #[test]
