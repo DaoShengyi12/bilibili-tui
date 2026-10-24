@@ -9,10 +9,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Message for completed cover download
+/// Message for a finished cover download. `url` identifies the card it was
+/// started for, so a result arriving after the list changed is dropped.
 pub struct CoverResult {
     pub index: usize,
-    pub protocol: StatefulProtocol,
+    pub url: String,
+    /// `None` when the download or decode failed.
+    pub protocol: Option<StatefulProtocol>,
 }
 
 /// A video card with cover image
@@ -27,6 +30,8 @@ pub struct VideoCard {
     pub duration: String,
     pub pic_url: Option<String>,
     pub cover: Option<StatefulProtocol>,
+    /// The cover download failed; it is not retried for this card.
+    pub cover_failed: bool,
 }
 
 impl VideoCard {
@@ -49,6 +54,7 @@ impl VideoCard {
             duration,
             pic_url,
             cover: None,
+            cover_failed: false,
         }
     }
 
@@ -380,25 +386,27 @@ impl VideoCardGrid {
         let end = (start + self.columns * prefetch_rows).min(self.cards.len());
 
         for idx in start..end {
-            if self.cards[idx].cover.is_some() || self.pending_downloads.contains(&idx) {
+            let card = &self.cards[idx];
+            if card.cover.is_some() || card.cover_failed || self.pending_downloads.contains(&idx) {
                 continue;
             }
 
-            if let Some(pic_url) = self.cards[idx].pic_url.clone() {
+            if let Some(pic_url) = card.pic_url.clone() {
                 self.pending_downloads.insert(idx);
                 let tx = self.cover_tx.clone();
                 let picker = Arc::clone(&self.picker);
 
                 tokio::spawn(async move {
-                    if let Some(img) = download_image(&pic_url).await {
-                        let protocol = picker.new_resize_protocol(img);
-                        let _ = tx
-                            .send(CoverResult {
-                                index: idx,
-                                protocol,
-                            })
-                            .await;
-                    }
+                    let protocol = download_image(&pic_url)
+                        .await
+                        .map(|img| picker.new_resize_protocol(img));
+                    let _ = tx
+                        .send(CoverResult {
+                            index: idx,
+                            url: pic_url,
+                            protocol,
+                        })
+                        .await;
                 });
             }
         }
@@ -407,10 +415,25 @@ impl VideoCardGrid {
     /// Poll for completed cover downloads
     pub fn poll_cover_results(&mut self) {
         while let Ok(result) = self.cover_rx.try_recv() {
-            if result.index < self.cards.len() {
-                self.cards[result.index].cover = Some(result.protocol);
-                self.pending_downloads.remove(&result.index);
-            }
+            self.apply_cover_result(result);
+        }
+    }
+
+    /// Store a finished cover on the card it was requested for. Results for
+    /// a card that has since been replaced (new search, folder, tab) are
+    /// dropped instead of landing on whatever card now has that index.
+    fn apply_cover_result(&mut self, result: CoverResult) {
+        let Some(card) = self
+            .cards
+            .get_mut(result.index)
+            .filter(|card| card.pic_url.as_deref() == Some(result.url.as_str()))
+        else {
+            return;
+        };
+        self.pending_downloads.remove(&result.index);
+        match result.protocol {
+            Some(protocol) => card.cover = Some(protocol),
+            None => card.cover_failed = true,
         }
     }
 
@@ -501,6 +524,47 @@ async fn download_image(url: &str) -> Option<DynamicImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn card_with_cover(url: &str) -> VideoCard {
+        VideoCard::new(
+            None,
+            None,
+            url.to_string(),
+            "up".to_string(),
+            "0".to_string(),
+            "00:00".to_string(),
+            Some(url.to_string()),
+        )
+    }
+
+    #[test]
+    fn cover_from_a_previous_list_does_not_land_on_the_new_list() {
+        let mut grid = VideoCardGrid::new();
+        grid.add_card(card_with_cover("https://i0.test/old.jpg"));
+        grid.pending_downloads.insert(0);
+        grid.clear();
+        grid.add_card(card_with_cover("https://i0.test/new.jpg"));
+        grid.pending_downloads.insert(0);
+
+        grid.apply_cover_result(CoverResult {
+            index: 0,
+            url: "https://i0.test/old.jpg".to_string(),
+            protocol: None,
+        });
+        assert!(!grid.cards[0].cover_failed);
+        assert!(grid.pending_downloads.contains(&0));
+
+        grid.apply_cover_result(CoverResult {
+            index: 0,
+            url: "https://i0.test/new.jpg".to_string(),
+            protocol: None,
+        });
+        assert!(
+            grid.cards[0].cover_failed,
+            "a failed download is not retried"
+        );
+        assert!(!grid.pending_downloads.contains(&0));
+    }
 
     #[test]
     fn page_navigation_moves_by_one_viewport() {

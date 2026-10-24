@@ -22,12 +22,25 @@ use tokio::sync::mpsc;
 pub struct VideoCard {
     pub video: VideoItem,
     pub cover: Option<StatefulProtocol>,
+    /// The cover download failed; the placeholder stops saying "loading".
+    pub cover_failed: bool,
 }
 
-/// Message for completed cover download
+impl VideoCard {
+    fn new(video: VideoItem) -> Self {
+        Self {
+            video,
+            cover: None,
+            cover_failed: false,
+        }
+    }
+}
+
+/// Message for a finished cover download; see `video_card::CoverResult`.
 pub struct CoverResult {
     pub index: usize,
-    pub protocol: StatefulProtocol,
+    pub url: String,
+    pub protocol: Option<StatefulProtocol>,
 }
 
 pub struct HomePage {
@@ -218,10 +231,7 @@ impl HomePage {
 
         match api_client.get_recommendations().await {
             Ok(videos) => {
-                self.videos = videos
-                    .into_iter()
-                    .map(|video| VideoCard { video, cover: None })
-                    .collect();
+                self.videos = videos.into_iter().map(VideoCard::new).collect();
                 self.loading = false;
                 self.selected_index = 0;
                 self.scroll_row = 0;
@@ -245,10 +255,9 @@ impl HomePage {
         if self.feed != feed {
             return;
         }
-        self.videos = videos
-            .into_iter()
-            .map(|video| VideoCard { video, cover: None })
-            .collect();
+        self.videos = videos.into_iter().map(VideoCard::new).collect();
+        // Downloads still running for the old cards must not block the new ones.
+        self.pending_downloads.clear();
         self.loading = false;
         self.selected_index = 0;
         self.scroll_row = 0;
@@ -287,7 +296,7 @@ impl HomePage {
             return;
         }
         for video in videos {
-            self.videos.push(VideoCard { video, cover: None });
+            self.videos.push(VideoCard::new(video));
         }
         self.loading_more = false;
     }
@@ -308,7 +317,7 @@ impl HomePage {
         match api_client.get_recommendations_paged(self.fresh_idx).await {
             Ok(videos) => {
                 for video in videos {
-                    self.videos.push(VideoCard { video, cover: None });
+                    self.videos.push(VideoCard::new(video));
                 }
                 self.loading_more = false;
             }
@@ -346,7 +355,11 @@ impl HomePage {
 
             for idx in start..end {
                 // Skip if already has cover or is pending
-                if self.videos[idx].cover.is_some() || self.pending_downloads.contains(&idx) {
+                let card = &self.videos[idx];
+                if card.cover.is_some()
+                    || card.cover_failed
+                    || self.pending_downloads.contains(&idx)
+                {
                     continue;
                 }
 
@@ -357,15 +370,16 @@ impl HomePage {
 
                     // Spawn background task
                     tokio::spawn(async move {
-                        if let Some(img) = Self::download_image(&pic_url).await {
-                            let protocol = picker.new_resize_protocol(img);
-                            let _ = tx
-                                .send(CoverResult {
-                                    index: idx,
-                                    protocol,
-                                })
-                                .await;
-                        }
+                        let protocol = Self::download_image(&pic_url)
+                            .await
+                            .map(|img| picker.new_resize_protocol(img));
+                        let _ = tx
+                            .send(CoverResult {
+                                index: idx,
+                                url: pic_url,
+                                protocol,
+                            })
+                            .await;
                     });
                 }
             }
@@ -377,12 +391,26 @@ impl HomePage {
     pub fn poll_cover_results(&mut self) {
         // Try to receive all available results without blocking
         while let Ok(result) = self.cover_rx.try_recv() {
-            if result.index < self.videos.len() {
-                self.videos[result.index].cover = Some(result.protocol);
-                self.pending_downloads.remove(&result.index);
-            }
+            self.apply_cover_result(result);
         }
         self.search.poll_cover_results();
+    }
+
+    /// Store a cover on the card it was requested for; results for a card
+    /// replaced by a feed switch or refresh are dropped.
+    fn apply_cover_result(&mut self, result: CoverResult) {
+        let Some(card) = self
+            .videos
+            .get_mut(result.index)
+            .filter(|card| card.video.pic.as_deref() == Some(result.url.as_str()))
+        else {
+            return;
+        };
+        self.pending_downloads.remove(&result.index);
+        match result.protocol {
+            Some(protocol) => card.cover = Some(protocol),
+            None => card.cover_failed = true,
+        }
     }
 
     async fn download_image(url: &str) -> Option<DynamicImage> {
@@ -974,6 +1002,31 @@ fn format_count(value: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_home_cover_stops_showing_loading_and_stale_covers_are_dropped() {
+        let mut page = HomePage::new();
+        let video = |pic: &str| -> VideoItem {
+            serde_json::from_value(serde_json::json!({"id": 1, "bvid": "BV1", "pic": pic})).unwrap()
+        };
+        page.apply_recommendations(page.feed(), vec![video("https://i0.test/a.jpg")]);
+        page.pending_downloads.insert(0);
+
+        page.apply_cover_result(CoverResult {
+            index: 0,
+            url: "https://i0.test/stale.jpg".to_string(),
+            protocol: None,
+        });
+        assert!(page.pending_downloads.contains(&0));
+
+        page.apply_cover_result(CoverResult {
+            index: 0,
+            url: "https://i0.test/a.jpg".to_string(),
+            protocol: None,
+        });
+        assert!(!page.pending_downloads.contains(&0));
+        assert!(page.videos[0].cover_failed);
+    }
 
     #[test]
     fn load_more_waits_for_the_first_page() {
