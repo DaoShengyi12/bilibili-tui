@@ -1,6 +1,7 @@
 use crate::api::{
-    ApiClient,
+    ApiClient, LiveDanmakuHub,
     article::ArticleData,
+    auth::{QrcodeData, QrcodePollStatus},
     bangumi::{SeasonRankItem, SeasonResult},
     comment::{CommentItem, CommentType},
     dynamic::DynamicItem,
@@ -10,7 +11,8 @@ use crate::api::{
         SeasonArchivesData, WatchLaterData,
     },
     history::{HistoryCursor, HistoryData, HistoryKey},
-    live::LiveRoom,
+    live::{LiveRoom, LiveRoomInfo},
+    live_ws::HistoryDanmakuData,
     recommend::{HomeFeed, VideoItem},
     search::HotwordItem,
     search::SearchVideoItem,
@@ -20,6 +22,7 @@ use crate::api::{
 };
 use crate::domain::playback::{PlayOrder, PlaylistItem, PlaylistSource};
 use crate::presentation::tui::DynamicTab;
+use crate::storage::Credentials;
 use futures_util::{StreamExt, stream};
 use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
@@ -140,6 +143,51 @@ pub enum NetworkCommand {
     LoadBangumiDetail {
         req_id: u64,
         season_id: i64,
+    },
+    LoadVideoComments {
+        req_id: u64,
+        aid: i64,
+        page: i32,
+    },
+    LoadDynamicComments {
+        req_id: u64,
+        dynamic_id: String,
+        oid: i64,
+        comment_type: i32,
+        page: i32,
+    },
+    LoadCommentReplies {
+        req_id: u64,
+        aid: i64,
+        root: i64,
+    },
+    LikeComment {
+        oid: i64,
+        rpid: i64,
+        comment_type: i32,
+        like: bool,
+    },
+    PostComment {
+        oid: i64,
+        comment_type: i32,
+        message: String,
+        root: Option<i64>,
+    },
+    LoadLiveDetail {
+        req_id: u64,
+        room_id: i64,
+    },
+    ConnectLiveDanmaku {
+        req_id: u64,
+        room_id: i64,
+        uid: i64,
+    },
+    LoadQrcode {
+        req_id: u64,
+    },
+    PollQrcode {
+        req_id: u64,
+        qrcode_key: String,
     },
 }
 
@@ -281,10 +329,58 @@ pub enum NetworkEvent {
         target: &'static str,
         error: String,
     },
+    VideoCommentsLoaded {
+        req_id: u64,
+        aid: i64,
+        page: i32,
+        replies: Option<Vec<CommentItem>>,
+    },
+    DynamicCommentsLoaded {
+        req_id: u64,
+        dynamic_id: String,
+        page: i32,
+        replies: Option<Vec<CommentItem>>,
+    },
+    CommentRepliesLoaded {
+        req_id: u64,
+        root: i64,
+        replies: Vec<CommentItem>,
+    },
+    CommentLiked {
+        oid: i64,
+        rpid: i64,
+        liked: bool,
+    },
+    CommentPosted {
+        oid: i64,
+    },
+    LiveDetailLoaded {
+        req_id: u64,
+        room_id: i64,
+        room_info: LiveRoomInfo,
+        history: Option<HistoryDanmakuData>,
+    },
+    LiveDanmakuConnected {
+        req_id: u64,
+        room_id: i64,
+        hub: Arc<LiveDanmakuHub>,
+    },
+    QrcodeLoaded {
+        req_id: u64,
+        data: QrcodeData,
+    },
+    QrcodePolled {
+        req_id: u64,
+        status: Option<QrcodePollStatus>,
+        credentials: Option<Credentials>,
+    },
     /// The worker dropped the request before it finished, either because a
     /// newer request with the same key replaced it or because of
     /// `CancelPending`. Pages must leave their loading state.
-    RequestCancelled { req_id: u64, target: &'static str },
+    RequestCancelled {
+        req_id: u64,
+        target: &'static str,
+    },
 }
 
 pub struct NetworkBridge {
@@ -311,7 +407,7 @@ pub fn start_network_worker(api_client: Arc<ApiClient>) -> NetworkBridge {
             let mut cancellations =
                 HashMap::<&'static str, tokio_util::sync::CancellationToken>::new();
             while let Ok(command) = command_rx.recv() {
-                let Some(key) = command.request_key() else {
+                if matches!(command, NetworkCommand::CancelPending) {
                     cancellations.retain(|key, token| {
                         if survives_cancel_pending(key) {
                             return true;
@@ -320,20 +416,30 @@ pub fn start_network_worker(api_client: Arc<ApiClient>) -> NetworkBridge {
                         false
                     });
                     continue;
+                }
+                let api_client = api_client.clone();
+                let event_tx = event_tx.clone();
+                let (Some(key), Some(req_id)) = (command.request_key(), command.req_id()) else {
+                    // Untracked mutations always run to completion.
+                    runtime.spawn(async move {
+                        if let Some(event) = handle_command(api_client, command).await {
+                            let _ = event_tx.send(event);
+                        }
+                    });
+                    continue;
                 };
-                let req_id = command.req_id();
                 let token = tokio_util::sync::CancellationToken::new();
                 if let Some(previous) = cancellations.insert(key, token.clone()) {
                     previous.cancel();
                 }
-                let api_client = api_client.clone();
-                let event_tx = event_tx.clone();
                 runtime.spawn(async move {
                     let event = tokio::select! {
-                        _ = token.cancelled() => NetworkEvent::RequestCancelled { req_id, target: key },
+                        _ = token.cancelled() => Some(NetworkEvent::RequestCancelled { req_id, target: key }),
                         event = handle_command(api_client, command) => event,
                     };
-                    let _ = event_tx.send(event);
+                    if let Some(event) = event {
+                        let _ = event_tx.send(event);
+                    }
                 });
             }
         })
@@ -355,10 +461,13 @@ fn survives_cancel_pending(key: &str) -> bool {
 impl NetworkCommand {
     /// The request-tracking key shared with the app. A newer command with the
     /// same key supersedes the older one, so unrelated requests must not
-    /// share a key. `None` for `CancelPending`.
+    /// share a key. `None` for `CancelPending` and for untracked mutations,
+    /// which are never superseded or cancelled.
     pub fn request_key(&self) -> Option<&'static str> {
         Some(match self {
-            Self::CancelPending => return None,
+            Self::CancelPending | Self::LikeComment { .. } | Self::PostComment { .. } => {
+                return None;
+            }
             Self::LoadHome { .. } => "home",
             Self::LoadHomeMore { .. } => "home_more",
             Self::LoadHotwords { .. } => "hotwords",
@@ -381,12 +490,21 @@ impl NetworkCommand {
             Self::LoadDynamicDetail { .. } => "dynamic_detail",
             Self::LoadBangumiIndex { .. } => "bangumi_index",
             Self::LoadBangumiDetail { .. } => "bangumi_detail",
+            Self::LoadVideoComments { .. } => "video_comments",
+            Self::LoadDynamicComments { .. } => "dynamic_comments",
+            Self::LoadCommentReplies { .. } => "comment_replies",
+            Self::LoadLiveDetail { .. } => "live_detail",
+            Self::ConnectLiveDanmaku { .. } => "live_danmaku",
+            Self::LoadQrcode { .. } => "login_qrcode",
+            Self::PollQrcode { .. } => "login_poll",
         })
     }
 
-    fn req_id(&self) -> u64 {
-        match self {
-            Self::CancelPending => 0,
+    fn req_id(&self) -> Option<u64> {
+        Some(match self {
+            Self::CancelPending | Self::LikeComment { .. } | Self::PostComment { .. } => {
+                return None;
+            }
             Self::LoadHome { req_id, .. }
             | Self::LoadHomeMore { req_id, .. }
             | Self::LoadHotwords { req_id }
@@ -410,14 +528,152 @@ impl NetworkCommand {
             | Self::LoadFavoritesContent { req_id, .. }
             | Self::LoadDynamicDetail { req_id, .. }
             | Self::LoadBangumiIndex { req_id }
-            | Self::LoadBangumiDetail { req_id, .. } => *req_id,
-        }
+            | Self::LoadBangumiDetail { req_id, .. }
+            | Self::LoadVideoComments { req_id, .. }
+            | Self::LoadDynamicComments { req_id, .. }
+            | Self::LoadCommentReplies { req_id, .. }
+            | Self::LoadLiveDetail { req_id, .. }
+            | Self::ConnectLiveDanmaku { req_id, .. }
+            | Self::LoadQrcode { req_id }
+            | Self::PollQrcode { req_id, .. } => *req_id,
+        })
     }
 }
 
-async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> NetworkEvent {
+async fn handle_command(
+    api_client: Arc<ApiClient>,
+    command: NetworkCommand,
+) -> Option<NetworkEvent> {
     match command {
-        NetworkCommand::CancelPending => unreachable!("handled by worker"),
+        NetworkCommand::CancelPending => None,
+        NetworkCommand::LikeComment {
+            oid,
+            rpid,
+            comment_type,
+            like,
+        } => api_client
+            .like_comment(oid, rpid, comment_type, like)
+            .await
+            .ok()
+            .map(|()| NetworkEvent::CommentLiked {
+                oid,
+                rpid,
+                liked: like,
+            }),
+        NetworkCommand::PostComment {
+            oid,
+            comment_type,
+            message,
+            root,
+        } => api_client
+            .add_comment(oid, comment_type, &message, root, root)
+            .await
+            .ok()
+            .map(|_| NetworkEvent::CommentPosted { oid }),
+        command => Some(handle_tracked_command(api_client, command).await),
+    }
+}
+
+async fn handle_tracked_command(
+    api_client: Arc<ApiClient>,
+    command: NetworkCommand,
+) -> NetworkEvent {
+    match command {
+        NetworkCommand::CancelPending
+        | NetworkCommand::LikeComment { .. }
+        | NetworkCommand::PostComment { .. } => unreachable!("handled by handle_command"),
+        NetworkCommand::LoadVideoComments { req_id, aid, page } => {
+            match api_client.get_comments(aid, page).await {
+                Ok(data) => NetworkEvent::VideoCommentsLoaded {
+                    req_id,
+                    aid,
+                    page,
+                    replies: data.replies,
+                },
+                Err(error) => failed(req_id, "video_comments", error),
+            }
+        }
+        NetworkCommand::LoadDynamicComments {
+            req_id,
+            dynamic_id,
+            oid,
+            comment_type,
+            page,
+        } => match api_client
+            .get_dynamic_comments(oid, comment_type, page)
+            .await
+        {
+            Ok(data) => NetworkEvent::DynamicCommentsLoaded {
+                req_id,
+                dynamic_id,
+                page,
+                replies: data.replies,
+            },
+            Err(error) => failed(req_id, "dynamic_comments", error),
+        },
+        NetworkCommand::LoadCommentReplies { req_id, aid, root } => {
+            match api_client.get_comment_replies(aid, root, 1).await {
+                Ok(data) => NetworkEvent::CommentRepliesLoaded {
+                    req_id,
+                    root,
+                    replies: data.replies.unwrap_or_default(),
+                },
+                Err(error) => failed(req_id, "comment_replies", error),
+            }
+        }
+        NetworkCommand::LoadLiveDetail { req_id, room_id } => {
+            let (room_info, history) = tokio::join!(
+                api_client.get_live_room_info(room_id),
+                api_client.get_history_danmaku(room_id)
+            );
+            match room_info {
+                Ok(room_info) => NetworkEvent::LiveDetailLoaded {
+                    req_id,
+                    room_id,
+                    room_info,
+                    history: history.ok(),
+                },
+                Err(error) => failed(req_id, "live_detail", error),
+            }
+        }
+        NetworkCommand::ConnectLiveDanmaku {
+            req_id,
+            room_id,
+            uid,
+        } => match LiveDanmakuHub::connect(&api_client, room_id, uid).await {
+            Ok(hub) => NetworkEvent::LiveDanmakuConnected {
+                req_id,
+                room_id,
+                hub,
+            },
+            Err(error) => failed(req_id, "live_danmaku", error),
+        },
+        NetworkCommand::LoadQrcode { req_id } => match api_client.get_qrcode_data().await {
+            Ok(data) => NetworkEvent::QrcodeLoaded { req_id, data },
+            Err(error) => failed(req_id, "login_qrcode", error),
+        },
+        NetworkCommand::PollQrcode { req_id, qrcode_key } => {
+            match api_client.poll_qrcode(&qrcode_key).await {
+                Ok(result) => {
+                    let status = result
+                        .data
+                        .as_ref()
+                        .map(|data| QrcodePollStatus::from(data.code));
+                    let credentials = match (status, result.data) {
+                        (Some(QrcodePollStatus::Success), Some(data)) => {
+                            Credentials::from_cookies(&result.cookies, Some(data.refresh_token))
+                        }
+                        _ => None,
+                    };
+                    NetworkEvent::QrcodePolled {
+                        req_id,
+                        status,
+                        credentials,
+                    }
+                }
+                Err(error) => failed(req_id, "login_poll", error),
+            }
+        }
         NetworkCommand::LoadHome {
             req_id,
             feed,
@@ -1064,6 +1320,27 @@ mod tests {
             })
         );
         assert_eq!(key(NetworkCommand::CancelPending), None);
+    }
+
+    #[test]
+    fn comment_mutations_are_never_superseded() {
+        for command in [
+            NetworkCommand::LikeComment {
+                oid: 1,
+                rpid: 2,
+                comment_type: 1,
+                like: true,
+            },
+            NetworkCommand::PostComment {
+                oid: 1,
+                comment_type: 1,
+                message: "hi".into(),
+                root: None,
+            },
+        ] {
+            assert_eq!(command.request_key(), None);
+            assert_eq!(command.req_id(), None);
+        }
     }
 
     #[test]

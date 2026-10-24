@@ -2,7 +2,6 @@
 
 use super::{Component, Theme, shortcut_footer};
 use crate::api::auth::{QrcodeData, QrcodePollStatus};
-use crate::api::client::ApiClient;
 use crate::application::AppAction;
 use crate::storage::{Credentials, Keybindings};
 use image::DynamicImage;
@@ -18,6 +17,7 @@ pub struct LoginPage {
     error_message: Option<String>,
     poll_status: QrcodePollStatus,
     last_poll: Option<Instant>,
+    poll_in_flight: bool,
     picker: Arc<Picker>,
     qr_image_protocol: Option<StatefulProtocol>,
 }
@@ -30,24 +30,23 @@ impl LoginPage {
             error_message: None,
             poll_status: QrcodePollStatus::Waiting,
             last_poll: None,
+            poll_in_flight: false,
             picker,
             qr_image_protocol: None,
         }
     }
 
-    pub async fn load_qrcode(&mut self, api_client: &ApiClient) {
-        match api_client.get_qrcode_data().await {
-            Ok(data) => {
-                self.qr_image_protocol = Self::generate_qr_image(&data.url, &self.picker);
-                self.qrcode_data = Some(data);
-                self.error_message = None;
-                self.poll_status = QrcodePollStatus::Waiting;
-                self.last_poll = None;
-            }
-            Err(e) => {
-                self.error_message = Some(format!("获取二维码失败: {}", e));
-            }
-        }
+    pub fn apply_qrcode(&mut self, data: QrcodeData) {
+        self.qr_image_protocol = Self::generate_qr_image(&data.url, &self.picker);
+        self.qrcode_data = Some(data);
+        self.error_message = None;
+        self.poll_status = QrcodePollStatus::Waiting;
+        self.last_poll = None;
+        self.poll_in_flight = false;
+    }
+
+    pub fn apply_qrcode_error(&mut self, msg: String) {
+        self.error_message = Some(msg);
     }
 
     fn generate_qr_image(url: &str, picker: &Picker) -> Option<StatefulProtocol> {
@@ -122,54 +121,43 @@ impl LoginPage {
         }
     }
 
-    pub async fn tick(&mut self, api_client: &ApiClient) -> Option<AppAction> {
-        // Only poll if we have a QR code and haven't succeeded/expired
-        let qrcode_key = match &self.qrcode_data {
-            Some(data) => data.qrcode_key.clone(),
-            None => return None,
-        };
-
-        // Don't poll if already successful or expired
-        if matches!(
-            self.poll_status,
-            QrcodePollStatus::Success | QrcodePollStatus::Expired
-        ) {
+    /// Returns the QR code key when a poll is due: every 2 seconds while a
+    /// code is waiting for confirmation and no poll is in flight.
+    pub fn poll_request(&mut self) -> Option<String> {
+        let data = self.qrcode_data.as_ref()?;
+        if self.poll_in_flight
+            || matches!(
+                self.poll_status,
+                QrcodePollStatus::Success | QrcodePollStatus::Expired
+            )
+            || self
+                .last_poll
+                .is_some_and(|t| t.elapsed() <= Duration::from_secs(2))
+        {
             return None;
         }
-
-        // Poll every 2 seconds
-        let should_poll = self
-            .last_poll
-            .map(|t| t.elapsed() > Duration::from_secs(2))
-            .unwrap_or(true);
-
-        if !should_poll {
-            return None;
-        }
-
         self.last_poll = Some(Instant::now());
+        self.poll_in_flight = true;
+        Some(data.qrcode_key.clone())
+    }
 
-        match api_client.poll_qrcode(&qrcode_key).await {
-            Ok(result) => {
-                if let Some(data) = result.data {
-                    self.poll_status = QrcodePollStatus::from(data.code);
-
-                    if self.poll_status == QrcodePollStatus::Success {
-                        // Extract credentials from cookies
-                        if let Some(creds) =
-                            Credentials::from_cookies(&result.cookies, Some(data.refresh_token))
-                        {
-                            return Some(AppAction::LoginSuccess(creds));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                self.error_message = Some(format!("轮询失败: {}", e));
-            }
+    pub fn apply_poll(
+        &mut self,
+        status: Option<QrcodePollStatus>,
+        credentials: Option<Credentials>,
+    ) -> Option<AppAction> {
+        self.poll_in_flight = false;
+        let status = status?;
+        self.poll_status = status;
+        if status == QrcodePollStatus::Success {
+            return credentials.map(AppAction::LoginSuccess);
         }
-
         None
+    }
+
+    pub fn apply_poll_error(&mut self, msg: String) {
+        self.poll_in_flight = false;
+        self.error_message = Some(msg);
     }
 
     fn status_text(&self, theme: &Theme) -> (&str, Color) {
@@ -329,5 +317,49 @@ impl Component for LoginPage {
             return Some(AppAction::SwitchToLogin);
         }
         Some(AppAction::None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn waiting_page() -> LoginPage {
+        let mut page = LoginPage::new();
+        page.apply_qrcode(QrcodeData {
+            url: "https://example.com/qr".into(),
+            qrcode_key: "key".into(),
+        });
+        page
+    }
+
+    #[test]
+    fn qrcode_poll_waits_for_the_previous_poll_and_the_interval() {
+        let mut page = waiting_page();
+        assert_eq!(page.poll_request().as_deref(), Some("key"));
+        assert_eq!(page.poll_request(), None);
+        page.apply_poll(Some(QrcodePollStatus::Scanned), None);
+        assert_eq!(page.poll_request(), None);
+        page.last_poll = Some(Instant::now() - Duration::from_secs(3));
+        assert_eq!(page.poll_request().as_deref(), Some("key"));
+        page.apply_poll_error("轮询失败: timeout".into());
+        assert!(!page.poll_in_flight);
+    }
+
+    #[test]
+    fn successful_poll_returns_login_and_stops_polling() {
+        let mut page = waiting_page();
+        page.poll_request();
+        let credentials = Credentials {
+            sessdata: String::new(),
+            bili_jct: String::new(),
+            dede_user_id: "1".into(),
+            dede_user_id_ckmd5: None,
+            refresh_token: None,
+        };
+        let action = page.apply_poll(Some(QrcodePollStatus::Success), Some(credentials));
+        assert!(matches!(action, Some(AppAction::LoginSuccess(_))));
+        page.last_poll = None;
+        assert_eq!(page.poll_request(), None);
     }
 }

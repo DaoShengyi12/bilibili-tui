@@ -17,6 +17,14 @@ pub struct LiveDanmakuHub {
     shutdown_tx: mpsc::Sender<()>,
 }
 
+impl std::fmt::Debug for LiveDanmakuHub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveDanmakuHub")
+            .field("room_id", &self.room_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl LiveDanmakuHub {
     pub async fn connect(api_client: &ApiClient, room_id: i64, uid: i64) -> Result<Arc<Self>> {
         let danmu_info = api_client.get_danmu_info(room_id).await?;

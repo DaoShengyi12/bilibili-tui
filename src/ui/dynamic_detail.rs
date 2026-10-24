@@ -1,7 +1,6 @@
 //! Dynamic detail page for viewing image/text dynamics
 
 use super::{Component, Theme, shortcut_footer};
-use crate::api::client::ApiClient;
 use crate::api::comment::CommentItem;
 use crate::api::dynamic::DynamicItem;
 use crate::application::AppAction;
@@ -79,65 +78,6 @@ impl DynamicDetailPage {
         }
     }
 
-    pub async fn load_data(&mut self, api_client: &ApiClient) {
-        self.loading = true;
-        self.error_message = None;
-
-        // Load dynamic detail
-        match api_client.get_dynamic_detail(&self.dynamic_id).await {
-            Ok(item) => {
-                self.dynamic_item = Some(item);
-            }
-            Err(e) => {
-                self.error_message = Some(format!("加载动态详情失败: {}", e));
-                self.loading = false;
-                return;
-            }
-        }
-
-        // Load comments using the correct type and oid
-        if let Some(ref item) = self.dynamic_item {
-            let comment_type = item.comment_type();
-            if let Some(oid) = item.comment_oid(&self.dynamic_id) {
-                match api_client.get_dynamic_comments(oid, comment_type, 1).await {
-                    Ok(data) => {
-                        self.comments = data.replies.unwrap_or_default();
-                        self.comment_page = 1;
-                        if let Some(page) = data.page {
-                            self.has_more_comments =
-                                page.count.unwrap_or(0) > self.comments.len() as i32;
-                        }
-                    }
-                    Err(e) => {
-                        if self.error_message.is_none() {
-                            self.error_message = Some(format!("加载评论失败: {}", e));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Get image URLs (both draw and opus types have images)
-        if let Some(ref item) = self.dynamic_item {
-            let mut urls: Vec<&str> = Vec::new();
-
-            // Collect images from draw type
-            if item.is_draw() {
-                urls.extend(item.draw_images());
-            }
-
-            // Collect images from opus type
-            if item.is_opus() {
-                urls.extend(item.opus_images());
-            }
-
-            self.image_urls = urls.into_iter().map(|s| s.to_string()).collect();
-            self.image_protocols = (0..self.image_urls.len()).map(|_| None).collect();
-        }
-
-        self.loading = false;
-    }
-
     /// Start background downloads for images (non-blocking)
     pub fn start_image_downloads(&mut self) {
         for (idx, url) in self.image_urls.iter().enumerate() {
@@ -181,38 +121,32 @@ impl DynamicDetailPage {
         image::load_from_memory(&bytes).ok()
     }
 
-    pub async fn load_more_comments(&mut self, api_client: &ApiClient) {
+    /// Marks the next comment page as loading and returns the comment
+    /// target and page number, or `None` when there is nothing to load.
+    pub fn begin_load_more_comments(&mut self) -> Option<(i64, i32, i32)> {
         if !self.has_more_comments || self.loading_more_comments {
-            return;
+            return None;
         }
+        let item = self.dynamic_item.as_ref()?;
+        let oid = item.comment_oid(&self.dynamic_id)?;
+        let comment_type = item.comment_type();
+        self.loading_more_comments = true;
+        Some((oid, comment_type, self.comment_page + 1))
+    }
 
-        if let Some(ref item) = self.dynamic_item {
-            let comment_type = item.comment_type();
-            if let Some(oid) = item.comment_oid(&self.dynamic_id) {
-                self.loading_more_comments = true;
-                self.comment_page += 1;
-                match api_client
-                    .get_dynamic_comments(oid, comment_type, self.comment_page)
-                    .await
-                {
-                    Ok(data) => {
-                        if let Some(replies) = data.replies {
-                            if replies.is_empty() {
-                                self.has_more_comments = false;
-                            } else {
-                                self.comments.extend(replies);
-                            }
-                        } else {
-                            self.has_more_comments = false;
-                        }
-                    }
-                    Err(_) => {
-                        self.comment_page -= 1;
-                    }
-                }
-                self.loading_more_comments = false;
+    pub fn apply_more_comments(&mut self, page: i32, replies: Option<Vec<CommentItem>>) {
+        match replies {
+            Some(replies) if !replies.is_empty() => {
+                self.comments.extend(replies);
+                self.comment_page = page;
             }
+            _ => self.has_more_comments = false,
         }
+        self.loading_more_comments = false;
+    }
+
+    pub fn apply_more_comments_error(&mut self) {
+        self.loading_more_comments = false;
     }
 
     fn get_content_lines(&self) -> Vec<String> {

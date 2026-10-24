@@ -39,6 +39,10 @@ pub enum PlaybackStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaybackEvent {
+    /// The player process is running; sent once its setup finished.
+    Started {
+        session_id: u64,
+    },
     ItemChanged {
         session_id: u64,
         index: usize,
@@ -75,6 +79,14 @@ impl PlaybackState {
         self.session_id = None;
     }
 
+    /// Claims `session_id` before the player starts in the background, so
+    /// events from the new player are accepted as soon as they arrive.
+    pub fn begin_starting(&mut self, session_id: u64) {
+        self.session_id = Some(session_id);
+        self.status = PlaybackStatus::Starting;
+        self.last_error = None;
+    }
+
     pub fn begin_session(&mut self, session_id: u64) {
         self.session_id = Some(session_id);
         self.status = PlaybackStatus::Playing;
@@ -83,7 +95,8 @@ impl PlaybackState {
 
     pub fn apply_event(&mut self, event: &PlaybackEvent) -> bool {
         let session_id = match event {
-            PlaybackEvent::ItemChanged { session_id, .. }
+            PlaybackEvent::Started { session_id }
+            | PlaybackEvent::ItemChanged { session_id, .. }
             | PlaybackEvent::Finished { session_id, .. }
             | PlaybackEvent::Failed { session_id, .. } => *session_id,
         };
@@ -91,6 +104,11 @@ impl PlaybackState {
             return false;
         }
         match event {
+            PlaybackEvent::Started { .. } => {
+                if self.status == PlaybackStatus::Starting {
+                    self.status = PlaybackStatus::Playing;
+                }
+            }
             PlaybackEvent::ItemChanged { index, bvid, .. } => {
                 self.current_index = if self
                     .queue
@@ -152,6 +170,25 @@ impl PlaybackState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_start_reports_playing_or_failure_for_its_session() {
+        let mut state = PlaybackState::default();
+        state.begin_starting(1);
+        assert_eq!(state.status, PlaybackStatus::Starting);
+        assert!(state.apply_event(&PlaybackEvent::Started { session_id: 1 }));
+        assert_eq!(state.status, PlaybackStatus::Playing);
+
+        state.begin_starting(2);
+        assert!(!state.apply_event(&PlaybackEvent::Started { session_id: 1 }));
+        assert_eq!(state.status, PlaybackStatus::Starting);
+        assert!(state.apply_event(&PlaybackEvent::Failed {
+            session_id: 2,
+            error: "启动播放器失败: mpv".into(),
+        }));
+        assert_eq!(state.status, PlaybackStatus::Failed);
+        assert_eq!(state.session_id, None);
+    }
 
     fn item(id: i64) -> PlaylistItem {
         PlaylistItem {

@@ -1,8 +1,7 @@
 //! Video detail page showing video info, comments, and related videos
 
-use super::video_card::{VideoCard, VideoCardGrid};
+use super::video_card::VideoCardGrid;
 use super::{Component, Theme, shortcut_footer};
-use crate::api::client::ApiClient;
 use crate::api::comment::CommentItem;
 use crate::api::video::{RelatedVideoItem, VideoInfo};
 use crate::application::AppAction;
@@ -120,129 +119,60 @@ impl VideoDetailPage {
         }
     }
 
-    pub async fn load_data(&mut self, api_client: &ApiClient) {
-        self.loading = true;
-        self.error_message = None;
-
-        // Load video info
-        match api_client.get_video_info(&self.bvid).await {
-            Ok(info) => {
-                self.video_info = Some(info);
-            }
-            Err(e) => {
-                self.error_message = Some(format!("加载视频信息失败: {}", e));
-            }
+    /// Marks the next comment page as loading and returns its number, or
+    /// `None` when there is nothing more to load or a page is in flight.
+    pub fn begin_load_more_comments(&mut self) -> Option<i32> {
+        if !self.has_more_comments || self.loading_more_comments {
+            return None;
         }
-
-        // Load comments
-        match api_client.get_comments(self.aid, 1).await {
-            Ok(data) => {
-                self.comments = data.replies.unwrap_or_default();
-                self.comment_page = 1;
-                if let Some(page) = data.page {
-                    self.has_more_comments = page.count.unwrap_or(0) > self.comments.len() as i32;
-                }
-            }
-            Err(e) => {
-                if self.error_message.is_none() {
-                    self.error_message = Some(format!("加载评论失败: {}", e));
-                }
-            }
-        }
-
-        // Load related videos
-        if self.recommendations_enabled {
-            match api_client.get_related_videos(&self.bvid).await {
-                Ok(videos) => {
-                    self.related_videos = videos.clone();
-                    // Populate video card grid
-                    self.related_card_grid.clear();
-                    for video in &videos {
-                        let card = VideoCard::new(
-                            video.bvid.clone(),
-                            video.aid,
-                            video.title.clone().unwrap_or_else(|| "无标题".to_string()),
-                            video.author_name().to_string(),
-                            video.format_views(),
-                            video.format_duration(),
-                            video.cover_url(),
-                        )
-                        .with_uploader_mid(video.owner.as_ref().and_then(|owner| owner.mid));
-                        self.related_card_grid.add_card(card);
-                    }
-                }
-                Err(e) => {
-                    if self.error_message.is_none() {
-                        self.error_message = Some(format!("加载相关视频失败: {}", e));
-                    }
-                }
-            }
-        }
-        self.loading = false;
+        self.loading_more_comments = true;
+        Some(self.comment_page + 1)
     }
 
-    pub async fn load_more_comments(&mut self, api_client: &ApiClient) {
-        if !self.has_more_comments || self.loading_more_comments {
-            return;
-        }
-
-        self.loading_more_comments = true;
-        self.comment_page += 1;
-        match api_client.get_comments(self.aid, self.comment_page).await {
-            Ok(data) => {
-                if let Some(replies) = data.replies {
-                    if replies.is_empty() {
-                        self.has_more_comments = false;
-                    } else {
-                        self.comments.extend(replies);
-                    }
-                } else {
-                    self.has_more_comments = false;
-                }
+    pub fn apply_more_comments(&mut self, page: i32, replies: Option<Vec<CommentItem>>) {
+        match replies {
+            Some(replies) if !replies.is_empty() => {
+                self.comments.extend(replies);
+                self.comment_page = page;
             }
-            Err(_) => {
-                self.comment_page -= 1;
-            }
+            _ => self.has_more_comments = false,
         }
         self.loading_more_comments = false;
     }
 
-    pub async fn toggle_comment_replies(&mut self, api_client: &ApiClient) {
-        if self.comment_scroll >= self.comments.len() {
-            return;
-        }
+    pub fn apply_more_comments_error(&mut self) {
+        self.loading_more_comments = false;
+    }
 
-        let comment = &self.comments[self.comment_scroll];
+    /// Collapses the selected comment's replies when they are shown, or
+    /// expands them and returns the comment to load replies for.
+    pub fn toggle_comment_replies(&mut self) -> Option<i64> {
+        let comment = self.comments.get(self.comment_scroll)?;
         let comment_rpid = comment.rpid;
 
-        // If already expanded, collapse it
         if self.expanded_comment == Some(comment_rpid) {
             self.expanded_comment = None;
             self.comment_replies.clear();
-            return;
+            self.loading_replies = false;
+            return None;
         }
-
-        // Check if comment has replies
         if comment.reply_count() == 0 {
+            return None;
+        }
+
+        self.expanded_comment = Some(comment_rpid);
+        self.comment_replies.clear();
+        self.loading_replies = true;
+        Some(comment_rpid)
+    }
+
+    /// Replies for a comment that is no longer expanded are ignored. A failed
+    /// load (`None`) leaves the comment expanded with no replies.
+    pub fn apply_comment_replies(&mut self, root: i64, replies: Option<Vec<CommentItem>>) {
+        if self.expanded_comment != Some(root) {
             return;
         }
-
-        // Expand and load replies
-        self.expanded_comment = Some(comment_rpid);
-        self.loading_replies = true;
-
-        match api_client
-            .get_comment_replies(self.aid, comment_rpid, 1)
-            .await
-        {
-            Ok(data) => {
-                self.comment_replies = data.replies.unwrap_or_default();
-            }
-            Err(_) => {
-                self.comment_replies.clear();
-            }
-        }
-
+        self.comment_replies = replies.unwrap_or_default();
         self.loading_replies = false;
     }
 
@@ -1099,6 +1029,50 @@ fn truncate_str(s: &str, max_len: usize) -> String {
             + "..."
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod comment_loading_tests {
+    use super::*;
+
+    fn comment(rpid: i64, rcount: i32) -> CommentItem {
+        serde_json::from_value(serde_json::json!({
+            "rpid": rpid, "oid": 1, "mid": 1, "parent": 0, "rcount": rcount
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn load_more_comments_runs_one_page_at_a_time_and_ends_on_failure() {
+        let mut page = VideoDetailPage::new("BV1test".into(), 1);
+        page.has_more_comments = true;
+        assert_eq!(page.begin_load_more_comments(), Some(2));
+        assert_eq!(page.begin_load_more_comments(), None);
+        page.apply_more_comments_error();
+        assert!(!page.loading_more_comments);
+        assert_eq!(page.comment_page, 1);
+
+        assert_eq!(page.begin_load_more_comments(), Some(2));
+        page.apply_more_comments(2, Some(vec![comment(5, 0)]));
+        assert_eq!(page.comment_page, 2);
+        assert_eq!(page.comments.len(), 1);
+        page.begin_load_more_comments();
+        page.apply_more_comments(3, Some(Vec::new()));
+        assert!(!page.has_more_comments && !page.loading_more_comments);
+    }
+
+    #[test]
+    fn replies_for_a_collapsed_comment_are_ignored() {
+        let mut page = VideoDetailPage::new("BV1test".into(), 1);
+        page.comments = vec![comment(7, 2)];
+        assert_eq!(page.toggle_comment_replies(), Some(7));
+        assert!(page.loading_replies);
+        assert_eq!(page.toggle_comment_replies(), None);
+        assert!(!page.loading_replies);
+
+        page.apply_comment_replies(7, Some(vec![comment(8, 0)]));
+        assert!(page.comment_replies.is_empty());
     }
 }
 

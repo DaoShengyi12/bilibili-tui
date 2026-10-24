@@ -5,7 +5,7 @@ use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent},
     prelude::*,
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 use std::io;
 
@@ -136,6 +136,26 @@ impl App {
             self.draw_page(frame, chunks[0]);
         }
         self.draw_playback_error(frame, area);
+        self.draw_playback_starting(frame, area);
+    }
+
+    fn draw_playback_starting(&self, frame: &mut Frame, area: Rect) {
+        if self.playback.status != crate::domain::playback::PlaybackStatus::Starting
+            || self.playback.last_error.is_some()
+        {
+            return;
+        }
+        let bar = Rect {
+            x: area.x,
+            y: area.bottom().saturating_sub(1),
+            width: area.width,
+            height: 1.min(area.height),
+        };
+        let message = Paragraph::new("⏳ 正在启动播放器...")
+            .style(Style::default().fg(self.theme.warning))
+            .alignment(Alignment::Center);
+        frame.render_widget(Clear, bar);
+        frame.render_widget(message, bar);
     }
 
     fn draw_playback_error(&self, frame: &mut Frame, area: Rect) {
@@ -233,8 +253,19 @@ impl App {
 
     pub(super) async fn tick(&mut self) {
         self.drain_network_events();
-        if let Some((items, source, start_index, order)) = self.pending_playlist.take() {
-            self.start_playlist(items, source, start_index, order).await;
+        for action in std::mem::take(&mut self.deferred_actions) {
+            self.handle_action(action).await;
+        }
+        let qrcode_poll = match &mut self.current_page {
+            Page::Login(page) => page.poll_request(),
+            _ => None,
+        };
+        if let Some(qrcode_key) = qrcode_poll {
+            let req_id = self.next_request_id("login_poll");
+            self.send_network_command(crate::application::network::NetworkCommand::PollQrcode {
+                req_id,
+                qrcode_key,
+            });
         }
         while let Ok(event) = self.playback_event_rx.try_recv() {
             let accepted = self.playback.apply_event(&event);
@@ -306,12 +337,7 @@ impl App {
             }
         }
         match &mut self.current_page {
-            Page::Login(page) => {
-                let client = &self.api_client;
-                if let Some(action) = page.tick(client).await {
-                    self.handle_action(action).await;
-                }
-            }
+            Page::Login(_) => {}
             Page::Home(page) => {
                 // Non-blocking: poll completed downloads and start new ones
                 page.poll_cover_results();

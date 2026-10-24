@@ -1,12 +1,12 @@
 use crate::app::{App, PreviousPage};
 use crate::application::{AppAction, network};
+use crate::domain::playback::PlaybackEvent;
 use crate::infrastructure::{media, persistence};
 use crate::presentation::tui::{
     ArticleDetailPage, BangumiDetailPage, BangumiPage, DynamicDetailPage, DynamicPage,
     FavoritesPage, HistoryPage, HomePage, LiveDetailPage, LivePage, LoginPage, NavItem, Page,
     SearchPage, SettingsPage, Theme, UpPage,
 };
-use std::sync::Arc;
 
 impl App {
     fn login_required_message() -> String {
@@ -48,6 +48,22 @@ impl App {
     }
 
     pub(super) async fn handle_action(&mut self, action: AppAction) {
+        // One player starts at a time; a second key press while the first
+        // start is still running would otherwise launch a second mpv.
+        if self.playback.status == crate::domain::playback::PlaybackStatus::Starting
+            && matches!(
+                action,
+                AppAction::PlayVideo { .. }
+                    | AppAction::PlayVideoWithPages { .. }
+                    | AppAction::PlayPlaylist { .. }
+                    | AppAction::PlayUpAll { .. }
+                    | AppAction::PlayFavoriteAll { .. }
+                    | AppAction::PlayLive { .. }
+                    | AppAction::PlayBangumiEpisode { .. }
+            )
+        {
+            return;
+        }
         if self.config.minimal_mode
             && matches!(
                 action,
@@ -115,33 +131,7 @@ impl App {
                 cid,
                 duration,
             } => {
-                let session_id = self.allocate_playback_session();
-                self.playback.session_id = None;
-                self.playback.status = crate::domain::playback::PlaybackStatus::Starting;
-                let api_client = self.api_client.clone();
-                match media::play_video(
-                    api_client,
-                    &bvid,
-                    aid,
-                    cid,
-                    duration,
-                    None,
-                    self.credentials.as_ref(),
-                    self.config.danmaku.clone(),
-                    self.config.video_quality,
-                    self.playback_event_tx.clone(),
-                    session_id,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        self.playback.begin_session(session_id);
-                    }
-                    Err(error) => {
-                        self.playback.status = crate::domain::playback::PlaybackStatus::Failed;
-                        self.playback.last_error = Some(format!("启动播放器失败: {error:#}"));
-                    }
-                }
+                self.start_video_playback(bvid, aid, cid, duration, None);
             }
             AppAction::PlayVideoWithPages {
                 bvid,
@@ -150,35 +140,9 @@ impl App {
                 current_index,
             } => {
                 // Play only the selected episode
-                if current_index < pages.len() {
-                    let session_id = self.allocate_playback_session();
-                    self.playback.session_id = None;
-                    self.playback.status = crate::domain::playback::PlaybackStatus::Starting;
-                    let page = &pages[current_index];
-                    let api_client = self.api_client.clone();
-                    match media::play_video(
-                        api_client,
-                        &bvid,
-                        aid,
-                        page.cid,
-                        page.duration,
-                        Some(page.page),
-                        self.credentials.as_ref(),
-                        self.config.danmaku.clone(),
-                        self.config.video_quality,
-                        self.playback_event_tx.clone(),
-                        session_id,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            self.playback.begin_session(session_id);
-                        }
-                        Err(error) => {
-                            self.playback.status = crate::domain::playback::PlaybackStatus::Failed;
-                            self.playback.last_error = Some(format!("启动播放器失败: {error:#}"));
-                        }
-                    }
+                if let Some(page) = pages.get(current_index) {
+                    let (cid, duration, page_num) = (page.cid, page.duration, page.page);
+                    self.start_video_playback(bvid.clone(), aid, cid, duration, Some(page_num));
                     // Update current page index in video detail page
                     if let Page::VideoDetail(detail_page) = &mut self.current_page
                         && detail_page.bvid == bvid
@@ -192,7 +156,7 @@ impl App {
                 source,
                 start_index,
                 order,
-            } => self.start_playlist(items, source, start_index, order).await,
+            } => self.start_playlist(items, source, start_index, order),
             AppAction::PlayUpAll {
                 mid,
                 name,
@@ -670,18 +634,41 @@ impl App {
                 self.init_current_page().await;
             }
             AppAction::LoadMoreComments => {
-                if let Page::VideoDetail(page) = &mut self.current_page {
-                    let client = self.api_client.clone();
-                    page.load_more_comments(&client).await;
-                } else if let Page::DynamicDetail(page) = &mut self.current_page {
-                    let client = self.api_client.clone();
-                    page.load_more_comments(&client).await;
+                if let Page::VideoDetail(page) = &mut self.current_page
+                    && let Some(next_page) = page.begin_load_more_comments()
+                {
+                    let aid = page.aid;
+                    let req_id = self.next_request_id("video_comments");
+                    self.send_network_command(network::NetworkCommand::LoadVideoComments {
+                        req_id,
+                        aid,
+                        page: next_page,
+                    });
+                } else if let Page::DynamicDetail(page) = &mut self.current_page
+                    && let Some((oid, comment_type, next_page)) = page.begin_load_more_comments()
+                {
+                    let dynamic_id = page.dynamic_id.clone();
+                    let req_id = self.next_request_id("dynamic_comments");
+                    self.send_network_command(network::NetworkCommand::LoadDynamicComments {
+                        req_id,
+                        dynamic_id,
+                        oid,
+                        comment_type,
+                        page: next_page,
+                    });
                 }
             }
             AppAction::ToggleCommentReplies => {
-                if let Page::VideoDetail(page) = &mut self.current_page {
-                    let client = self.api_client.clone();
-                    page.toggle_comment_replies(&client).await;
+                if let Page::VideoDetail(page) = &mut self.current_page
+                    && let Some(root) = page.toggle_comment_replies()
+                {
+                    let aid = page.aid;
+                    let req_id = self.next_request_id("comment_replies");
+                    self.send_network_command(network::NetworkCommand::LoadCommentReplies {
+                        req_id,
+                        aid,
+                        root,
+                    });
                 }
             }
             AppAction::SwitchDynamicTab(tab) => {
@@ -744,33 +731,18 @@ impl App {
                     self.apply_login_required_hint();
                     return;
                 }
-                let client = self.api_client.clone();
                 // Toggle like - if already liked, unlike
-                if let Page::VideoDetail(page) = &mut self.current_page {
-                    let is_liked = page.liked_comments.contains(&rpid);
-                    if let Ok(()) = client
-                        .like_comment(oid, rpid, comment_type, !is_liked)
-                        .await
-                    {
-                        if is_liked {
-                            page.liked_comments.remove(&rpid);
-                        } else {
-                            page.liked_comments.insert(rpid);
-                        }
-                    }
-                } else if let Page::DynamicDetail(page) = &mut self.current_page {
-                    let is_liked = page.liked_comments.contains(&rpid);
-                    if let Ok(()) = client
-                        .like_comment(oid, rpid, comment_type, !is_liked)
-                        .await
-                    {
-                        if is_liked {
-                            page.liked_comments.remove(&rpid);
-                        } else {
-                            page.liked_comments.insert(rpid);
-                        }
-                    }
-                }
+                let is_liked = match &self.current_page {
+                    Page::VideoDetail(page) => page.liked_comments.contains(&rpid),
+                    Page::DynamicDetail(page) => page.liked_comments.contains(&rpid),
+                    _ => return,
+                };
+                self.send_network_command(network::NetworkCommand::LikeComment {
+                    oid,
+                    rpid,
+                    comment_type,
+                    like: !is_liked,
+                });
             }
             AppAction::AddComment {
                 oid,
@@ -782,18 +754,12 @@ impl App {
                     self.apply_login_required_hint();
                     return;
                 }
-                let client = self.api_client.clone();
-                if let Ok(_response) = client
-                    .add_comment(oid, comment_type, &message, root, root)
-                    .await
-                {
-                    // Reload comments to show new comment
-                    if let Page::VideoDetail(page) = &mut self.current_page {
-                        page.load_data(&client).await;
-                    } else if let Page::DynamicDetail(page) = &mut self.current_page {
-                        page.load_data(&client).await;
-                    }
-                }
+                self.send_network_command(network::NetworkCommand::PostComment {
+                    oid,
+                    comment_type,
+                    message,
+                    root,
+                });
             }
             AppAction::SaveKeybindings(new_keybindings) => {
                 self.keybindings = (*new_keybindings).clone();
@@ -839,33 +805,25 @@ impl App {
             AppAction::OpenLiveDetail(room_id) => {
                 self.save_previous_page();
                 let mut detail_page = LiveDetailPage::new(room_id);
-                let client = &self.api_client;
-                detail_page.load_room_info(client).await;
-                detail_page.load_history_danmaku(client).await;
-                let uid = self
-                    .credentials
-                    .as_ref()
-                    .and_then(|c| c.dede_user_id.parse::<i64>().ok())
-                    .unwrap_or(0);
                 let existing_hub = self
                     .live_danmaku_hub
                     .as_ref()
                     .filter(|hub| hub.room_id() == room_id)
                     .cloned();
-                let hub_result = match existing_hub {
-                    Some(hub) => Ok(hub),
-                    None => crate::api::LiveDanmakuHub::connect(client, room_id, uid).await,
-                };
-                match hub_result {
-                    Ok(hub) => {
-                        detail_page.attach_danmaku_hub(Arc::clone(&hub));
-                        self.live_danmaku_hub = Some(hub);
-                    }
-                    Err(error) => {
-                        detail_page.set_ws_error(format!("WS连接失败: {error}"));
+                match existing_hub {
+                    Some(hub) => detail_page.attach_danmaku_hub(hub),
+                    None => {
+                        let uid = self.login_uid();
+                        let req_id = self.next_request_id("live_danmaku");
+                        self.send_network_command(network::NetworkCommand::ConnectLiveDanmaku {
+                            req_id,
+                            room_id,
+                            uid,
+                        });
                     }
                 }
                 self.current_page = Page::LiveDetail(Box::new(detail_page));
+                self.init_current_page().await;
             }
             AppAction::RefreshLive => {
                 if let Page::Live(page) = &mut self.current_page {
@@ -890,46 +848,29 @@ impl App {
                     .as_ref()
                     .filter(|hub| hub.room_id() == room_id)
                     .cloned();
-                let danmaku_hub = if existing_hub.is_some() {
-                    existing_hub
-                } else {
-                    let uid = self
-                        .credentials
-                        .as_ref()
-                        .and_then(|credentials| credentials.dede_user_id.parse::<i64>().ok())
-                        .unwrap_or(0);
-                    match crate::api::LiveDanmakuHub::connect(&self.api_client, room_id, uid).await
-                    {
-                        Ok(hub) => {
-                            self.live_danmaku_hub = Some(Arc::clone(&hub));
-                            Some(hub)
-                        }
-                        Err(error) => {
-                            if let Page::LiveDetail(page) = &mut self.current_page {
-                                page.set_ws_error(format!("WS连接失败: {error}"));
-                            }
-                            None
-                        }
-                    }
-                };
-                match media::play_live(
-                    self.api_client.clone(),
-                    room_id,
-                    danmaku_hub,
-                    self.danmaku_config_tx.subscribe(),
-                    self.config.video_quality,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        self.playback.status = crate::domain::playback::PlaybackStatus::Playing;
-                        self.playback.last_error = None;
-                    }
-                    Err(error) => {
-                        self.playback.status = crate::domain::playback::PlaybackStatus::Failed;
-                        self.playback.last_error = Some(format!("启动直播失败: {error:#}"));
-                    }
-                }
+                let uid = self.login_uid();
+                let api_client = self.api_client.clone();
+                let danmaku_config_rx = self.danmaku_config_tx.subscribe();
+                let video_quality = self.config.video_quality;
+                let session_id = self.allocate_playback_session();
+                self.start_playback(session_id, "启动直播失败", async move {
+                    // Without a shared hub, the player connects its own;
+                    // live playback still starts when that fails.
+                    let danmaku_hub = match existing_hub {
+                        Some(hub) => Some(hub),
+                        None => crate::api::LiveDanmakuHub::connect(&api_client, room_id, uid)
+                            .await
+                            .ok(),
+                    };
+                    media::play_live(
+                        api_client,
+                        room_id,
+                        danmaku_hub,
+                        danmaku_config_rx,
+                        video_quality,
+                    )
+                    .await
+                });
             }
             AppAction::SwitchToBangumi => {
                 self.sidebar.select(NavItem::Bangumi);
@@ -974,30 +915,27 @@ impl App {
                 title: _,
             } => {
                 let session_id = self.allocate_playback_session();
-                self.playback.session_id = None;
-                self.playback.status = crate::domain::playback::PlaybackStatus::Starting;
-                match media::play_bangumi_episode(
-                    self.api_client.clone(),
-                    ep_id,
-                    self.credentials.as_ref(),
-                    self.config.video_quality,
-                    self.playback_event_tx.clone(),
-                    session_id,
-                )
-                .await
-                {
-                    Ok(()) => self.playback.begin_session(session_id),
-                    Err(error) => {
-                        self.playback.status = crate::domain::playback::PlaybackStatus::Failed;
-                        self.playback.last_error = Some(format!("启动番剧播放器失败: {error:#}"));
-                    }
-                }
+                let api_client = self.api_client.clone();
+                let credentials = self.credentials.clone();
+                let video_quality = self.config.video_quality;
+                let playback_event_tx = self.playback_event_tx.clone();
+                self.start_playback(session_id, "启动番剧播放器失败", async move {
+                    media::play_bangumi_episode(
+                        api_client,
+                        ep_id,
+                        credentials.as_ref(),
+                        video_quality,
+                        playback_event_tx,
+                        session_id,
+                    )
+                    .await
+                });
             }
             AppAction::None => {}
         }
     }
 
-    pub(super) async fn start_playlist(
+    pub(super) fn start_playlist(
         &mut self,
         items: Vec<crate::domain::playback::PlaylistItem>,
         source: crate::domain::playback::PlaylistSource,
@@ -1008,26 +946,83 @@ impl App {
         self.playback.order = order;
         let _ = self.playback.play_from(start_index);
         let session_id = self.allocate_playback_session();
-        match media::play_playlist(
-            self.api_client.clone(),
-            items,
-            order,
-            start_index,
-            self.credentials.as_ref(),
-            self.config.video_quality,
-            self.playback_event_tx.clone(),
-            session_id,
-        )
-        .await
-        {
-            Ok(()) => {
-                self.playback.begin_session(session_id);
-            }
-            Err(error) => {
-                self.playback.status = crate::domain::playback::PlaybackStatus::Failed;
-                self.playback.last_error = Some(format!("启动播放列表失败: {error:#}"));
-            }
-        }
+        let api_client = self.api_client.clone();
+        let credentials = self.credentials.clone();
+        let video_quality = self.config.video_quality;
+        let playback_event_tx = self.playback_event_tx.clone();
+        self.start_playback(session_id, "启动播放列表失败", async move {
+            media::play_playlist(
+                api_client,
+                items,
+                order,
+                start_index,
+                credentials.as_ref(),
+                video_quality,
+                playback_event_tx,
+                session_id,
+            )
+            .await
+        });
+    }
+
+    fn start_video_playback(
+        &mut self,
+        bvid: String,
+        aid: i64,
+        cid: i64,
+        duration: i64,
+        page_num: Option<i32>,
+    ) {
+        let session_id = self.allocate_playback_session();
+        let api_client = self.api_client.clone();
+        let credentials = self.credentials.clone();
+        let danmaku = self.config.danmaku.clone();
+        let video_quality = self.config.video_quality;
+        let playback_event_tx = self.playback_event_tx.clone();
+        self.start_playback(session_id, "启动播放器失败", async move {
+            media::play_video(
+                api_client,
+                &bvid,
+                aid,
+                cid,
+                duration,
+                page_num,
+                credentials.as_ref(),
+                danmaku,
+                video_quality,
+                playback_event_tx,
+                session_id,
+            )
+            .await
+        });
+    }
+
+    /// Starts a player in the background so the UI keeps handling keys
+    /// while stream URLs are fetched and mpv launches. The outcome arrives
+    /// as `PlaybackEvent::Started` or `PlaybackEvent::Failed`.
+    fn start_playback<F>(&mut self, session_id: u64, error_context: &'static str, start: F)
+    where
+        F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        self.playback.begin_starting(session_id);
+        let playback_event_tx = self.playback_event_tx.clone();
+        tokio::spawn(async move {
+            let event = match start.await {
+                Ok(()) => PlaybackEvent::Started { session_id },
+                Err(error) => PlaybackEvent::Failed {
+                    session_id,
+                    error: format!("{error_context}: {error:#}"),
+                },
+            };
+            let _ = playback_event_tx.send(event);
+        });
+    }
+
+    fn login_uid(&self) -> i64 {
+        self.credentials
+            .as_ref()
+            .and_then(|credentials| credentials.dede_user_id.parse::<i64>().ok())
+            .unwrap_or(0)
     }
 
     async fn switch_to_nav_page(&mut self) {
@@ -1172,9 +1167,9 @@ impl App {
             self.current_page = Page::Search(SearchPage::new());
         }
         match &mut self.current_page {
-            Page::Login(page) => {
-                let client = self.api_client.clone();
-                page.load_qrcode(&client).await;
+            Page::Login(_) => {
+                let req_id = self.next_request_id("login_qrcode");
+                self.send_network_command(network::NetworkCommand::LoadQrcode { req_id });
             }
             Page::Home(page) => {
                 let feed = {
@@ -1251,8 +1246,13 @@ impl App {
                 self.send_network_command(network::NetworkCommand::LoadLiveInit { req_id });
             }
             Page::LiveDetail(page) => {
-                let client = self.api_client.clone();
-                page.load_room_info(&client).await;
+                page.begin_loading();
+                let room_id = page.room_id();
+                let req_id = self.next_request_id("live_detail");
+                self.send_network_command(network::NetworkCommand::LoadLiveDetail {
+                    req_id,
+                    room_id,
+                });
             }
             Page::Settings(_) => {
                 // Settings doesn't need async initialization

@@ -1,10 +1,9 @@
 //! Live streaming detail page with room info and real-time messages
 
 use super::{Component, Theme, shortcut_footer};
-use crate::api::client::ApiClient;
 use crate::api::live::LiveRoomInfo;
 use crate::api::live_danmaku_hub::LiveDanmakuHub;
-use crate::api::live_ws::LiveMessage;
+use crate::api::live_ws::{HistoryDanmakuData, LiveMessage};
 use crate::application::AppAction;
 use crate::storage::Keybindings;
 use ratatui::crossterm::event::KeyCode;
@@ -72,55 +71,44 @@ impl LiveDetailPage {
         }
     }
 
-    pub async fn load_room_info(&mut self, api_client: &ApiClient) {
-        if self.loading {
-            return;
-        }
-        self.loading = true;
-        self.error = None;
-
-        match api_client.get_live_room_info(self.room_id).await {
-            Ok(info) => {
-                self.room_info = Some(info);
-                self.loading = false;
-            }
-            Err(e) => {
-                self.error = Some(format!("加载房间信息失败: {}", e));
-                self.loading = false;
-            }
-        }
+    pub fn room_id(&self) -> i64 {
+        self.room_id
     }
 
-    /// Load history danmaku before connecting to WebSocket
-    pub async fn load_history_danmaku(&mut self, api_client: &ApiClient) {
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    pub fn begin_loading(&mut self) {
+        self.loading = true;
+        self.error = None;
+    }
+
+    pub fn apply_room_info(&mut self, info: LiveRoomInfo) {
+        self.room_info = Some(info);
+        self.loading = false;
+    }
+
+    pub fn apply_room_info_error(&mut self, msg: String) {
+        self.error = Some(msg);
+        self.loading = false;
+    }
+
+    /// Shows recent danmaku before the WebSocket delivers new ones.
+    pub fn apply_history_danmaku(&mut self, history: HistoryDanmakuData) {
         if self.history_loaded {
             return;
         }
-
-        match api_client.get_history_danmaku(self.room_id).await {
-            Ok(history) => {
-                // Merge admin and room messages, take up to 30 most recent
-                let all_messages: Vec<_> = history
-                    .admin
-                    .iter()
-                    .chain(history.room.iter())
-                    .take(30)
-                    .collect();
-
-                for item in all_messages {
-                    self.danmakus.push_back(DanmakuItem {
-                        uname: item.nickname.clone(),
-                        content: item.text.clone(),
-                        color: Color::White, // History messages use default color
-                        timestamp: Instant::now(),
-                    });
-                }
-                self.history_loaded = true;
-            }
-            Err(_) => {
-                // Don't show error for history loading failure, just skip
-            }
+        // Merge admin and room messages, take up to 30 most recent
+        for item in history.admin.iter().chain(history.room.iter()).take(30) {
+            self.danmakus.push_back(DanmakuItem {
+                uname: item.nickname.clone(),
+                content: item.text.clone(),
+                color: Color::White, // History messages use default color
+                timestamp: Instant::now(),
+            });
         }
+        self.history_loaded = true;
     }
 
     pub fn attach_danmaku_hub(&mut self, hub: Arc<LiveDanmakuHub>) {

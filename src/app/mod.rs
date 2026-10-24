@@ -70,12 +70,9 @@ pub struct App {
     playback_event_rx: mpsc::Receiver<PlaybackEvent>,
     auto_return_after_playback: Option<(u64, String)>,
     next_playback_session_id: u64,
-    pending_playlist: Option<(
-        Vec<crate::domain::playback::PlaylistItem>,
-        crate::domain::playback::PlaylistSource,
-        usize,
-        crate::domain::playback::PlayOrder,
-    )>,
+    /// Actions produced while handling network events, which cannot await;
+    /// `tick` runs them.
+    deferred_actions: Vec<crate::application::AppAction>,
 
     /// Cached home page to avoid refresh when switching tabs
     pub cached_home: Option<HomePage>,
@@ -142,7 +139,7 @@ impl App {
             playback_event_rx,
             auto_return_after_playback: None,
             next_playback_session_id: 1,
-            pending_playlist: None,
+            deferred_actions: Vec::new(),
             cached_home: None,
             cached_bangumi: None,
             network_command_tx: bridge.command_tx,

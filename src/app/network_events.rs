@@ -231,6 +231,7 @@ impl App {
                         .with_uploader_mid(video.owner.as_ref().and_then(|owner| owner.mid));
                         page.related_card_grid.add_card(card);
                     }
+                    page.loading_more_comments = false;
                     page.loading = false;
                     page.error_message = None;
                 }
@@ -306,7 +307,7 @@ impl App {
                 order,
             } => {
                 if self.is_latest_request("playlist_build", req_id) {
-                    self.pending_playlist = Some((items, source, start_index, order));
+                    self.start_playlist(items, source, start_index, order);
                 }
             }
             network::NetworkEvent::FavoritesInitLoaded {
@@ -427,6 +428,105 @@ impl App {
                     page.set_season(season);
                 }
             }
+            network::NetworkEvent::VideoCommentsLoaded {
+                req_id,
+                aid,
+                page,
+                replies,
+            } => {
+                if !self.is_latest_request("video_comments", req_id) {
+                    return;
+                }
+                if let Some(detail) = find_page!(self, VideoDetail(detail) if detail.aid == aid) {
+                    detail.apply_more_comments(page, replies);
+                }
+            }
+            network::NetworkEvent::DynamicCommentsLoaded {
+                req_id,
+                dynamic_id,
+                page,
+                replies,
+            } => {
+                if !self.is_latest_request("dynamic_comments", req_id) {
+                    return;
+                }
+                if let Some(detail) =
+                    find_page!(self, DynamicDetail(detail) if detail.dynamic_id == dynamic_id)
+                {
+                    detail.apply_more_comments(page, replies);
+                }
+            }
+            network::NetworkEvent::CommentRepliesLoaded {
+                req_id,
+                root,
+                replies,
+            } => {
+                if !self.is_latest_request("comment_replies", req_id) {
+                    return;
+                }
+                if let Some(page) =
+                    find_page!(self, VideoDetail(page) if page.expanded_comment == Some(root))
+                {
+                    page.apply_comment_replies(root, Some(replies));
+                }
+            }
+            network::NetworkEvent::CommentLiked { oid, rpid, liked } => {
+                self.apply_comment_like(oid, rpid, liked);
+            }
+            network::NetworkEvent::CommentPosted { oid } => self.reload_comments_after_post(oid),
+            network::NetworkEvent::LiveDetailLoaded {
+                req_id,
+                room_id,
+                room_info,
+                history,
+            } => {
+                if !self.is_latest_request("live_detail", req_id) {
+                    return;
+                }
+                if let Some(page) = find_page!(self, LiveDetail(page) if page.room_id() == room_id)
+                {
+                    page.apply_room_info(room_info);
+                    if let Some(history) = history {
+                        page.apply_history_danmaku(history);
+                    }
+                }
+            }
+            network::NetworkEvent::LiveDanmakuConnected {
+                req_id,
+                room_id,
+                hub,
+            } => {
+                if !self.is_latest_request("live_danmaku", req_id) {
+                    return;
+                }
+                if let Some(page) = find_page!(self, LiveDetail(page) if page.room_id() == room_id)
+                {
+                    page.attach_danmaku_hub(std::sync::Arc::clone(&hub));
+                }
+                self.live_danmaku_hub = Some(hub);
+            }
+            network::NetworkEvent::QrcodeLoaded { req_id, data } => {
+                if !self.is_latest_request("login_qrcode", req_id) {
+                    return;
+                }
+                if let Page::Login(page) = &mut self.current_page {
+                    page.apply_qrcode(data);
+                }
+            }
+            network::NetworkEvent::QrcodePolled {
+                req_id,
+                status,
+                credentials,
+            } => {
+                if !self.is_latest_request("login_poll", req_id) {
+                    return;
+                }
+                if let Page::Login(page) = &mut self.current_page
+                    && let Some(action) = page.apply_poll(status, credentials)
+                {
+                    self.deferred_actions.push(action);
+                }
+            }
             network::NetworkEvent::RequestFailed {
                 req_id,
                 target,
@@ -441,6 +541,58 @@ impl App {
                     self.apply_request_failure(target, REQUEST_CANCELLED);
                 }
             }
+        }
+    }
+
+    fn apply_comment_like(&mut self, oid: i64, rpid: i64, liked: bool) {
+        for page in std::iter::once(&mut self.current_page).chain(self.navigation_stack.iter_mut())
+        {
+            let liked_comments = match page {
+                Page::VideoDetail(page) if page.aid == oid => &mut page.liked_comments,
+                Page::DynamicDetail(page) if page.comments.iter().any(|c| c.rpid == rpid) => {
+                    &mut page.liked_comments
+                }
+                _ => continue,
+            };
+            if liked {
+                liked_comments.insert(rpid);
+            } else {
+                liked_comments.remove(&rpid);
+            }
+        }
+    }
+
+    /// Reloads the detail page a comment was posted to so the new comment
+    /// shows up.
+    fn reload_comments_after_post(&mut self, oid: i64) {
+        match &self.current_page {
+            Page::VideoDetail(page) if page.aid == oid => {
+                let (bvid, aid) = (page.bvid.clone(), page.aid);
+                // The reload replaces the comment list; drop any page in flight.
+                self.next_request_id("video_comments");
+                let req_id = self.next_request_id("video_detail");
+                self.send_network_command(network::NetworkCommand::LoadVideoDetail {
+                    req_id,
+                    bvid,
+                    aid,
+                    include_related: !self.config.minimal_mode,
+                });
+            }
+            Page::DynamicDetail(page)
+                if page
+                    .dynamic_item
+                    .as_ref()
+                    .and_then(|item| item.comment_oid(&page.dynamic_id))
+                    == Some(oid) =>
+            {
+                let dynamic_id = page.dynamic_id.clone();
+                let req_id = self.next_request_id("dynamic_detail");
+                self.send_network_command(network::NetworkCommand::LoadDynamicDetail {
+                    req_id,
+                    dynamic_id,
+                });
+            }
+            _ => {}
         }
     }
 
@@ -538,6 +690,47 @@ impl App {
             "bangumi_detail" => {
                 if let Some(page) = find_page!(self, BangumiDetail(page)) {
                     page.set_error(format!("加载番剧详情失败: {error}"));
+                }
+            }
+            "video_comments" => {
+                if let Some(page) =
+                    find_page!(self, VideoDetail(page) if page.loading_more_comments)
+                {
+                    page.apply_more_comments_error();
+                }
+            }
+            "dynamic_comments" => {
+                if let Some(page) =
+                    find_page!(self, DynamicDetail(page) if page.loading_more_comments)
+                {
+                    page.apply_more_comments_error();
+                }
+            }
+            "comment_replies" => {
+                if let Some(page) = find_page!(self, VideoDetail(page) if page.loading_replies)
+                    && let Some(root) = page.expanded_comment
+                {
+                    page.apply_comment_replies(root, None);
+                }
+            }
+            "live_detail" => {
+                if let Some(page) = find_page!(self, LiveDetail(page)) {
+                    page.apply_room_info_error(format!("加载房间信息失败: {error}"));
+                }
+            }
+            "live_danmaku" => {
+                if let Some(page) = find_page!(self, LiveDetail(page)) {
+                    page.set_ws_error(format!("WS连接失败: {error}"));
+                }
+            }
+            "login_qrcode" => {
+                if let Page::Login(page) = &mut self.current_page {
+                    page.apply_qrcode_error(format!("获取二维码失败: {error}"));
+                }
+            }
+            "login_poll" => {
+                if let Page::Login(page) = &mut self.current_page {
+                    page.apply_poll_error(format!("轮询失败: {error}"));
                 }
             }
             _ => {}
@@ -699,6 +892,104 @@ mod tests {
         assert!(matches!(
             rx.try_recv(),
             Ok(NetworkCommand::LoadDynamicInit { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn opening_a_live_room_returns_before_the_room_loads() {
+        let (mut app, rx) = app();
+        app.live_danmaku_hub = None;
+        app.current_page = Page::Live(crate::presentation::tui::LivePage::new());
+
+        app.handle_action(AppAction::OpenLiveDetail(42)).await;
+
+        assert!(matches!(&app.current_page, Page::LiveDetail(page) if page.room_id() == 42));
+        let commands: Vec<_> = rx.try_iter().collect();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            NetworkCommand::ConnectLiveDanmaku { room_id: 42, .. }
+        )));
+        let Some(NetworkCommand::LoadLiveDetail { req_id, .. }) = commands
+            .into_iter()
+            .find(|command| matches!(command, NetworkCommand::LoadLiveDetail { .. }))
+        else {
+            panic!("live room details were not requested");
+        };
+
+        app.handle_network_event(NetworkEvent::RequestFailed {
+            req_id,
+            target: "live_detail",
+            error: "timeout".into(),
+        });
+        assert!(matches!(&app.current_page, Page::LiveDetail(page) if !page.is_loading()));
+    }
+
+    #[tokio::test]
+    async fn more_comments_load_in_the_background() {
+        let (mut app, rx) = app();
+        let mut page = crate::presentation::tui::VideoDetailPage::new("BV1test".into(), 7);
+        page.has_more_comments = true;
+        app.current_page = Page::VideoDetail(Box::new(page));
+
+        app.handle_action(AppAction::LoadMoreComments).await;
+        let Ok(NetworkCommand::LoadVideoComments {
+            req_id,
+            aid: 7,
+            page: 2,
+        }) = rx.try_recv()
+        else {
+            panic!("comments were not requested");
+        };
+        assert!(matches!(&app.current_page, Page::VideoDetail(page) if page.loading_more_comments));
+
+        app.handle_network_event(NetworkEvent::RequestCancelled {
+            req_id,
+            target: "video_comments",
+        });
+        assert!(
+            matches!(&app.current_page, Page::VideoDetail(page) if !page.loading_more_comments)
+        );
+    }
+
+    #[tokio::test]
+    async fn play_requests_are_ignored_while_a_player_is_starting() {
+        let (mut app, _rx) = app();
+        app.playback.begin_starting(9);
+
+        app.handle_action(AppAction::PlayVideo {
+            bvid: "BV1test".into(),
+            aid: 1,
+            cid: 1,
+            duration: 10,
+        })
+        .await;
+
+        assert_eq!(app.playback.session_id, Some(9));
+    }
+
+    #[tokio::test]
+    async fn successful_qrcode_poll_logs_in_on_the_next_tick() {
+        let (mut app, _rx) = app();
+        app.credentials = None;
+        app.current_page = Page::Login(crate::presentation::tui::LoginPage::new());
+        let req_id = app.next_request_id("login_poll");
+        let credentials = crate::infrastructure::persistence::Credentials {
+            sessdata: String::new(),
+            bili_jct: String::new(),
+            dede_user_id: "1".into(),
+            dede_user_id_ckmd5: None,
+            refresh_token: None,
+        };
+
+        app.handle_network_event(NetworkEvent::QrcodePolled {
+            req_id,
+            status: Some(crate::api::auth::QrcodePollStatus::Success),
+            credentials: Some(credentials),
+        });
+
+        assert!(matches!(
+            app.deferred_actions.as_slice(),
+            [AppAction::LoginSuccess(_)]
         ));
     }
 
