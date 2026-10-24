@@ -10,8 +10,8 @@ use crate::infrastructure::{
 };
 use crate::presentation::tui::{BangumiPage, DEFAULT_THEME_ID, HomePage, Page, Sidebar, Theme};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Weak};
 use tokio::sync::watch;
 
 #[derive(Default)]
@@ -34,18 +34,6 @@ impl RequestTracker {
     }
 }
 
-/// Previous page for back navigation
-#[derive(Clone)]
-pub enum PreviousPage {
-    Home,
-    Search,
-    Dynamic,
-    History,
-    Favorites,
-    Live,
-    Bangumi,
-}
-
 /// Main application state
 pub struct App {
     pub current_page: Page,
@@ -55,7 +43,6 @@ pub struct App {
     pub sidebar: Sidebar,
     pub show_sidebar: bool,
 
-    pub previous_page: Option<PreviousPage>,
     /// Full page instances for nested detail navigation (list -> video -> UP).
     pub navigation_stack: Vec<Page>,
     pub theme: Theme,
@@ -64,7 +51,9 @@ pub struct App {
     pub keybindings: Keybindings,
     pub pending_home_notice: Option<String>,
     pub playback: PlaybackState,
-    pub live_danmaku_hub: Option<Arc<LiveDanmakuHub>>,
+    /// The most recent live danmaku connection. Live pages and players own
+    /// it, so it closes once they are gone instead of living as long as the app.
+    pub live_danmaku_hub: Option<Weak<LiveDanmakuHub>>,
     danmaku_config_tx: watch::Sender<crate::storage::DanmakuConfig>,
     playback_event_tx: mpsc::Sender<PlaybackEvent>,
     playback_event_rx: mpsc::Receiver<PlaybackEvent>,
@@ -124,7 +113,6 @@ impl App {
             credentials,
             sidebar,
             show_sidebar: true,
-            previous_page: None,
             navigation_stack: Vec::new(),
             theme,
             theme_id,
@@ -158,6 +146,14 @@ impl App {
 
     fn send_network_command(&self, command: network::NetworkCommand) {
         let _ = self.network_command_tx.send(command);
+    }
+
+    /// The shared danmaku connection for `room_id`, if something still uses it.
+    fn live_danmaku_hub_for(&self, room_id: i64) -> Option<Arc<LiveDanmakuHub>> {
+        self.live_danmaku_hub
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .filter(|hub| hub.room_id() == room_id)
     }
 
     fn allocate_playback_session(&mut self) -> u64 {
@@ -322,10 +318,9 @@ mod tests {
         app.cached_home = Some(HomePage::new());
         app.cached_bangumi = Some(crate::presentation::tui::BangumiPage::new());
         app.navigation_stack.push(Page::Home(HomePage::new()));
-        app.previous_page = Some(super::PreviousPage::Home);
         app.apply_minimal_mode(true);
         assert!(app.cached_home.is_none() && app.cached_bangumi.is_none());
-        assert!(app.navigation_stack.is_empty() && app.previous_page.is_none());
+        assert!(app.navigation_stack.is_empty());
         assert!(!app.is_latest_request("hotwords", old_req_id));
         assert!(matches!(
             rx.try_recv().unwrap(),

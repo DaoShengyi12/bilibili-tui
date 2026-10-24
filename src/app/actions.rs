@@ -1,4 +1,4 @@
-use crate::app::{App, PreviousPage};
+use crate::app::App;
 use crate::application::{AppAction, network};
 use crate::domain::playback::PlaybackEvent;
 use crate::infrastructure::{media, persistence};
@@ -33,18 +33,36 @@ impl App {
         }
     }
 
-    /// 记录当前页面以便返回导航
-    fn save_previous_page(&mut self) {
-        self.previous_page = match &self.current_page {
-            Page::Home(_) => Some(PreviousPage::Home),
-            Page::Search(_) => Some(PreviousPage::Search),
-            Page::Dynamic(_) => Some(PreviousPage::Dynamic),
-            Page::History(_) => Some(PreviousPage::History),
-            Page::Favorites(_) => Some(PreviousPage::Favorites),
-            Page::Live(_) => Some(PreviousPage::Live),
-            Page::Bangumi(_) => Some(PreviousPage::Bangumi),
-            _ => None,
-        };
+    /// Open `page` on top of the current one; Esc returns to it unchanged.
+    fn push_page(&mut self, page: Page) {
+        let previous = std::mem::replace(&mut self.current_page, page);
+        self.navigation_stack.push(previous);
+    }
+
+    /// Sidebar navigation starts a new history. List pages kept in the back
+    /// stack move to their tab caches; detail pages are dropped.
+    fn leave_navigation_stack(&mut self) {
+        for page in std::mem::take(&mut self.navigation_stack) {
+            match page {
+                Page::Home(home) if self.cached_home.is_none() => self.cached_home = Some(home),
+                Page::Bangumi(bangumi) if self.cached_bangumi.is_none() => {
+                    self.cached_bangumi = Some(*bangumi)
+                }
+                _ => {}
+            }
+        }
+        self.auto_return_after_playback = None;
+    }
+
+    /// Forget everything tied to the previous account after login or logout.
+    pub(super) fn reset_account_state(&mut self) {
+        self.send_network_command(network::NetworkCommand::CancelPending);
+        self.navigation_stack.clear();
+        self.cached_home = None;
+        self.cached_bangumi = None;
+        self.live_danmaku_hub = None;
+        self.auto_return_after_playback = None;
+        self.sidebar.select(NavItem::Home);
     }
 
     pub(super) async fn handle_action(&mut self, action: AppAction) {
@@ -121,7 +139,7 @@ impl App {
                     let client = self.api_client.clone();
                     client.set_credentials(&creds);
                 }
-                // Switch to home
+                self.reset_account_state();
                 self.current_page = Page::Home(HomePage::new());
                 self.init_current_page().await;
             }
@@ -409,15 +427,8 @@ impl App {
                 }
             }
             AppAction::OpenDynamicDetail(dynamic_id) => {
-                self.save_previous_page();
-                // Cache home page before navigating to dynamic detail
-                if let Page::Home(home_page) =
-                    std::mem::replace(&mut self.current_page, Page::Home(HomePage::new()))
-                {
-                    self.cached_home = Some(home_page);
-                }
                 let detail_page = DynamicDetailPage::new(dynamic_id.clone());
-                self.current_page = Page::DynamicDetail(Box::new(detail_page));
+                self.push_page(Page::DynamicDetail(Box::new(detail_page)));
                 let req_id = self.next_request_id("dynamic_detail");
                 self.send_network_command(network::NetworkCommand::LoadDynamicDetail {
                     req_id,
@@ -433,65 +444,8 @@ impl App {
             }
             AppAction::BackToList => {
                 self.auto_return_after_playback = None;
-                match self.previous_page.take() {
-                    Some(PreviousPage::Home) => {
-                        self.sidebar.select(NavItem::Home);
-                        self.show_home().await;
-                    }
-                    Some(PreviousPage::Search) if self.config.minimal_mode => {
-                        self.sidebar.select(NavItem::Search);
-                        self.current_page = Page::Search(SearchPage::new());
-                        self.init_current_page().await;
-                    }
-                    Some(PreviousPage::Search) => {
-                        // Search now lives inside Home; return there with the search pane open.
-                        self.sidebar.select(NavItem::Home);
-                        let mut home = self.cached_home.take().unwrap_or_default();
-                        home.begin_search();
-                        self.current_page = Page::Home(home);
-                        self.init_current_page().await;
-                    }
-                    Some(PreviousPage::Dynamic) => {
-                        self.sidebar.select(NavItem::Dynamic);
-                        self.current_page = Page::Dynamic(DynamicPage::new());
-                        self.init_current_page().await;
-                    }
-                    Some(PreviousPage::History) => {
-                        self.sidebar.select(NavItem::History);
-                        self.current_page = Page::History(HistoryPage::new());
-                        self.init_current_page().await;
-                    }
-                    Some(PreviousPage::Favorites) => {
-                        self.sidebar.select(NavItem::Favorites);
-                        let mid = self
-                            .credentials
-                            .as_ref()
-                            .and_then(|credentials| credentials.dede_user_id.parse::<i64>().ok());
-                        if let Some(mid) = mid {
-                            self.current_page = Page::Favorites(FavoritesPage::new(mid));
-                            self.init_current_page().await;
-                        }
-                    }
-                    Some(PreviousPage::Live) => {
-                        self.sidebar.select(NavItem::Live);
-                        self.current_page = Page::Live(LivePage::new());
-                        self.init_current_page().await;
-                    }
-                    Some(PreviousPage::Bangumi) => {
-                        self.sidebar.select(NavItem::Bangumi);
-                        if let Some(cached) = self.cached_bangumi.take() {
-                            self.current_page = Page::Bangumi(Box::new(cached));
-                        } else {
-                            self.current_page = Page::Bangumi(Box::<BangumiPage>::default());
-                            self.init_current_page().await;
-                        }
-                    }
-                    None => {
-                        // Default to home
-                        self.sidebar.select(NavItem::Home);
-                        self.show_home().await;
-                    }
-                }
+                self.sidebar.select(NavItem::Home);
+                self.show_home().await;
             }
             AppAction::LoadMoreRecommendations => {
                 let request = if let Page::Home(page) = &mut self.current_page {
@@ -718,7 +672,7 @@ impl App {
                 let _ = persistence::delete_credentials();
                 self.credentials = None;
                 self.api_client.clear_credentials();
-                self.cached_home = None;
+                self.reset_account_state();
                 self.current_page = Page::Home(HomePage::new());
                 self.init_current_page().await;
             }
@@ -803,13 +757,8 @@ impl App {
                 self.init_current_page().await;
             }
             AppAction::OpenLiveDetail(room_id) => {
-                self.save_previous_page();
                 let mut detail_page = LiveDetailPage::new(room_id);
-                let existing_hub = self
-                    .live_danmaku_hub
-                    .as_ref()
-                    .filter(|hub| hub.room_id() == room_id)
-                    .cloned();
+                let existing_hub = self.live_danmaku_hub_for(room_id);
                 match existing_hub {
                     Some(hub) => detail_page.attach_danmaku_hub(hub),
                     None => {
@@ -822,7 +771,7 @@ impl App {
                         });
                     }
                 }
-                self.current_page = Page::LiveDetail(Box::new(detail_page));
+                self.push_page(Page::LiveDetail(Box::new(detail_page)));
                 self.init_current_page().await;
             }
             AppAction::RefreshLive => {
@@ -843,11 +792,7 @@ impl App {
                 }
             }
             AppAction::PlayLive { room_id, title: _ } => {
-                let existing_hub = self
-                    .live_danmaku_hub
-                    .as_ref()
-                    .filter(|hub| hub.room_id() == room_id)
-                    .cloned();
+                let existing_hub = self.live_danmaku_hub_for(room_id);
                 let uid = self.login_uid();
                 let api_client = self.api_client.clone();
                 let danmaku_config_rx = self.danmaku_config_tx.subscribe();
@@ -895,15 +840,8 @@ impl App {
                 // Single tab mode, no-op
             }
             AppAction::OpenBangumiDetail(season_id) => {
-                self.save_previous_page();
-                if let Page::Bangumi(bangumi_page) = std::mem::replace(
-                    &mut self.current_page,
-                    Page::Bangumi(Box::<BangumiPage>::default()),
-                ) {
-                    self.cached_bangumi = Some(*bangumi_page);
-                }
                 let detail_page = BangumiDetailPage::new(season_id);
-                self.current_page = Page::BangumiDetail(Box::new(detail_page));
+                self.push_page(Page::BangumiDetail(Box::new(detail_page)));
                 let req_id = self.next_request_id("bangumi_detail");
                 self.send_network_command(network::NetworkCommand::LoadBangumiDetail {
                     req_id,
@@ -1030,6 +968,7 @@ impl App {
     }
 
     async fn switch_to_nav_page(&mut self) {
+        self.leave_navigation_stack();
         // First, cache home page if we're leaving it
         if matches!(self.current_page, Page::Home(_))
             && self.sidebar.selected != NavItem::Home
@@ -1310,7 +1249,6 @@ impl App {
         self.cached_home = None;
         self.cached_bangumi = None;
         self.navigation_stack.clear();
-        self.previous_page = None;
         for key in [
             "home",
             "home_more",

@@ -503,7 +503,7 @@ impl App {
                 {
                     page.attach_danmaku_hub(std::sync::Arc::clone(&hub));
                 }
-                self.live_danmaku_hub = Some(hub);
+                self.live_danmaku_hub = Some(std::sync::Arc::downgrade(&hub));
             }
             network::NetworkEvent::QrcodeLoaded { req_id, data } => {
                 if !self.is_latest_request("login_qrcode", req_id) {
@@ -893,6 +893,84 @@ mod tests {
             rx.try_recv(),
             Ok(NetworkCommand::LoadDynamicInit { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn back_from_dynamic_detail_restores_the_list_without_reloading() {
+        let (mut app, rx) = app();
+        app.sidebar
+            .select(crate::presentation::tui::NavItem::Dynamic);
+        app.current_page = Page::Dynamic(crate::presentation::tui::DynamicPage::new());
+
+        app.handle_action(AppAction::OpenDynamicDetail("1".into()))
+            .await;
+        assert!(matches!(app.current_page, Page::DynamicDetail(_)));
+        rx.try_iter().for_each(drop);
+
+        app.handle_action(AppAction::BackToList).await;
+
+        assert!(matches!(app.current_page, Page::Dynamic(_)));
+        assert!(app.navigation_stack.is_empty());
+        assert!(
+            rx.try_iter()
+                .all(|command| !matches!(command, NetworkCommand::LoadDynamicInit { .. })),
+            "the restored dynamic page must keep its loaded feed"
+        );
+    }
+
+    #[tokio::test]
+    async fn back_from_live_and_bangumi_details_returns_to_the_list() {
+        let (mut app, _rx) = app();
+        app.current_page = Page::Live(crate::presentation::tui::LivePage::new());
+        app.handle_action(AppAction::OpenLiveDetail(42)).await;
+        app.handle_action(AppAction::BackToList).await;
+        assert!(matches!(app.current_page, Page::Live(_)));
+
+        app.current_page = Page::Bangumi(Box::default());
+        app.handle_action(AppAction::OpenBangumiDetail(7)).await;
+        app.handle_action(AppAction::BackToList).await;
+        assert!(matches!(app.current_page, Page::Bangumi(_)));
+        assert!(app.navigation_stack.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sidebar_navigation_from_a_detail_drops_the_back_stack() {
+        let (mut app, _rx) = app();
+        app.sidebar
+            .select(crate::presentation::tui::NavItem::Bangumi);
+        app.current_page = Page::Bangumi(Box::default());
+        app.handle_action(AppAction::OpenBangumiDetail(7)).await;
+
+        app.handle_action(AppAction::NavNext).await;
+
+        assert!(app.navigation_stack.is_empty());
+        assert!(
+            app.cached_bangumi.is_some(),
+            "the list page moves to its tab cache"
+        );
+        assert!(!matches!(app.current_page, Page::BangumiDetail(_)));
+    }
+
+    #[tokio::test]
+    async fn account_change_clears_navigation_caches_and_danmaku() {
+        let (mut app, rx) = app();
+        app.navigation_stack
+            .push(Page::Live(crate::presentation::tui::LivePage::new()));
+        app.cached_home = Some(crate::presentation::tui::HomePage::new());
+        app.cached_bangumi = Some(crate::presentation::tui::BangumiPage::new());
+        app.sidebar.select(crate::presentation::tui::NavItem::Live);
+        app.live_danmaku_hub = Some(std::sync::Weak::new());
+
+        app.reset_account_state();
+
+        assert!(app.navigation_stack.is_empty());
+        assert!(app.cached_home.is_none() && app.cached_bangumi.is_none());
+        assert!(app.live_danmaku_hub.is_none());
+        assert_eq!(
+            app.sidebar.selected,
+            crate::presentation::tui::NavItem::Home
+        );
+        assert!(matches!(rx.try_recv(), Ok(NetworkCommand::CancelPending)));
     }
 
     #[tokio::test]
