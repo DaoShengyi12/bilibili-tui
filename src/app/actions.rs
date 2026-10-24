@@ -858,9 +858,13 @@ impl App {
                     // live playback still starts when that fails.
                     let danmaku_hub = match existing_hub {
                         Some(hub) => Some(hub),
-                        None => crate::api::LiveDanmakuHub::connect(&api_client, room_id, uid)
-                            .await
-                            .ok(),
+                        None => crate::api::LiveDanmakuHub::connect(
+                            std::sync::Arc::clone(&api_client),
+                            room_id,
+                            uid,
+                        )
+                        .await
+                        .ok(),
                     };
                     media::play_live(
                         api_client,

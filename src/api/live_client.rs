@@ -2,6 +2,7 @@
 //!
 //! Manages WebSocket connection for receiving live stream messages.
 
+use super::ApiClient;
 use super::live_ws::{
     DanmuInfoData, LiveMessage, Packet, make_auth_packet, make_heartbeat_packet, parse_message,
 };
@@ -24,22 +25,17 @@ pub struct LiveClient {
 }
 
 impl LiveClient {
-    /// Connect to live room WebSocket
+    /// Connect to live room WebSocket. When every host fails, the client
+    /// backs off and fetches a fresh token and host list through `api_client`.
     pub async fn connect(
+        api_client: Arc<ApiClient>,
         room_id: i64,
         uid: i64,
         buvid: String,
         danmu_info: &DanmuInfoData,
     ) -> Result<Self> {
-        let urls = danmu_info
-            .host_list
-            .iter()
-            .map(|host| host.wss_url())
-            .collect::<Vec<_>>();
-        if urls.is_empty() {
-            return Err(anyhow!("No WebSocket hosts available"));
-        }
-        let token = danmu_info.token.clone();
+        let endpoint = DanmuEndpoint::from_info(danmu_info)
+            .ok_or_else(|| anyhow!("No WebSocket hosts available"))?;
 
         // Create channels
         let (message_tx, message_rx) = mpsc::channel::<LiveMessage>(256);
@@ -52,10 +48,10 @@ impl LiveClient {
         // Spawn connection task
         tokio::spawn(async move {
             run_connections(
-                &urls,
+                api_client,
+                endpoint,
                 room_id,
                 uid,
-                &token,
                 &buvid,
                 message_tx,
                 &mut shutdown_rx,
@@ -96,52 +92,97 @@ impl LiveClient {
     }
 }
 
+/// WebSocket hosts and the auth token issued with them by `getDanmuInfo`.
+struct DanmuEndpoint {
+    urls: Vec<String>,
+    token: String,
+}
+
+impl DanmuEndpoint {
+    fn from_info(info: &DanmuInfoData) -> Option<Self> {
+        let urls: Vec<String> = info.host_list.iter().map(|host| host.wss_url()).collect();
+        (!urls.is_empty()).then(|| Self {
+            urls,
+            token: info.token.clone(),
+        })
+    }
+}
+
+const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+
+/// Exponential backoff after `failed_rounds` consecutive rounds in which no
+/// host authenticated.
+fn reconnect_delay(failed_rounds: u32) -> Duration {
+    RECONNECT_BASE_DELAY
+        .saturating_mul(2u32.saturating_pow(failed_rounds.saturating_sub(1)))
+        .min(RECONNECT_MAX_DELAY)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_connections(
-    urls: &[String],
+    api_client: Arc<ApiClient>,
+    mut endpoint: DanmuEndpoint,
     room_id: i64,
     uid: i64,
-    token: &str,
     buvid: &str,
     message_tx: mpsc::Sender<LiveMessage>,
     shutdown_rx: &mut mpsc::Receiver<()>,
     last_error: Arc<Mutex<Option<String>>>,
     connection_state: Arc<AtomicU8>,
 ) {
+    let set_error = |message: String| {
+        if let Ok(mut error) = last_error.lock() {
+            *error = Some(message);
+        }
+    };
+    let mut failed_rounds = 0u32;
     loop {
-        for url in urls {
+        let mut authenticated = false;
+        for url in &endpoint.urls {
             connection_state.store(0, Ordering::Release);
-            match run_connection(
+            let result = run_connection(
                 url,
                 room_id,
                 uid,
-                token,
+                &endpoint.token,
                 buvid,
                 message_tx.clone(),
                 shutdown_rx,
                 &connection_state,
             )
-            .await
-            {
+            .await;
+            authenticated |= connection_state.load(Ordering::Acquire) == 1;
+            match result {
                 Ok(true) => return,
                 Ok(false) => {
                     connection_state.store(2, Ordering::Release);
-                    if let Ok(mut error) = last_error.lock() {
-                        *error = Some(format!("live connection closed: {url}"));
-                    }
+                    set_error(format!("live connection closed: {url}"));
                 }
                 Err(error) => {
                     connection_state.store(2, Ordering::Release);
-                    if let Ok(mut value) = last_error.lock() {
-                        *value = Some(format!("live connection failed for {url}: {error}"));
-                    }
+                    set_error(format!("live connection failed for {url}: {error}"));
                 }
             }
         }
 
+        failed_rounds = if authenticated { 1 } else { failed_rounds + 1 };
         tokio::select! {
             _ = shutdown_rx.recv() => return,
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = tokio::time::sleep(reconnect_delay(failed_rounds)) => {}
+        }
+
+        // Tokens expire, so each reconnect round asks for a fresh one.
+        tokio::select! {
+            _ = shutdown_rx.recv() => return,
+            info = api_client.get_danmu_info(room_id) => match info {
+                Ok(info) => {
+                    if let Some(fresh) = DanmuEndpoint::from_info(&info) {
+                        endpoint = fresh;
+                    }
+                }
+                Err(error) => set_error(format!("failed to refresh live danmaku token: {error:#}")),
+            },
         }
     }
 }
@@ -246,6 +287,22 @@ async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_backs_off_exponentially_up_to_a_cap() {
+        assert_eq!(reconnect_delay(1), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(2), Duration::from_secs(4));
+        assert_eq!(reconnect_delay(3), Duration::from_secs(8));
+        assert_eq!(reconnect_delay(6), RECONNECT_MAX_DELAY);
+        assert_eq!(reconnect_delay(u32::MAX), RECONNECT_MAX_DELAY);
+    }
+
+    #[test]
+    fn endpoint_requires_at_least_one_host() {
+        let info: DanmuInfoData =
+            serde_json::from_value(serde_json::json!({"token": "t", "host_list": []})).unwrap();
+        assert!(DanmuEndpoint::from_info(&info).is_none());
+    }
 
     #[test]
     fn connection_status_can_recover_after_an_error() {

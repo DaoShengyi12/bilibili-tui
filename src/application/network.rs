@@ -640,7 +640,7 @@ async fn handle_tracked_command(
             req_id,
             room_id,
             uid,
-        } => match LiveDanmakuHub::connect(&api_client, room_id, uid).await {
+        } => match LiveDanmakuHub::connect(Arc::clone(&api_client), room_id, uid).await {
             Ok(hub) => NetworkEvent::LiveDanmakuConnected {
                 req_id,
                 room_id,

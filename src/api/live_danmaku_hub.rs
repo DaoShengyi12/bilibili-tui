@@ -26,10 +26,10 @@ impl std::fmt::Debug for LiveDanmakuHub {
 }
 
 impl LiveDanmakuHub {
-    pub async fn connect(api_client: &ApiClient, room_id: i64, uid: i64) -> Result<Arc<Self>> {
+    pub async fn connect(api_client: Arc<ApiClient>, room_id: i64, uid: i64) -> Result<Arc<Self>> {
         let danmu_info = api_client.get_danmu_info(room_id).await?;
         let buvid = api_client.get_buvid3().await.unwrap_or_default();
-        let mut client = LiveClient::connect(room_id, uid, buvid, &danmu_info).await?;
+        let mut client = LiveClient::connect(api_client, room_id, uid, buvid, &danmu_info).await?;
         let (message_tx, _) = broadcast::channel(512);
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
         let connected = Arc::new(AtomicBool::new(false));
