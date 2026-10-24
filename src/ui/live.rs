@@ -107,6 +107,7 @@ impl LivePage {
 
     pub fn begin_loading(&mut self) {
         self.loading = true;
+        self.loading_more = false;
         self.error = None;
     }
 
@@ -131,7 +132,7 @@ impl LivePage {
     }
 
     pub fn begin_load_more(&mut self) -> bool {
-        if self.loading_more {
+        if self.loading || self.loading_more {
             return false;
         }
         self.loading_more = true;
@@ -664,5 +665,22 @@ impl LivePage {
 
         let info = Paragraph::new(info_lines).wrap(Wrap { trim: true });
         frame.render_widget(info, chunks[1]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_ends_load_more_and_blocks_new_pages_until_loaded() {
+        let mut page = LivePage::new();
+        page.apply_live_init(Vec::new());
+        assert!(page.begin_load_more());
+        page.begin_loading();
+        assert!(!page.loading_more);
+        assert!(!page.begin_load_more());
+        page.apply_live_init(Vec::new());
+        assert!(page.begin_load_more());
     }
 }

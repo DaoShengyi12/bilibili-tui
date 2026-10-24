@@ -80,6 +80,7 @@ impl SearchPage {
         }
         self.total_results = total;
         self.loading = false;
+        self.loading_more = false;
         self.input_mode = false;
         self.show_hot_list = false;
         self.error_message = None;
@@ -719,6 +720,15 @@ impl Component for SearchPage {
 #[cfg(test)]
 mod minimal_mode_tests {
     use super::*;
+
+    #[test]
+    fn new_search_results_end_a_superseded_load_more() {
+        let mut page = SearchPage::new();
+        page.loading = true;
+        page.loading_more = true;
+        page.set_results(Vec::new(), 0);
+        assert!(!page.loading && !page.loading_more);
+    }
 
     #[test]
     fn typing_and_refocusing_search_keeps_hotwords_disabled() {

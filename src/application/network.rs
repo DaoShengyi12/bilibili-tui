@@ -281,6 +281,10 @@ pub enum NetworkEvent {
         target: &'static str,
         error: String,
     },
+    /// The worker dropped the request before it finished, either because a
+    /// newer request with the same key replaced it or because of
+    /// `CancelPending`. Pages must leave their loading state.
+    RequestCancelled { req_id: u64, target: &'static str },
 }
 
 pub struct NetworkBridge {
@@ -307,13 +311,17 @@ pub fn start_network_worker(api_client: Arc<ApiClient>) -> NetworkBridge {
             let mut cancellations =
                 HashMap::<&'static str, tokio_util::sync::CancellationToken>::new();
             while let Ok(command) = command_rx.recv() {
-                if matches!(command, NetworkCommand::CancelPending) {
-                    for (_, token) in cancellations.drain() {
+                let Some(key) = command.request_key() else {
+                    cancellations.retain(|key, token| {
+                        if survives_cancel_pending(key) {
+                            return true;
+                        }
                         token.cancel();
-                    }
+                        false
+                    });
                     continue;
-                }
-                let key = command.cancel_key();
+                };
+                let req_id = command.req_id();
                 let token = tokio_util::sync::CancellationToken::new();
                 if let Some(previous) = cancellations.insert(key, token.clone()) {
                     previous.cancel();
@@ -321,12 +329,11 @@ pub fn start_network_worker(api_client: Arc<ApiClient>) -> NetworkBridge {
                 let api_client = api_client.clone();
                 let event_tx = event_tx.clone();
                 runtime.spawn(async move {
-                    tokio::select! {
-                        _ = token.cancelled() => {}
-                        event = handle_command(api_client, command) => {
-                            let _ = event_tx.send(event);
-                        }
-                    }
+                    let event = tokio::select! {
+                        _ = token.cancelled() => NetworkEvent::RequestCancelled { req_id, target: key },
+                        event = handle_command(api_client, command) => event,
+                    };
+                    let _ = event_tx.send(event);
                 });
             }
         })
@@ -338,27 +345,72 @@ pub fn start_network_worker(api_client: Arc<ApiClient>) -> NetworkBridge {
     }
 }
 
+/// User-started background work that must finish even when the user leaves
+/// the page: a playlist the user asked to play and a deletion the server may
+/// already have applied.
+fn survives_cancel_pending(key: &str) -> bool {
+    matches!(key, "playlist_build" | "history_delete")
+}
+
 impl NetworkCommand {
-    fn cancel_key(&self) -> &'static str {
-        match self {
-            Self::LoadHome { .. } | Self::LoadHomeMore { .. } => "home",
-            Self::LoadFavoriteResources { .. }
-            | Self::LoadFavoritesInit { .. }
-            | Self::LoadFavoritesContent { .. } => "favorites",
-            Self::BuildUpPlaylist { .. } | Self::BuildFavoritePlaylist { .. } => "playlist",
-            Self::CancelPending => "cancel",
-            Self::LoadHotwords { .. } | Self::Search { .. } => "search",
-            Self::LoadDynamicInit { .. }
-            | Self::LoadDynamicRefresh { .. }
-            | Self::LoadDynamicMore { .. } => "dynamic",
-            Self::LoadHistoryInit { .. } | Self::LoadHistoryMore { .. } => "history",
+    /// The request-tracking key shared with the app. A newer command with the
+    /// same key supersedes the older one, so unrelated requests must not
+    /// share a key. `None` for `CancelPending`.
+    pub fn request_key(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::CancelPending => return None,
+            Self::LoadHome { .. } => "home",
+            Self::LoadHomeMore { .. } => "home_more",
+            Self::LoadHotwords { .. } => "hotwords",
+            Self::Search { .. } => "search",
+            Self::LoadDynamicInit { .. } | Self::LoadDynamicRefresh { .. } => "dynamic_feed",
+            Self::LoadDynamicMore { .. } => "dynamic_more",
+            Self::LoadHistoryInit { .. } => "history_init",
+            Self::LoadHistoryMore { .. } => "history_more",
             Self::DeleteHistory { .. } => "history_delete",
             Self::LoadArticle { .. } => "article_detail",
-            Self::LoadLiveInit { .. } | Self::LoadLiveMore { .. } => "live",
+            Self::LoadLiveInit { .. } => "live_init",
+            Self::LoadLiveMore { .. } => "live_more",
             Self::LoadVideoDetail { .. } => "video_detail",
-            Self::LoadUpPage { .. } | Self::LoadUpVideos { .. } => "up",
+            Self::LoadUpPage { .. } => "up_page",
+            Self::LoadUpVideos { .. } => "up_videos",
+            Self::LoadFavoriteResources { .. } => "favorite_resources",
+            Self::BuildUpPlaylist { .. } | Self::BuildFavoritePlaylist { .. } => "playlist_build",
+            Self::LoadFavoritesInit { .. } => "favorites_init",
+            Self::LoadFavoritesContent { .. } => "favorites_content",
             Self::LoadDynamicDetail { .. } => "dynamic_detail",
-            Self::LoadBangumiIndex { .. } | Self::LoadBangumiDetail { .. } => "bangumi",
+            Self::LoadBangumiIndex { .. } => "bangumi_index",
+            Self::LoadBangumiDetail { .. } => "bangumi_detail",
+        })
+    }
+
+    fn req_id(&self) -> u64 {
+        match self {
+            Self::CancelPending => 0,
+            Self::LoadHome { req_id, .. }
+            | Self::LoadHomeMore { req_id, .. }
+            | Self::LoadHotwords { req_id }
+            | Self::Search { req_id, .. }
+            | Self::LoadDynamicInit { req_id, .. }
+            | Self::LoadDynamicRefresh { req_id, .. }
+            | Self::LoadDynamicMore { req_id, .. }
+            | Self::LoadHistoryInit { req_id }
+            | Self::LoadHistoryMore { req_id, .. }
+            | Self::DeleteHistory { req_id, .. }
+            | Self::LoadArticle { req_id, .. }
+            | Self::LoadLiveInit { req_id }
+            | Self::LoadLiveMore { req_id }
+            | Self::LoadVideoDetail { req_id, .. }
+            | Self::LoadUpPage { req_id, .. }
+            | Self::LoadUpVideos { req_id, .. }
+            | Self::LoadFavoriteResources { req_id, .. }
+            | Self::BuildUpPlaylist { req_id, .. }
+            | Self::BuildFavoritePlaylist { req_id, .. }
+            | Self::LoadFavoritesInit { req_id, .. }
+            | Self::LoadFavoritesContent { req_id, .. }
+            | Self::LoadDynamicDetail { req_id, .. }
+            | Self::LoadBangumiIndex { req_id }
+            | Self::LoadBangumiDetail { req_id, .. } => *req_id,
         }
     }
 }
@@ -661,7 +713,7 @@ async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> 
                     offset: data.offset,
                     has_more: data.has_more.unwrap_or(false),
                 },
-                Err(e) => failed(req_id, "dynamic_init", e),
+                Err(e) => failed(req_id, "dynamic_feed", e),
             }
         }
         NetworkCommand::LoadDynamicRefresh {
@@ -679,7 +731,7 @@ async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> 
                     offset: data.offset,
                     has_more: data.has_more.unwrap_or(false),
                 },
-                Err(e) => failed(req_id, "dynamic_refresh", e),
+                Err(e) => failed(req_id, "dynamic_feed", e),
             }
         }
         NetworkCommand::LoadDynamicMore {
@@ -977,6 +1029,49 @@ pub(crate) fn redact_url_queries(message: &str) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NetworkCommand, survives_cancel_pending};
+
+    #[test]
+    fn unrelated_requests_do_not_share_a_cancel_key() {
+        let key = |command: NetworkCommand| command.request_key();
+        assert_ne!(
+            key(NetworkCommand::LoadHotwords { req_id: 1 }),
+            key(NetworkCommand::Search {
+                req_id: 2,
+                keyword: "rust".into(),
+                page: 1,
+            })
+        );
+        assert_ne!(
+            key(NetworkCommand::LoadLiveInit { req_id: 1 }),
+            key(NetworkCommand::LoadLiveMore { req_id: 2 })
+        );
+        assert_ne!(
+            key(NetworkCommand::LoadUpPage {
+                req_id: 1,
+                mid: 1,
+                order: crate::api::space::SpaceVideoOrder::Latest,
+            }),
+            key(NetworkCommand::LoadUpVideos {
+                req_id: 2,
+                mid: 1,
+                page: 2,
+                order: crate::api::space::SpaceVideoOrder::Latest,
+            })
+        );
+        assert_eq!(key(NetworkCommand::CancelPending), None);
+    }
+
+    #[test]
+    fn cancel_pending_keeps_playlist_builds_and_deletions() {
+        assert!(survives_cancel_pending("playlist_build"));
+        assert!(survives_cancel_pending("history_delete"));
+        assert!(!survives_cancel_pending("home"));
+    }
 }
 
 #[cfg(test)]

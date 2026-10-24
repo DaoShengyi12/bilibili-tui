@@ -93,15 +93,25 @@ impl UpPage {
         videos: SpaceVideoData,
         folders: Vec<FavoriteFolder>,
     ) {
-        self.profile = Some(profile);
-        self.relation = relation;
-        self.folders = folders;
+        self.apply_profile(profile, relation, folders);
         self.videos.clear();
         self.video_page = 1;
         self.video_total = videos.page.count;
         self.append_space_videos(videos);
         self.loading = false;
         self.error = None;
+    }
+
+    /// Applies the header and folder list without touching the video list.
+    pub fn apply_profile(
+        &mut self,
+        profile: SpaceInfo,
+        relation: Option<RelationStat>,
+        folders: Vec<FavoriteFolder>,
+    ) {
+        self.profile = Some(profile);
+        self.relation = relation;
+        self.folders = folders;
     }
 
     pub fn apply_more_videos(&mut self, page: i32, videos: SpaceVideoData) {
@@ -375,6 +385,11 @@ impl Component for UpPage {
             }
             KeyCode::Char('o') if self.tab == UpTab::Favorites => {
                 self.favorite_order = self.favorite_order.next();
+                if let Some(media_id) = self.pending_folder {
+                    // Results in the old order are discarded, so request the
+                    // pending folder again in the new order.
+                    return Some(AppAction::OpenFavoriteFolder(media_id));
+                }
                 if self.active_folder.is_some() {
                     self.loading = true;
                     return Some(AppAction::SwitchFavoriteOrder(self.favorite_order));
@@ -519,6 +534,17 @@ mod tests {
         assert!(matches!(action, Some(AppAction::None)));
         assert_eq!(page.pending_folder, None);
         assert!(!page.loading);
+    }
+
+    #[test]
+    fn changing_favorite_order_requests_the_pending_folder_again() {
+        let mut page = UpPage::new_favorites(1);
+        page.pending_folder = Some(10);
+        page.loading = true;
+        let action = page.handle_input(KeyCode::Char('o'), &Keybindings::default());
+        assert!(matches!(action, Some(AppAction::OpenFavoriteFolder(10))));
+        assert_eq!(page.pending_folder, Some(10));
+        assert!(page.loading);
     }
 }
 

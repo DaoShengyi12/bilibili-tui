@@ -235,6 +235,7 @@ impl HomePage {
 
     pub fn begin_loading(&mut self) {
         self.loading = true;
+        self.loading_more = false;
         self.error_message = None;
         self.pending_downloads.clear();
         self.fresh_idx = 1;
@@ -259,8 +260,21 @@ impl HomePage {
         self.loading = false;
     }
 
+    /// True while the first page or a further page is being requested.
+    pub fn is_loading(&self) -> bool {
+        self.loading || self.loading_more
+    }
+
+    /// True when the feed is empty and nothing is loading it.
+    pub fn needs_reload(&self) -> bool {
+        !self.loading && self.videos.is_empty()
+    }
+
     pub fn begin_load_more(&mut self) -> Option<i32> {
-        if self.loading_more || !matches!(self.feed, HomeFeed::Recommended | HomeFeed::Popular) {
+        if self.loading
+            || self.loading_more
+            || !matches!(self.feed, HomeFeed::Recommended | HomeFeed::Popular)
+        {
             return None;
         }
         self.loading_more = true;
@@ -960,6 +974,18 @@ fn format_count(value: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_more_waits_for_the_first_page() {
+        let mut page = HomePage::new();
+        assert!(page.loading);
+        assert_eq!(page.begin_load_more(), None);
+        page.apply_recommendations(page.feed(), Vec::new());
+        assert!(page.needs_reload());
+        assert!(page.begin_load_more().is_some());
+        page.begin_loading();
+        assert!(!page.loading_more);
+    }
 
     #[test]
     fn home_pane_switch_preempts_loading() {

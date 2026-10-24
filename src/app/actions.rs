@@ -69,13 +69,7 @@ impl App {
             AppAction::Quit => self.should_quit = true,
             AppAction::SwitchToHome => {
                 self.sidebar.select(NavItem::Home);
-                // Use cached home page if available
-                if let Some(cached) = self.cached_home.take() {
-                    self.current_page = Page::Home(cached);
-                } else {
-                    self.current_page = Page::Home(HomePage::new());
-                    self.init_current_page().await;
-                }
+                self.show_home().await;
             }
             AppAction::RefreshHome => {
                 self.sidebar.select(NavItem::Home);
@@ -283,17 +277,7 @@ impl App {
                     self.apply_login_required_hint();
                     return;
                 }
-                if let Page::Dynamic(page) = &mut self.current_page {
-                    page.loading = true;
-                    let tab = page.current_tab;
-                    let host_mid = page.get_selected_up_mid();
-                    let req_id = self.next_request_id("dynamic_refresh");
-                    self.send_network_command(network::NetworkCommand::LoadDynamicRefresh {
-                        req_id,
-                        tab,
-                        host_mid,
-                    });
-                }
+                self.request_dynamic_feed();
             }
             AppAction::OpenVideoDetail(bvid, aid) => {
                 let mut detail_page =
@@ -339,6 +323,7 @@ impl App {
             AppAction::SwitchUpVideoOrder(order) => {
                 if let Page::Up(page) = &mut self.current_page {
                     page.loading = true;
+                    page.loading_more = false;
                     page.videos.clear();
                     page.video_page = 1;
                     let mid = page.mid;
@@ -352,7 +337,10 @@ impl App {
                 }
             }
             AppAction::LoadMoreUpVideos => {
-                let command = if let Page::Up(page) = &mut self.current_page {
+                let command = if let Page::Up(page) = &mut self.current_page
+                    && !page.loading
+                    && !page.loading_more
+                {
                     let next_page = page.video_page + 1;
                     page.loading_more = true;
                     Some((page.mid, next_page, page.video_order))
@@ -484,13 +472,7 @@ impl App {
                 match self.previous_page.take() {
                     Some(PreviousPage::Home) => {
                         self.sidebar.select(NavItem::Home);
-                        // Use cached home page if available
-                        if let Some(cached) = self.cached_home.take() {
-                            self.current_page = Page::Home(cached);
-                        } else {
-                            self.current_page = Page::Home(HomePage::new());
-                            self.init_current_page().await;
-                        }
+                        self.show_home().await;
                     }
                     Some(PreviousPage::Search) if self.config.minimal_mode => {
                         self.sidebar.select(NavItem::Search);
@@ -543,12 +525,7 @@ impl App {
                     None => {
                         // Default to home
                         self.sidebar.select(NavItem::Home);
-                        if let Some(cached) = self.cached_home.take() {
-                            self.current_page = Page::Home(cached);
-                        } else {
-                            self.current_page = Page::Home(HomePage::new());
-                            self.init_current_page().await;
-                        }
+                        self.show_home().await;
                     }
                 }
             }
@@ -574,7 +551,11 @@ impl App {
                 match &mut self.current_page {
                     Page::Home(home) => {
                         let page = home.search_mut();
-                        if page.loading_more || page.query.is_empty() || page.show_hot_list {
+                        if page.loading
+                            || page.loading_more
+                            || page.query.is_empty()
+                            || page.show_hot_list
+                        {
                             return;
                         }
                         if page.grid.cards.len() >= page.total_results as usize {
@@ -584,7 +565,11 @@ impl App {
                         command = Some((page.query.clone(), page.page + 1));
                     }
                     Page::Search(page) => {
-                        if page.loading_more || page.query.is_empty() || page.show_hot_list {
+                        if page.loading
+                            || page.loading_more
+                            || page.query.is_empty()
+                            || page.show_hot_list
+                        {
                             return;
                         }
                         if page.grid.cards.len() >= page.total_results as usize {
@@ -611,7 +596,7 @@ impl App {
                 }
                 let mut command = None;
                 if let Page::Dynamic(page) = &mut self.current_page {
-                    if page.loading_more || !page.has_more {
+                    if page.loading || page.loading_more || !page.has_more {
                         return;
                     }
                     let Some(offset) = page.offset.clone() else {
@@ -704,19 +689,9 @@ impl App {
                     self.apply_login_required_hint();
                     return;
                 }
-                let mut command = None;
                 if let Page::Dynamic(page) = &mut self.current_page {
                     page.switch_tab(tab);
-                    let host_mid = page.get_selected_up_mid();
-                    command = Some((page.current_tab, host_mid));
-                }
-                if let Some((tab, host_mid)) = command {
-                    let req_id = self.next_request_id("dynamic_refresh");
-                    self.send_network_command(network::NetworkCommand::LoadDynamicRefresh {
-                        req_id,
-                        tab,
-                        host_mid,
-                    });
+                    self.request_dynamic_feed();
                 }
             }
             AppAction::SelectUpMaster(index) => {
@@ -724,19 +699,9 @@ impl App {
                     self.apply_login_required_hint();
                     return;
                 }
-                let mut command = None;
                 if let Page::Dynamic(page) = &mut self.current_page {
                     page.select_up(index);
-                    let host_mid = page.get_selected_up_mid();
-                    command = Some((page.current_tab, host_mid));
-                }
-                if let Some((tab, host_mid)) = command {
-                    let req_id = self.next_request_id("dynamic_refresh");
-                    self.send_network_command(network::NetworkCommand::LoadDynamicRefresh {
-                        req_id,
-                        tab,
-                        host_mid,
-                    });
+                    self.request_dynamic_feed();
                 }
             }
             AppAction::NextTheme => {
@@ -905,6 +870,8 @@ impl App {
             AppAction::RefreshLive => {
                 if let Page::Live(page) = &mut self.current_page {
                     page.begin_loading();
+                    // A pending page of the old list must not be appended to the new one.
+                    self.next_request_id("live_more");
                     let req_id = self.next_request_id("live_init");
                     self.send_network_command(network::NetworkCommand::LoadLiveInit { req_id });
                 }
@@ -1076,13 +1043,7 @@ impl App {
         match self.sidebar.selected {
             NavItem::Home => {
                 if !matches!(self.current_page, Page::Home(_)) {
-                    // Use cached home page if available
-                    if let Some(cached) = self.cached_home.take() {
-                        self.current_page = Page::Home(cached);
-                    } else {
-                        self.current_page = Page::Home(HomePage::new());
-                        self.init_current_page().await;
-                    }
+                    self.show_home().await;
                 }
             }
             NavItem::MySpace => {
@@ -1189,6 +1150,17 @@ impl App {
         }
     }
 
+    /// Shows the cached Home page, loading it again when it has nothing to
+    /// show because its first load failed or was cancelled.
+    async fn show_home(&mut self) {
+        let cached = self.cached_home.take();
+        let reload = cached.as_ref().is_none_or(HomePage::needs_reload);
+        self.current_page = Page::Home(cached.unwrap_or_default());
+        if reload {
+            self.init_current_page().await;
+        }
+    }
+
     pub(super) async fn init_current_page(&mut self) {
         if self.config.minimal_mode
             && matches!(
@@ -1248,7 +1220,7 @@ impl App {
                 page.loading_up_list = true;
                 let tab = page.current_tab;
                 let host_mid = page.get_selected_up_mid();
-                let req_id = self.next_request_id("dynamic_init");
+                let req_id = self.next_request_id("dynamic_feed");
                 self.send_network_command(network::NetworkCommand::LoadDynamicInit {
                     req_id,
                     tab,
@@ -1297,6 +1269,35 @@ impl App {
                 // UpPage is initialized by OpenUpPage with an identity-bound request.
             }
         }
+    }
+
+    /// Reloads the Dynamic feed for the current tab and UP. The first load
+    /// also fetches the UP list, so it is repeated until that list arrives.
+    fn request_dynamic_feed(&mut self) {
+        let Page::Dynamic(page) = &mut self.current_page else {
+            return;
+        };
+        page.loading = true;
+        page.loading_more = false;
+        let tab = page.current_tab;
+        let host_mid = page.get_selected_up_mid();
+        let include_up_list = page.loading_up_list;
+        // A pending page of the old feed must not be appended to the new one.
+        self.next_request_id("dynamic_more");
+        let req_id = self.next_request_id("dynamic_feed");
+        self.send_network_command(if include_up_list {
+            network::NetworkCommand::LoadDynamicInit {
+                req_id,
+                tab,
+                host_mid,
+            }
+        } else {
+            network::NetworkCommand::LoadDynamicRefresh {
+                req_id,
+                tab,
+                host_mid,
+            }
+        });
     }
 
     pub(super) fn apply_minimal_mode(&mut self, enabled: bool) {

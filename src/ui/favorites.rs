@@ -93,6 +93,7 @@ impl FavoritesPage {
         self.total = 0;
         self.videos.clear();
         self.loading = true;
+        self.loading_more = false;
         self.error = None;
     }
 

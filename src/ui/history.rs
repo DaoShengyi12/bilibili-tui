@@ -123,6 +123,10 @@ impl HistoryPage {
         }
     }
 
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
     pub fn begin_loading(&mut self) {
         self.loading = true;
         self.error = None;
