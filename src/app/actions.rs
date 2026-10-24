@@ -96,6 +96,8 @@ impl App {
     /// Forget everything tied to the previous account after login or logout.
     pub(super) fn reset_account_state(&mut self) {
         self.send_network_command(network::NetworkCommand::CancelPending);
+        self.login_prompt = None;
+        self.session_refresh_forced = false;
         self.navigation_stack.clear();
         self.cached_home = None;
         self.cached_bangumi = None;
@@ -265,32 +267,26 @@ impl App {
                 self.send_network_command(network::NetworkCommand::CancelPending);
             }
             AppAction::Search(keyword) => {
-                let mut start_search = false;
-                match &mut self.current_page {
-                    Page::Home(home) => {
-                        let page = home.search_mut();
-                        page.query = keyword.clone();
-                        page.page = 1;
-                        page.loading = true;
-                        page.show_hot_list = false;
-                        start_search = true;
-                    }
-                    Page::Search(page) => {
-                        page.query = keyword.clone();
-                        page.page = 1;
-                        page.loading = true;
-                        page.show_hot_list = false;
-                        start_search = true;
-                    }
-                    _ => {}
+                let kind = self.current_search_page().map(|page| {
+                    page.query = keyword.clone();
+                    page.page = 1;
+                    page.loading = true;
+                    page.show_hot_list = false;
+                    page.kind
+                });
+                if let Some(kind) = kind {
+                    self.request_search(keyword, kind, 1);
                 }
-                if start_search {
-                    let req_id = self.next_request_id("search");
-                    self.send_network_command(network::NetworkCommand::Search {
-                        req_id,
-                        keyword,
-                        page: 1,
-                    });
+            }
+            AppAction::SwitchSearchKind(kind) => {
+                if let Some(keyword) = self
+                    .current_search_page()
+                    .and_then(|page| page.switch_kind(kind))
+                {
+                    self.request_search(keyword, kind, 1);
+                } else {
+                    // Results of the previous kind must not land in the new one.
+                    self.next_request_id("search");
                 }
             }
             AppAction::RefreshDynamic => {
@@ -505,46 +501,20 @@ impl App {
                 }
             }
             AppAction::LoadMoreSearch => {
-                let mut command = None;
-                match &mut self.current_page {
-                    Page::Home(home) => {
-                        let page = home.search_mut();
-                        if page.loading
-                            || page.loading_more
-                            || page.query.is_empty()
-                            || page.show_hot_list
-                        {
-                            return;
-                        }
-                        if page.grid.cards.len() >= page.total_results as usize {
-                            return;
-                        }
-                        page.loading_more = true;
-                        command = Some((page.query.clone(), page.page + 1));
+                let request = self.current_search_page().and_then(|page| {
+                    if page.loading
+                        || page.loading_more
+                        || page.query.is_empty()
+                        || page.show_hot_list
+                        || page.grid.cards.len() >= page.total_results as usize
+                    {
+                        return None;
                     }
-                    Page::Search(page) => {
-                        if page.loading
-                            || page.loading_more
-                            || page.query.is_empty()
-                            || page.show_hot_list
-                        {
-                            return;
-                        }
-                        if page.grid.cards.len() >= page.total_results as usize {
-                            return;
-                        }
-                        page.loading_more = true;
-                        command = Some((page.query.clone(), page.page + 1));
-                    }
-                    _ => {}
-                }
-                if let Some((keyword, next_page)) = command {
-                    let req_id = self.next_request_id("search");
-                    self.send_network_command(network::NetworkCommand::Search {
-                        req_id,
-                        keyword,
-                        page: next_page,
-                    });
+                    page.loading_more = true;
+                    Some((page.query.clone(), page.kind, page.page + 1))
+                });
+                if let Some((keyword, kind, next_page)) = request {
+                    self.request_search(keyword, kind, next_page);
                 }
             }
             AppAction::LoadMoreDynamic => {
@@ -627,29 +597,43 @@ impl App {
                 self.current_page = Page::History(HistoryPage::new());
                 self.init_current_page().await;
             }
+            AppAction::RefreshHistory => {
+                if self.credentials.is_none() {
+                    self.apply_login_required_hint();
+                    return;
+                }
+                if let Page::History(page) = &mut self.current_page {
+                    page.begin_loading();
+                    // A pending page of the old list must not be appended.
+                    self.next_request_id("history_more");
+                    let req_id = self.next_request_id("history_init");
+                    self.send_network_command(network::NetworkCommand::LoadHistoryInit { req_id });
+                }
+            }
             AppAction::LoadMoreComments => {
                 if let Page::VideoDetail(page) = &mut self.current_page
-                    && let Some(next_page) = page.begin_load_more_comments()
+                    && let Some((sort, offset)) = page.begin_load_more_comments()
                 {
                     let aid = page.aid;
-                    let req_id = self.next_request_id("video_comments");
-                    self.send_network_command(network::NetworkCommand::LoadVideoComments {
-                        req_id,
-                        aid,
-                        page: next_page,
-                    });
+                    self.request_video_comments(aid, sort, Some(offset));
                 } else if let Page::DynamicDetail(page) = &mut self.current_page
-                    && let Some((oid, comment_type, next_page)) = page.begin_load_more_comments()
+                    && let Some(request) = page.begin_load_more_comments()
                 {
                     let dynamic_id = page.dynamic_id.clone();
-                    let req_id = self.next_request_id("dynamic_comments");
-                    self.send_network_command(network::NetworkCommand::LoadDynamicComments {
-                        req_id,
-                        dynamic_id,
-                        oid,
-                        comment_type,
-                        page: next_page,
-                    });
+                    self.request_dynamic_comments(dynamic_id, request);
+                }
+            }
+            AppAction::ToggleCommentSort => {
+                if let Page::VideoDetail(page) = &mut self.current_page
+                    && let Some(sort) = page.begin_comment_sort_toggle()
+                {
+                    let aid = page.aid;
+                    self.request_video_comments(aid, sort, None);
+                } else if let Page::DynamicDetail(page) = &mut self.current_page
+                    && let Some(request) = page.begin_comment_sort_toggle()
+                {
+                    let dynamic_id = page.dynamic_id.clone();
+                    self.request_dynamic_comments(dynamic_id, request);
                 }
             }
             AppAction::ToggleCommentReplies => {
@@ -710,7 +694,9 @@ impl App {
             }
             AppAction::Logout => {
                 self.report_save_result("删除登录信息", persistence::delete_credentials());
-                self.credentials = None;
+                if let Some(credentials) = self.credentials.take() {
+                    self.send_network_command(network::NetworkCommand::Logout { credentials });
+                }
                 self.api_client.clear_credentials();
                 self.reset_account_state();
                 self.current_page = Page::Home(HomePage::new());
@@ -831,7 +817,11 @@ impl App {
                     self.send_network_command(network::NetworkCommand::LoadLiveMore { req_id });
                 }
             }
-            AppAction::PlayLive { room_id, title: _ } => {
+            AppAction::PlayLive {
+                room_id,
+                title: _,
+                quality,
+            } => {
                 let existing_hub = self.live_danmaku_hub_for(room_id);
                 let live_hub_tx = self.live_hub_tx.clone();
                 let uid = self.login_uid();
@@ -864,10 +854,31 @@ impl App {
                         danmaku_hub,
                         control,
                         video_quality,
+                        quality,
                         playback_event_tx,
                         session_id,
                     )
                     .await
+                });
+            }
+            AppAction::LoadLiveQualities(room_id) => {
+                let req_id = self.next_request_id("live_qualities");
+                self.send_network_command(network::NetworkCommand::LoadLiveQualities {
+                    req_id,
+                    room_id,
+                    quality: self.config.video_quality,
+                });
+            }
+            AppAction::SendLiveDanmaku { room_id, message } => {
+                if self.credentials.is_none() {
+                    if let Page::LiveDetail(page) = &mut self.current_page {
+                        page.restore_danmaku_draft(message, Self::login_required_message());
+                    }
+                    return;
+                }
+                self.send_network_command(network::NetworkCommand::SendLiveDanmaku {
+                    room_id,
+                    message,
                 });
             }
             AppAction::SwitchToBangumi => {
@@ -945,6 +956,41 @@ impl App {
                 );
             }
             AppAction::StopPlayback => self.stop_playback(),
+            AppAction::VideoAction(mut request) => {
+                let Page::VideoDetail(page) = &mut self.current_page else {
+                    return;
+                };
+                if self.credentials.is_none() {
+                    if let crate::application::VideoActionRequest::SendDanmaku { message, .. } =
+                        request
+                    {
+                        page.restore_danmaku_draft(message, Self::login_required_message());
+                    } else {
+                        page.notice = Some(Self::login_required_message());
+                    }
+                    return;
+                }
+                if let crate::application::VideoActionRequest::SendDanmaku {
+                    cid,
+                    progress_ms,
+                    ..
+                } = &mut request
+                {
+                    *progress_ms = self
+                        .playback_position
+                        .lock()
+                        .ok()
+                        .and_then(|position| *position)
+                        .filter(|(playing_cid, _)| playing_cid == cid)
+                        .map_or(0, |(_, seconds)| (seconds * 1000.0) as i64);
+                }
+                page.action_pending = true;
+                let user_mid = self.login_uid();
+                self.send_network_command(network::NetworkCommand::VideoAction {
+                    request,
+                    user_mid,
+                });
+            }
             AppAction::None => {}
         }
     }
@@ -1032,6 +1078,7 @@ impl App {
         let start = start(media::PlayerControl {
             stop: stop.clone(),
             danmaku_config: self.danmaku_config_tx.subscribe(),
+            position: std::sync::Arc::clone(&self.playback_position),
         });
         let playback_event_tx = self.playback_event_tx.clone();
         tokio::spawn(async move {
@@ -1059,6 +1106,56 @@ impl App {
         self.auto_return_after_playback = None;
     }
 
+    /// The search page on screen: standalone or inside Home.
+    fn current_search_page(&mut self) -> Option<&mut SearchPage> {
+        match &mut self.current_page {
+            Page::Home(home) => Some(home.search_mut()),
+            Page::Search(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    fn request_search(&mut self, keyword: String, kind: crate::api::search::SearchKind, page: i32) {
+        let req_id = self.next_request_id("search");
+        self.send_network_command(network::NetworkCommand::Search {
+            req_id,
+            keyword,
+            kind,
+            page,
+        });
+    }
+
+    pub(super) fn request_video_comments(
+        &mut self,
+        aid: i64,
+        sort: crate::api::comment::CommentSort,
+        offset: Option<String>,
+    ) {
+        let req_id = self.next_request_id("video_comments");
+        self.send_network_command(network::NetworkCommand::LoadVideoComments {
+            req_id,
+            aid,
+            sort,
+            offset,
+        });
+    }
+
+    pub(super) fn request_dynamic_comments(
+        &mut self,
+        dynamic_id: String,
+        request: crate::presentation::tui::CommentRequest,
+    ) {
+        let req_id = self.next_request_id("dynamic_comments");
+        self.send_network_command(network::NetworkCommand::LoadDynamicComments {
+            req_id,
+            dynamic_id,
+            oid: request.oid,
+            comment_type: request.comment_type,
+            sort: request.sort,
+            offset: request.offset,
+        });
+    }
+
     fn login_uid(&self) -> i64 {
         self.credentials
             .as_ref()
@@ -1066,7 +1163,7 @@ impl App {
             .unwrap_or(0)
     }
 
-    async fn switch_to_nav_page(&mut self) {
+    pub(super) async fn switch_to_nav_page(&mut self) {
         self.leave_navigation_stack();
         // First, cache home page if we're leaving it
         if matches!(self.current_page, Page::Home(_))

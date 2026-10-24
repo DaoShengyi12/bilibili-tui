@@ -453,7 +453,7 @@ impl Component for HistoryPage {
         self.render_grid(frame, chunks[0], theme);
         self.render_footer(frame, chunks[1], theme, keys);
         if self.mode == HistoryMode::ConfirmDelete {
-            self.render_delete_confirmation(frame, area, theme);
+            self.render_delete_confirmation(frame, area, theme, keys);
         }
     }
 
@@ -500,6 +500,9 @@ impl Component for HistoryPage {
         if modifiers.contains(KeyModifiers::CONTROL) && key == KeyCode::Char('r') {
             self.invert_loaded_selection();
             return None;
+        }
+        if keys.matches_refresh(key) && self.selected_keys.is_empty() && !self.loading {
+            return Some(AppAction::RefreshHistory);
         }
         // Fixed shortcuts give way to keys the user bound for navigation.
         let fixed_shortcut = !keys.matches_list_navigation(key);
@@ -579,8 +582,7 @@ impl Component for HistoryPage {
             }
             return None;
         }
-        if fixed_shortcut
-            && key == KeyCode::Char('u')
+        if keys.matches_open_up(key)
             && let Some(item) = self.items.get(self.selected)
         {
             return Some(AppAction::OpenUpPage(item.item.author_mid));
@@ -867,6 +869,8 @@ impl HistoryPage {
                 ("Ctrl+A/Ctrl+R".into(), "全选/反选".into(), theme.fg_accent),
                 ("d".into(), "删除".into(), theme.info),
                 (keys.confirm.clone(), "详情".into(), theme.success),
+                (keys.open_up.clone(), "UP主".into(), theme.info),
+                (keys.refresh.clone(), "刷新".into(), theme.info),
                 (
                     "Esc".into(),
                     format!("取消 · 已选 {}", self.selected_keys.len()),
@@ -877,7 +881,13 @@ impl HistoryPage {
         frame.render_widget(Paragraph::new(help).alignment(Alignment::Center), area);
     }
 
-    fn render_delete_confirmation(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_delete_confirmation(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        keys: &Keybindings,
+    ) {
         let width = area.width.min(52);
         let height = area.height.min(7);
         let popup = Rect::new(
@@ -888,8 +898,10 @@ impl HistoryPage {
         );
         frame.render_widget(Clear, popup);
         let message = format!(
-            "确定删除 {} 条历史记录？\n\nEnter 确认 · Esc 返回选择",
-            self.selected_keys.len()
+            "确定删除 {} 条历史记录？\n\n{} 确认 · {} 返回选择",
+            self.selected_keys.len(),
+            keys.confirm,
+            keys.back
         );
         frame.render_widget(
             Paragraph::new(message)
@@ -1094,5 +1106,21 @@ mod tests {
 
         assert_eq!(page.mode, HistoryMode::Selecting);
         assert_eq!(page.selected_keys.len(), 1);
+    }
+
+    #[test]
+    fn refresh_key_reloads_only_without_a_selection() {
+        let keys = Keybindings::default();
+        let mut page = HistoryPage::new();
+        page.loading = false;
+        assert!(matches!(
+            page.handle_input_with_modifiers(KeyCode::Char('r'), KeyModifiers::NONE, &keys),
+            Some(AppAction::RefreshHistory)
+        ));
+        page.loading = true;
+        assert!(
+            page.handle_input_with_modifiers(KeyCode::Char('r'), KeyModifiers::NONE, &keys)
+                .is_none_or(|action| !matches!(action, AppAction::RefreshHistory))
+        );
     }
 }

@@ -2,9 +2,10 @@
 
 use super::video_card::VideoCardGrid;
 use super::{Component, Theme, footer_notice, shortcut_footer};
-use crate::api::comment::CommentItem;
+use crate::api::client::{ArchiveRelation, TripleResult};
+use crate::api::comment::{CommentBatch, CommentItem, CommentSort};
 use crate::api::video::{RelatedVideoItem, VideoInfo};
-use crate::application::AppAction;
+use crate::application::{AppAction, VideoActionRequest};
 use crate::storage::Keybindings;
 use ratatui::{
     crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind},
@@ -13,6 +14,14 @@ use ratatui::{
 };
 use std::collections::HashSet;
 use std::time::Instant;
+
+/// What the text box at the bottom is typing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InputTarget {
+    #[default]
+    Comment,
+    Danmaku,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum DetailFocus {
@@ -31,7 +40,9 @@ pub struct VideoDetailPage {
     pub related_card_grid: VideoCardGrid,
     pub loading: bool,
     pub error_message: Option<String>,
-    pub comment_page: i32,
+    /// Cursor of the next comment page; `None` once all are loaded.
+    pub comment_offset: Option<String>,
+    pub comment_sort: CommentSort,
     pub comment_scroll: usize,
     pub related_scroll: usize,
     pub focus: DetailFocus,
@@ -42,7 +53,12 @@ pub struct VideoDetailPage {
     pub loading_replies: bool,
     pub liked_comments: HashSet<i64>,
     pub input_mode: bool,
+    pub input_target: InputTarget,
     pub input_buffer: String,
+    /// The account's like/coin/favourite/follow state; `None` for guests.
+    pub relation: Option<ArchiveRelation>,
+    /// A video action was sent and its result has not arrived.
+    pub action_pending: bool,
     /// Transient message shown in the footer until the next key press.
     pub notice: Option<String>,
     last_click_time: Option<Instant>,
@@ -70,7 +86,8 @@ impl VideoDetailPage {
             related_card_grid,
             loading: true,
             error_message: None,
-            comment_page: 1,
+            comment_offset: None,
+            comment_sort: CommentSort::default(),
             comment_scroll: 0,
             related_scroll: 0,
             focus: DetailFocus::Comments,
@@ -81,7 +98,10 @@ impl VideoDetailPage {
             loading_replies: false,
             liked_comments: HashSet::new(),
             input_mode: false,
+            input_target: InputTarget::Comment,
             input_buffer: String::new(),
+            relation: None,
+            action_pending: false,
             notice: None,
             last_click_time: None,
             last_click_index: None,
@@ -94,8 +114,124 @@ impl VideoDetailPage {
     /// Reopen the comment box with a draft that could not be posted.
     pub fn restore_comment_draft(&mut self, message: String, notice: String) {
         self.input_mode = true;
+        self.input_target = InputTarget::Comment;
         self.input_buffer = message;
         self.notice = Some(notice);
+    }
+
+    /// Reopen the danmaku box with a message that could not be sent.
+    pub fn restore_danmaku_draft(&mut self, message: String, notice: String) {
+        self.input_mode = true;
+        self.input_target = InputTarget::Danmaku;
+        self.input_buffer = message;
+        self.notice = Some(notice);
+    }
+
+    /// The part playing or about to play.
+    fn current_cid(&self) -> Option<i64> {
+        self.get_pages()
+            .and_then(|pages| pages.get(self.current_page_index))
+            .map(|page| page.cid)
+            .or_else(|| self.video_info.as_ref().map(|info| info.cid))
+            .filter(|cid| *cid > 0)
+    }
+
+    /// The request for a video action key, or `None` for other keys.
+    fn video_action_for(&self, key: KeyCode, keys: &Keybindings) -> Option<VideoActionRequest> {
+        let info = self.video_info.as_ref()?;
+        let aid = info.aid;
+        let relation = self.relation.unwrap_or_default();
+        Some(if keys.matches_video_like(key) {
+            VideoActionRequest::Like {
+                aid,
+                like: !relation.like,
+            }
+        } else if keys.matches_video_coin(key) {
+            VideoActionRequest::Coin { aid }
+        } else if keys.matches_video_favorite(key) {
+            VideoActionRequest::Favorite {
+                aid,
+                favorite: !relation.favorite,
+            }
+        } else if keys.matches_video_triple(key) {
+            VideoActionRequest::Triple { aid }
+        } else if keys.matches_watch_later(key) {
+            VideoActionRequest::WatchLater { aid }
+        } else if keys.matches_follow(key) {
+            VideoActionRequest::Follow {
+                aid,
+                mid: info.owner.mid,
+                follow: !relation.attention,
+            }
+        } else {
+            return None;
+        })
+    }
+
+    /// Record the server's answer to a video action.
+    pub fn apply_video_action(
+        &mut self,
+        request: VideoActionRequest,
+        result: Result<Option<TripleResult>, String>,
+    ) {
+        self.action_pending = false;
+        if let Err(error) = result {
+            if let VideoActionRequest::SendDanmaku { message, .. } = request {
+                self.restore_danmaku_draft(message, format!("弹幕发送失败：{error}"));
+            } else {
+                self.notice = Some(format!("操作失败：{error}"));
+            }
+            return;
+        }
+        let relation = self.relation.get_or_insert_with(ArchiveRelation::default);
+        self.notice = Some(match request {
+            VideoActionRequest::Like { like, .. } => {
+                relation.like = like;
+                if like { "已点赞" } else { "已取消点赞" }.to_string()
+            }
+            VideoActionRequest::Coin { .. } => {
+                relation.coin = (relation.coin + 1).min(2);
+                "已投币".to_string()
+            }
+            VideoActionRequest::Favorite { favorite, .. } => {
+                relation.favorite = favorite;
+                if favorite {
+                    "已加入默认收藏夹"
+                } else {
+                    "已取消收藏"
+                }
+                .to_string()
+            }
+            VideoActionRequest::Triple { .. } => {
+                let triple = result.ok().flatten().unwrap_or_default();
+                relation.like |= triple.like;
+                relation.favorite |= triple.fav;
+                if triple.coin {
+                    relation.coin = triple.multiply.max(relation.coin).min(2);
+                }
+                format!(
+                    "三连：点赞{} 投币{} 收藏{}",
+                    if triple.like { "✓" } else { "✗" },
+                    if triple.coin { "✓" } else { "✗" },
+                    if triple.fav { "✓" } else { "✗" }
+                )
+            }
+            VideoActionRequest::WatchLater { .. } => "已添加到稍后再看".to_string(),
+            VideoActionRequest::Follow { follow, .. } => {
+                relation.attention = follow;
+                if follow {
+                    "已关注UP主"
+                } else {
+                    "已取消关注"
+                }
+                .to_string()
+            }
+            VideoActionRequest::SendDanmaku { progress_ms, .. } => format!(
+                "弹幕已发送到 {:02}:{:02}",
+                progress_ms / 60_000,
+                progress_ms / 1000 % 60
+            ),
+        });
     }
 
     pub fn play_action(&self) -> AppAction {
@@ -129,25 +265,55 @@ impl VideoDetailPage {
         }
     }
 
-    /// Marks the next comment page as loading and returns its number, or
-    /// `None` when there is nothing more to load or a page is in flight.
-    pub fn begin_load_more_comments(&mut self) -> Option<i32> {
+    /// Marks the next comment page as loading and returns its sort and
+    /// cursor, or `None` when there is nothing more or a page is in flight.
+    pub fn begin_load_more_comments(&mut self) -> Option<(CommentSort, String)> {
         if !self.has_more_comments || self.loading_more_comments {
             return None;
         }
+        let offset = self.comment_offset.clone()?;
         self.loading_more_comments = true;
-        Some(self.comment_page + 1)
+        Some((self.comment_sort, offset))
     }
 
-    pub fn apply_more_comments(&mut self, page: i32, replies: Option<Vec<CommentItem>>) {
-        match replies {
-            Some(replies) if !replies.is_empty() => {
-                self.comments.extend(replies);
-                self.comment_page = page;
-            }
-            _ => self.has_more_comments = false,
-        }
+    /// Replace the comment list with the first page of a load.
+    pub fn set_comments(&mut self, batch: CommentBatch) {
+        self.comments = batch.comments;
+        self.has_more_comments = batch.next_offset.is_some();
+        self.comment_offset = batch.next_offset;
+        self.comment_scroll = 0;
+        self.expanded_comment = None;
+        self.comment_replies.clear();
+        self.loading_replies = false;
         self.loading_more_comments = false;
+    }
+
+    /// A comment page for `sort`; pages for a sort no longer selected are
+    /// dropped.
+    pub fn apply_comment_batch(&mut self, sort: CommentSort, append: bool, batch: CommentBatch) {
+        if sort != self.comment_sort {
+            return;
+        }
+        if !append {
+            self.set_comments(batch);
+            return;
+        }
+        self.comments.extend(batch.comments);
+        self.has_more_comments = batch.next_offset.is_some();
+        self.comment_offset = batch.next_offset;
+        self.loading_more_comments = false;
+    }
+
+    /// Switch between hot and newest-first comments and return the sort to
+    /// load, or `None` while the page itself is still loading.
+    pub fn begin_comment_sort_toggle(&mut self) -> Option<CommentSort> {
+        if self.loading || self.video_info.is_none() {
+            return None;
+        }
+        self.comment_sort = self.comment_sort.toggled();
+        self.set_comments(CommentBatch::default());
+        self.loading_more_comments = true;
+        Some(self.comment_sort)
     }
 
     pub fn apply_more_comments_error(&mut self) {
@@ -237,9 +403,31 @@ impl VideoDetailPage {
             frame.render_widget(title, chunks[0]);
 
             // Author
-            let author = Paragraph::new(format!("UP: {}", info.owner.name))
-                .style(Style::default().fg(theme.bilibili_pink));
-            frame.render_widget(author, chunks[1]);
+            let relation = self.relation.unwrap_or_default();
+            let mut author_spans = vec![Span::styled(
+                format!("UP: {}", info.owner.name),
+                Style::default().fg(theme.bilibili_pink),
+            )];
+            if self.relation.is_some() {
+                author_spans.push(Span::styled(
+                    if relation.attention {
+                        "  [已关注]"
+                    } else {
+                        "  [未关注]"
+                    },
+                    Style::default().fg(theme.fg_secondary),
+                ));
+            }
+            frame.render_widget(Paragraph::new(Line::from(author_spans)), chunks[1]);
+            let marked = |active: bool| {
+                if active {
+                    Style::default()
+                        .fg(theme.bilibili_pink)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.fg_secondary)
+                }
+            };
 
             // Stats
             let stats = Paragraph::new(Line::from(vec![
@@ -254,20 +442,18 @@ impl VideoDetailPage {
                     Style::default().fg(theme.fg_secondary),
                 ),
                 Span::styled(" · 👍 ", Style::default().fg(theme.fg_secondary)),
-                Span::styled(
-                    info.stat.format_like(),
-                    Style::default().fg(theme.fg_secondary),
-                ),
+                Span::styled(info.stat.format_like(), marked(relation.like)),
                 Span::styled(" · 💰 ", Style::default().fg(theme.fg_secondary)),
                 Span::styled(
-                    info.stat.format_coin(),
-                    Style::default().fg(theme.fg_secondary),
+                    if relation.coin > 0 {
+                        format!("{} (已投{})", info.stat.format_coin(), relation.coin)
+                    } else {
+                        info.stat.format_coin()
+                    },
+                    marked(relation.coin > 0),
                 ),
                 Span::styled(" · ⭐ ", Style::default().fg(theme.fg_secondary)),
-                Span::styled(
-                    info.stat.format_favorite(),
-                    Style::default().fg(theme.fg_secondary),
-                ),
+                Span::styled(info.stat.format_favorite(), marked(relation.favorite)),
             ]));
             frame.render_widget(stats, chunks[2]);
 
@@ -305,7 +491,7 @@ impl VideoDetailPage {
             .border_type(BorderType::Rounded)
             .border_style(border_style)
             .title(Span::styled(
-                " 💬 评论 ",
+                format!(" 💬 评论 · {} ", self.comment_sort.label()),
                 Style::default().fg(if is_focused {
                     theme.bilibili_pink
                 } else {
@@ -317,7 +503,12 @@ impl VideoDetailPage {
         frame.render_widget(block, area);
 
         if self.comments.is_empty() {
-            let empty = Paragraph::new("暂无评论")
+            let text = if self.loading_more_comments {
+                "⏳ 加载评论中..."
+            } else {
+                "暂无评论"
+            };
+            let empty = Paragraph::new(text)
                 .style(Style::default().fg(theme.fg_secondary))
                 .alignment(Alignment::Center);
             frame.render_widget(empty, inner);
@@ -682,7 +873,10 @@ impl Component for VideoDetailPage {
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(theme.bilibili_pink))
                 .title(Span::styled(
-                    " ✏️ 发表评论 ",
+                    match self.input_target {
+                        InputTarget::Comment => " ✏️ 发表评论 ",
+                        InputTarget::Danmaku => " ✏️ 发送弹幕 ",
+                    },
                     Style::default()
                         .fg(theme.bilibili_pink)
                         .add_modifier(Modifier::BOLD),
@@ -707,7 +901,15 @@ impl Component for VideoDetailPage {
             shortcut_footer(
                 theme,
                 [
-                    (keys.confirm.clone(), "发送评论".into(), theme.success),
+                    (
+                        "Enter".to_string(),
+                        match self.input_target {
+                            InputTarget::Comment => "发送评论",
+                            InputTarget::Danmaku => "发送弹幕",
+                        }
+                        .into(),
+                        theme.success,
+                    ),
                     (keys.back.clone(), "取消".into(), theme.info),
                 ],
             )
@@ -724,12 +926,44 @@ impl Component for VideoDetailPage {
                     (keys.confirm.clone(), "点赞/选择".into(), theme.success),
                     (keys.comment.clone(), "评论".into(), theme.info),
                     (keys.toggle_replies.clone(), "回复".into(), theme.info),
+                    (
+                        keys.comment_sort.clone(),
+                        self.comment_sort.toggled().label().into(),
+                        theme.info,
+                    ),
                     (keys.play.clone(), "播放".into(), theme.success),
                     (keys.back.clone(), "返回".into(), theme.info),
                 ],
             )
         };
-        let help = Paragraph::new(help).alignment(Alignment::Center);
+        let actions = shortcut_footer(
+            theme,
+            [
+                (keys.video_like.clone(), "赞".into(), theme.bilibili_pink),
+                (keys.video_coin.clone(), "币".into(), theme.bilibili_pink),
+                (
+                    keys.video_favorite.clone(),
+                    "藏".into(),
+                    theme.bilibili_pink,
+                ),
+                (
+                    keys.video_triple.clone(),
+                    "三连".into(),
+                    theme.bilibili_pink,
+                ),
+                (keys.watch_later.clone(), "稍后看".into(), theme.info),
+                (keys.follow.clone(), "关注".into(), theme.info),
+                (keys.send_danmaku.clone(), "弹幕".into(), theme.info),
+                (keys.open_up.clone(), "UP主".into(), theme.info),
+                (keys.stop_playback.clone(), "停止播放".into(), theme.warning),
+            ],
+        );
+        let lines = if self.input_mode || self.notice.is_some() {
+            vec![help]
+        } else {
+            vec![help, actions]
+        };
+        let help = Paragraph::new(lines).alignment(Alignment::Center);
         frame.render_widget(help, help_chunk);
     }
 
@@ -758,6 +992,22 @@ impl Component for VideoDetailPage {
                 KeyCode::Esc => {
                     self.input_mode = false;
                     self.input_buffer.clear();
+                    return Some(AppAction::None);
+                }
+                KeyCode::Enter if self.input_target == InputTarget::Danmaku => {
+                    let message = self.input_buffer.trim().to_string();
+                    if let (false, Some(info), Some(cid)) =
+                        (message.is_empty(), &self.video_info, self.current_cid())
+                    {
+                        self.input_buffer.clear();
+                        self.input_mode = false;
+                        return Some(AppAction::VideoAction(VideoActionRequest::SendDanmaku {
+                            aid: info.aid,
+                            cid,
+                            message,
+                            progress_ms: 0,
+                        }));
+                    }
                     return Some(AppAction::None);
                 }
                 KeyCode::Enter => {
@@ -789,10 +1039,22 @@ impl Component for VideoDetailPage {
         if keys.matches_quit(key) || keys.matches_back(key) {
             return Some(AppAction::BackToList);
         }
-        if key == KeyCode::Char('u')
+        if keys.matches_open_up(key)
             && let Some(info) = &self.video_info
         {
             return Some(AppAction::OpenUpPage(info.owner.mid));
+        }
+        if let Some(request) = self.video_action_for(key, keys) {
+            if self.action_pending {
+                return Some(AppAction::None);
+            }
+            return Some(AppAction::VideoAction(request));
+        }
+        if keys.matches_send_danmaku(key) && self.video_info.is_some() {
+            self.input_mode = true;
+            self.input_target = InputTarget::Danmaku;
+            self.input_buffer.clear();
+            return Some(AppAction::None);
         }
         if keys.matches_play(key) {
             return Some(self.play_action());
@@ -800,6 +1062,7 @@ impl Component for VideoDetailPage {
         if keys.matches_comment(key) {
             // Enter comment input mode
             self.input_mode = true;
+            self.input_target = InputTarget::Comment;
             self.input_buffer.clear();
             return Some(AppAction::None);
         }
@@ -808,6 +1071,9 @@ impl Component for VideoDetailPage {
                 return Some(AppAction::ToggleCommentReplies);
             }
             return Some(AppAction::None);
+        }
+        if keys.matches_comment_sort(key) {
+            return Some(AppAction::ToggleCommentSort);
         }
         // Tab switches focus between Comments, Episodes, and Related (page-specific, not nav)
         if key == KeyCode::Tab {
@@ -1082,23 +1348,67 @@ mod comment_loading_tests {
         .unwrap()
     }
 
+    fn batch(ids: &[i64], next: Option<&str>) -> CommentBatch {
+        CommentBatch {
+            comments: ids.iter().map(|id| comment(*id, 0)).collect(),
+            next_offset: next.map(str::to_string),
+        }
+    }
+
     #[test]
     fn load_more_comments_runs_one_page_at_a_time_and_ends_on_failure() {
         let mut page = VideoDetailPage::new("BV1test".into(), 1);
-        page.has_more_comments = true;
-        assert_eq!(page.begin_load_more_comments(), Some(2));
+        page.set_comments(batch(&[1], Some("p2")));
+        assert_eq!(
+            page.begin_load_more_comments(),
+            Some((CommentSort::Hot, "p2".to_string()))
+        );
         assert_eq!(page.begin_load_more_comments(), None);
         page.apply_more_comments_error();
         assert!(!page.loading_more_comments);
-        assert_eq!(page.comment_page, 1);
 
-        assert_eq!(page.begin_load_more_comments(), Some(2));
-        page.apply_more_comments(2, Some(vec![comment(5, 0)]));
-        assert_eq!(page.comment_page, 2);
-        assert_eq!(page.comments.len(), 1);
         page.begin_load_more_comments();
-        page.apply_more_comments(3, Some(Vec::new()));
+        page.apply_comment_batch(CommentSort::Hot, true, batch(&[5], None));
+        assert_eq!(page.comments.len(), 2);
         assert!(!page.has_more_comments && !page.loading_more_comments);
+        assert_eq!(page.begin_load_more_comments(), None);
+    }
+
+    #[test]
+    fn sort_toggle_reloads_comments_and_drops_pages_of_the_old_sort() {
+        let mut page = VideoDetailPage::new("BV1test".into(), 1);
+        page.loading = false;
+        page.video_info = Some(
+            serde_json::from_value(serde_json::json!({
+                "bvid": "BV1test", "aid": 1, "title": "t", "cid": 1,
+                "owner": {"mid": 1, "name": "up", "face": ""},
+                "stat": {"view": 0, "danmaku": 0, "like": 0, "coin": 0, "favorite": 0, "share": 0}
+            }))
+            .unwrap(),
+        );
+        page.set_comments(batch(&[1, 2], Some("p2")));
+        page.comment_scroll = 1;
+
+        assert_eq!(page.begin_comment_sort_toggle(), Some(CommentSort::Time));
+        assert!(page.comments.is_empty() && page.loading_more_comments);
+        assert_eq!(page.comment_scroll, 0);
+
+        page.apply_comment_batch(CommentSort::Hot, true, batch(&[9], None));
+        assert!(
+            page.comments.is_empty(),
+            "a page of the old sort is ignored"
+        );
+        page.apply_comment_batch(CommentSort::Time, false, batch(&[3], Some("t2")));
+        assert_eq!(page.comments[0].rpid, 3);
+        assert_eq!(page.comment_offset.as_deref(), Some("t2"));
+        assert!(!page.loading_more_comments);
+    }
+
+    #[test]
+    fn sort_cannot_change_while_the_page_loads() {
+        let mut page = VideoDetailPage::new("BV1test".into(), 1);
+        assert_eq!(page.begin_comment_sort_toggle(), None);
+        assert_eq!(page.comment_sort, CommentSort::Hot);
     }
 
     #[test]
@@ -1145,6 +1455,107 @@ mod comment_loading_tests {
 
         page.apply_comment_replies(7, Some(vec![comment(8, 0)]));
         assert!(page.comment_replies.is_empty());
+    }
+
+    fn loaded_page() -> VideoDetailPage {
+        let mut page = VideoDetailPage::new("BV1test".into(), 1);
+        page.loading = false;
+        page.video_info = Some(
+            serde_json::from_value(serde_json::json!({
+                "bvid": "BV1test", "aid": 1, "title": "t", "cid": 11,
+                "owner": {"mid": 42, "name": "up", "face": ""},
+                "stat": {"view": 0, "danmaku": 0, "like": 0, "coin": 0, "favorite": 0, "share": 0}
+            }))
+            .unwrap(),
+        );
+        page
+    }
+
+    #[test]
+    fn action_keys_toggle_from_the_current_relation() {
+        let keys = Keybindings::default();
+        let mut page = loaded_page();
+        page.relation = Some(ArchiveRelation {
+            like: true,
+            ..ArchiveRelation::default()
+        });
+        assert!(matches!(
+            page.handle_input(KeyCode::Char('a'), &keys),
+            Some(AppAction::VideoAction(VideoActionRequest::Like {
+                like: false,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            page.handle_input(KeyCode::Char('F'), &keys),
+            Some(AppAction::VideoAction(VideoActionRequest::Follow {
+                mid: 42,
+                follow: true,
+                ..
+            }))
+        ));
+        page.action_pending = true;
+        assert!(matches!(
+            page.handle_input(KeyCode::Char('b'), &keys),
+            Some(AppAction::None)
+        ));
+    }
+
+    #[test]
+    fn action_results_update_relation_and_failures_keep_it() {
+        let mut page = loaded_page();
+        page.action_pending = true;
+        page.apply_video_action(VideoActionRequest::Coin { aid: 1 }, Ok(None));
+        assert_eq!(page.relation.unwrap().coin, 1);
+        assert!(!page.action_pending);
+        page.apply_video_action(
+            VideoActionRequest::Favorite {
+                aid: 1,
+                favorite: true,
+            },
+            Err("API error (-111): csrf".into()),
+        );
+        assert!(!page.relation.unwrap().favorite);
+        assert!(page.notice.as_deref().unwrap().contains("-111"));
+        page.apply_video_action(
+            VideoActionRequest::Triple { aid: 1 },
+            Ok(Some(TripleResult {
+                like: true,
+                coin: true,
+                fav: true,
+                multiply: 2,
+            })),
+        );
+        let relation = page.relation.unwrap();
+        assert!(relation.like && relation.favorite && relation.coin == 2);
+    }
+
+    #[test]
+    fn danmaku_box_sends_to_the_current_part() {
+        let keys = Keybindings::default();
+        let mut page = loaded_page();
+        page.handle_input(KeyCode::Char('d'), &keys);
+        assert!(page.input_mode && page.input_target == InputTarget::Danmaku);
+        for c in "hi".chars() {
+            page.handle_input(KeyCode::Char(c), &keys);
+        }
+        let action = page.handle_input(KeyCode::Enter, &keys);
+        assert!(matches!(
+            action,
+            Some(AppAction::VideoAction(VideoActionRequest::SendDanmaku { cid: 11, ref message, .. }))
+                if message == "hi"
+        ));
+        page.apply_video_action(
+            VideoActionRequest::SendDanmaku {
+                aid: 1,
+                cid: 11,
+                message: "hi".into(),
+                progress_ms: 0,
+            },
+            Err("timeout".into()),
+        );
+        assert!(page.input_mode && page.input_buffer == "hi");
+        assert_eq!(page.input_target, InputTarget::Danmaku);
     }
 }
 

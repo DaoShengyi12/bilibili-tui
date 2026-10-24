@@ -1,6 +1,10 @@
 //! Bilibili API Client with cookie management and WBI signing
 
 use super::wbi;
+
+mod actions;
+pub use actions::{ArchiveRelation, SubtitleTrack, TripleResult};
+mod session;
 use crate::storage::{Credentials, VideoQuality};
 use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
@@ -52,6 +56,18 @@ impl std::fmt::Display for ApiCodeError {
 
 impl std::error::Error for ApiCodeError {}
 
+/// Not logged in: the session cookies are missing or expired.
+pub const NOT_LOGGED_IN: i32 = -101;
+
+/// Whether `error` reports that the session is no longer logged in.
+pub fn is_login_expired(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ApiCodeError>()
+            .is_some_and(|error| error.code == NOT_LOGGED_IN)
+    })
+}
+
 /// Signature rejected; usually means the cached WBI keys have rotated.
 const WBI_SIGNATURE_REJECTED: i32 = -352;
 /// Bilibili rotates WBI keys daily; refetching hourly keeps signing valid.
@@ -79,6 +95,9 @@ impl CachedWbiKeys {
 pub struct ApiClient {
     client: Client,
     cookies: RwLock<Option<String>>,
+    /// Browser fingerprint cookies (`buvid3`, `bili_ticket`, ...) sent with
+    /// every request, logged in or not. Kept in memory only.
+    device_cookies: RwLock<session::DeviceCookies>,
     wbi_keys: RwLock<Option<CachedWbiKeys>>,
 }
 
@@ -144,6 +163,7 @@ impl ApiClient {
                 .build()
                 .expect("Failed to create HTTP client"),
             cookies: RwLock::new(None),
+            device_cookies: RwLock::new(session::DeviceCookies::default()),
             wbi_keys: RwLock::new(None),
         }
     }
@@ -165,11 +185,23 @@ impl ApiClient {
     }
 
     pub fn set_credentials(&self, credentials: &Credentials) {
-        let cookie_str = format!(
-            "SESSDATA={}; bili_jct={}; DedeUserID={}",
-            credentials.sessdata, credentials.bili_jct, credentials.dede_user_id
-        );
-        *self.cookies.write().expect("cookies lock poisoned") = Some(cookie_str);
+        *self.cookies.write().expect("cookies lock poisoned") =
+            Some(session::account_cookie(credentials));
+    }
+
+    /// The `Cookie` header for a request: the account cookies, if logged
+    /// in, followed by the device cookies.
+    fn cookie_header(&self) -> Option<String> {
+        let account = self.cookies.read().expect("cookies lock poisoned").clone();
+        let device = self
+            .device_cookies
+            .read()
+            .expect("device cookies lock poisoned")
+            .header();
+        match (account, device) {
+            (Some(account), Some(device)) => Some(format!("{account}; {device}")),
+            (account, device) => account.or(device),
+        }
     }
 
     pub fn clear_credentials(&self) {
@@ -200,8 +232,8 @@ impl ApiClient {
         let safe_url = Self::safe_url(url);
         for attempt in 0..2 {
             let mut req = self.client.get(url);
-            if let Some(ref cookies) = *self.cookies.read().expect("cookies lock poisoned") {
-                req = req.header(COOKIE, cookies.as_str());
+            if let Some(cookies) = self.cookie_header() {
+                req = req.header(COOKIE, cookies);
             }
 
             let resp = match req.send().await {
@@ -270,8 +302,8 @@ impl ApiClient {
     /// Make a GET request and return raw JSON
     pub async fn get_json(&self, url: &str) -> Result<serde_json::Value> {
         let mut req = self.client.get(url);
-        if let Some(ref cookies) = *self.cookies.read().expect("cookies lock poisoned") {
-            req = req.header(COOKIE, cookies.as_str());
+        if let Some(cookies) = self.cookie_header() {
+            req = req.header(COOKIE, cookies);
         }
         let resp = req.send().await?.error_for_status()?;
         let value: serde_json::Value = resp.json().await?;
@@ -288,10 +320,10 @@ impl ApiClient {
 
         // 使用块作用域确保锁在 await 之前释放
         let params = {
-            let cookies = self.cookies.read().expect("cookies lock poisoned");
-            if let Some(ref cookie_str) = *cookies {
-                req = req.header(COOKIE, cookie_str.as_str());
+            if let Some(header) = self.cookie_header() {
+                req = req.header(COOKIE, header);
             }
+            let cookies = self.cookies.read().expect("cookies lock poisoned");
 
             let has_csrf = cookies
                 .as_ref()
@@ -320,15 +352,11 @@ impl ApiClient {
 
         req = req.form(&params);
         let resp = req.send().await?.error_for_status()?;
-        let api_resp: ApiResponse<T> = resp.json().await?;
-        if api_resp.code != 0 {
-            return Err(anyhow!(
-                "API error ({}): {}",
-                api_resp.code,
-                api_resp.message
-            ));
-        }
-        Ok(api_resp)
+        let body = resp.bytes().await?;
+        Self::decode_api_response(&body).map_err(|error| match error {
+            ResponseError::Api(error) => anyhow::Error::new(error),
+            ResponseError::Decode(error) => anyhow!("invalid JSON response: {error}"),
+        })
     }
 
     /// Make a WBI-signed GET request. A signature rejection (-352) refreshes
@@ -437,8 +465,8 @@ impl ApiClient {
         );
 
         let mut req = self.client.get(&url);
-        if let Some(ref cookies) = *self.cookies.read().unwrap() {
-            req = req.header(COOKIE, cookies.as_str());
+        if let Some(cookies) = self.cookie_header() {
+            req = req.header(COOKIE, cookies);
         }
 
         let resp = req.send().await?.error_for_status()?;
@@ -494,8 +522,8 @@ impl ApiClient {
         );
 
         let mut req = self.client.get(&url);
-        if let Some(ref cookies) = *self.cookies.read().expect("cookies lock poisoned") {
-            req = req.header(COOKIE, cookies.as_str());
+        if let Some(cookies) = self.cookie_header() {
+            req = req.header(COOKIE, cookies);
         }
 
         let value: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
@@ -902,27 +930,34 @@ impl ApiClient {
     }
 
     // Search API
-    pub async fn search_videos(
+    /// One page of search results of `kind` and the total result count.
+    pub async fn search(
         &self,
         keyword: &str,
+        kind: super::search::SearchKind,
         page: i32,
-    ) -> Result<super::search::SearchData> {
+    ) -> Result<(Vec<super::search::SearchResultItem>, i32)> {
         let url = self.build_url(BilibiliApiDomain::Main, "/x/web-interface/wbi/search/type");
-
-        let params = vec![
-            ("search_type", "video".to_string()),
+        let mut params = vec![
+            ("search_type", kind.search_type().to_string()),
             ("keyword", keyword.to_string()),
             ("page", page.to_string()),
-            ("order", "totalrank".to_string()),
         ];
+        if kind == super::search::SearchKind::Video {
+            params.push(("order", "totalrank".to_string()));
+        }
+        let resp: ApiResponse<serde_json::Value> = self.get_with_wbi(&url, params).await?;
+        super::search::parse_search_data(kind, &resp.data.unwrap_or_default())
+    }
 
-        let resp: ApiResponse<super::search::SearchData> = self.get_with_wbi(&url, params).await?;
-        Ok(resp.data.unwrap_or(super::search::SearchData {
-            result: None,
-            num_results: Some(0),
-            page: Some(page),
-            pagesize: Some(20),
-        }))
+    /// Completions for a partly typed keyword.
+    pub async fn get_search_suggestions(&self, term: &str) -> Result<Vec<String>> {
+        let mut url = reqwest::Url::parse("https://s.search.bilibili.com/main/suggest")?;
+        url.query_pairs_mut()
+            .append_pair("term", term)
+            .append_pair("main_ver", "v1");
+        let value = self.get_json(url.as_str()).await?;
+        Ok(super::search::parse_suggestions(&value))
     }
 
     /// Fetch hot search keywords (web)
@@ -931,8 +966,8 @@ impl ApiClient {
 
         let mut req = self.client.get(HOTWORD_URL);
 
-        if let Some(ref cookies) = *self.cookies.read().expect("cookies lock poisoned") {
-            req = req.header(COOKIE, cookies.as_str());
+        if let Some(cookies) = self.cookie_header() {
+            req = req.header(COOKIE, cookies);
         }
 
         let resp = req.send().await?.error_for_status()?;
@@ -1081,46 +1116,30 @@ impl ApiClient {
             .unwrap_or(super::dynamic::PortalData { up_list: None }))
     }
 
-    // Comments API
-    pub async fn get_comments(&self, oid: i64, pn: i32) -> Result<super::comment::CommentData> {
-        let url = format!(
-            "{}/x/v2/reply?type=1&oid={}&sort=1&ps=20&pn={}",
-            BilibiliApiDomain::Main.as_str(),
-            oid,
-            pn
-        );
-
-        let resp: ApiResponse<super::comment::CommentData> = self.get(&url).await?;
-        Ok(resp.data.unwrap_or(super::comment::CommentData {
-            page: None,
-            replies: None,
-            hots: None,
-        }))
-    }
-
-    // Dynamic Comments API
-    // type=11: 相簿（图片动态） - image/photo albums
-    // type=17: 动态（纯文字动态&分享） - text dynamics and shares
-    pub async fn get_dynamic_comments(
+    /// One page of top-level comments from the WBI `main` endpoint.
+    /// `offset` is the cursor returned with the previous page.
+    pub async fn get_main_comments(
         &self,
         oid: i64,
         comment_type: i32,
-        pn: i32,
-    ) -> Result<super::comment::CommentData> {
-        let url = format!(
-            "{}/x/v2/reply?type={}&oid={}&sort=1&ps=20&pn={}",
-            BilibiliApiDomain::Main.as_str(),
-            comment_type,
-            oid,
-            pn
-        );
-
-        let resp: ApiResponse<super::comment::CommentData> = self.get(&url).await?;
-        Ok(resp.data.unwrap_or(super::comment::CommentData {
-            page: None,
-            replies: None,
-            hots: None,
-        }))
+        sort: super::comment::CommentSort,
+        offset: Option<&str>,
+    ) -> Result<super::comment::CommentBatch> {
+        let url = self.build_url(BilibiliApiDomain::Main, "/x/v2/reply/wbi/main");
+        let resp: ApiResponse<super::comment::MainCommentData> = self
+            .get_with_wbi(
+                &url,
+                vec![
+                    ("oid", oid.to_string()),
+                    ("type", comment_type.to_string()),
+                    ("mode", sort.mode().to_string()),
+                    ("pagination_str", super::comment::pagination_str(offset)),
+                    ("plat", "1".to_string()),
+                    ("web_location", "1315875".to_string()),
+                ],
+            )
+            .await?;
+        Ok(resp.data.unwrap_or_default().into_batch())
     }
 
     // Comment replies API
@@ -1376,8 +1395,8 @@ impl ApiClient {
         let url = format!("{}?platform=web", LIVE_REC_URL);
 
         let mut req = self.client.get(&url);
-        if let Some(ref cookies) = *self.cookies.read().expect("cookies lock poisoned") {
-            req = req.header(COOKIE, cookies.as_str());
+        if let Some(cookies) = self.cookie_header() {
+            req = req.header(COOKIE, cookies);
         }
 
         let resp = req.send().await?.error_for_status()?;
@@ -1452,13 +1471,31 @@ impl ApiClient {
             .ok_or_else(|| anyhow!("live play response has no data"))
     }
 
-    /// Stream URLs for the best live quality that does not exceed `quality`.
+    /// Live qualities the room offers that do not exceed `quality`.
+    pub async fn get_live_qualities(
+        &self,
+        room_id: i64,
+        quality: VideoQuality,
+    ) -> Result<Vec<super::live::LiveQuality>> {
+        let info = self.get_live_play_info(room_id, 0).await?;
+        if info.live_status != 1 {
+            return Err(anyhow!("直播间当前未开播"));
+        }
+        Ok(info.qualities_within(quality.live_qn_cap()))
+    }
+
+    /// Stream URLs for the best live quality that does not exceed `quality`,
+    /// or `chosen_qn` when the user picked one (itself kept within the cap).
     pub async fn get_live_stream_urls(
         &self,
         room_id: i64,
         quality: VideoQuality,
+        chosen_qn: Option<i64>,
     ) -> Result<Vec<String>> {
-        let cap = quality.live_qn_cap();
+        let cap = match (quality.live_qn_cap(), chosen_qn) {
+            (Some(cap), Some(chosen)) => Some(cap.min(chosen)),
+            (cap, chosen) => chosen.or(cap),
+        };
         let initial = self.get_live_play_info(room_id, 0).await?;
         if initial.live_status != 1 {
             return Err(anyhow!("直播间当前未开播"));
@@ -1493,6 +1530,37 @@ impl ApiClient {
         Ok(urls)
     }
 
+    /// Send a danmaku to a live room as the logged-in user.
+    pub async fn send_live_danmaku(&self, room_id: i64, message: &str) -> Result<()> {
+        let csrf = self
+            .csrf_token()
+            .ok_or_else(|| anyhow!("发送弹幕需要登录"))?;
+        let url = "https://api.live.bilibili.com/msg/send";
+        let _: ApiResponse<serde_json::Value> = self
+            .post(
+                url,
+                vec![
+                    ("bubble", "0".to_string()),
+                    ("msg", message.to_string()),
+                    ("color", "16777215".to_string()),
+                    ("mode", "1".to_string()),
+                    ("room_type", "0".to_string()),
+                    ("jumpfrom", "0".to_string()),
+                    ("reply_mid", "0".to_string()),
+                    ("reply_attr", "0".to_string()),
+                    ("replay_dmid", String::new()),
+                    ("statistics", r#"{"appId":100,"platform":5}"#.to_string()),
+                    ("fontsize", "25".to_string()),
+                    ("rnd", chrono::Utc::now().timestamp().to_string()),
+                    ("roomid", room_id.to_string()),
+                    ("csrf_token", csrf),
+                ],
+            )
+            .await
+            .context("发送直播弹幕失败")?;
+        Ok(())
+    }
+
     /// Get live room info
     pub async fn get_live_room_info(&self, room_id: i64) -> Result<super::live::LiveRoomInfo> {
         let url = format!(
@@ -1501,8 +1569,8 @@ impl ApiClient {
         );
 
         let mut req = self.client.get(&url);
-        if let Some(ref cookies) = *self.cookies.read().expect("cookies lock poisoned") {
-            req = req.header(COOKIE, cookies.as_str());
+        if let Some(cookies) = self.cookie_header() {
+            req = req.header(COOKIE, cookies);
         }
 
         let resp = req.send().await?.error_for_status()?;
@@ -1531,15 +1599,13 @@ impl ApiClient {
         resp.data.ok_or_else(|| anyhow!("响应无数据"))
     }
 
+    /// The device `buvid3`, fetched once and then sent with every request.
     pub async fn get_buvid3(&self) -> Result<String> {
-        let url = "https://api.bilibili.com/x/frontend/finger/spi";
-        let response: ApiResponse<serde_json::Value> = self.get(url).await?;
-        response
-            .data
-            .as_ref()
-            .and_then(|data| data.get("b_3"))
-            .and_then(|value| value.as_str())
-            .map(ToOwned::to_owned)
+        if let Some(buvid3) = self.cached_buvid3() {
+            return Ok(buvid3);
+        }
+        self.ensure_buvid().await?;
+        self.cached_buvid3()
             .ok_or_else(|| anyhow!("buvid3 响应为空"))
     }
 
@@ -1554,8 +1620,8 @@ impl ApiClient {
         );
 
         let mut req = self.client.get(&url);
-        if let Some(ref cookies) = *self.cookies.read().expect("cookies lock") {
-            req = req.header(COOKIE, cookies.as_str());
+        if let Some(cookies) = self.cookie_header() {
+            req = req.header(COOKIE, cookies);
         }
 
         let resp = req.send().await?.error_for_status()?;
@@ -1575,6 +1641,15 @@ impl ApiClient {
 enum ResponseError {
     Api(ApiCodeError),
     Decode(serde_json::Error),
+}
+
+impl std::fmt::Display for ResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Api(error) => error.fmt(f),
+            Self::Decode(error) => write!(f, "invalid JSON response: {error}"),
+        }
+    }
 }
 
 fn parse_home_videos(items: Vec<serde_json::Value>) -> Vec<super::recommend::VideoItem> {
@@ -1803,10 +1878,72 @@ mod live_contract_tests {
         let live_rooms = client.get_live_home_rooms().await.expect("live homepage");
         if let Some(room) = live_rooms.first() {
             let urls = client
-                .get_live_stream_urls(room.roomid, VideoQuality::Best)
+                .get_live_stream_urls(room.roomid, VideoQuality::Best, None)
                 .await
                 .expect("best live stream URLs");
             assert!(!urls.is_empty());
+            let qualities = client
+                .get_live_qualities(room.roomid, VideoQuality::Q720p)
+                .await
+                .expect("live qualities");
+            assert!(qualities.iter().all(|quality| quality.qn <= 250));
+            if let Some(lowest) = qualities.last() {
+                let urls = client
+                    .get_live_stream_urls(room.roomid, VideoQuality::Best, Some(lowest.qn))
+                    .await
+                    .expect("chosen live quality URLs");
+                assert!(!urls.is_empty());
+            }
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "contacts the live Bilibili API with saved credentials; guests get one short page"]
+    async fn main_comments_contract_pages_by_cursor_in_both_sorts() {
+        use crate::api::comment::CommentSort;
+        let credentials = crate::storage::load_credentials().expect("saved credentials");
+        let client = ApiClient::with_cookies(&credentials);
+        let _ = client.ensure_device_cookies().await;
+        for sort in [CommentSort::Hot, CommentSort::Time] {
+            let first = client
+                .get_main_comments(170001, 1, sort, None)
+                .await
+                .unwrap();
+            assert!(!first.comments.is_empty(), "{sort:?}");
+            let offset = first
+                .next_offset
+                .expect("a popular video has a second page");
+            let second = client
+                .get_main_comments(170001, 1, sort, Some(&offset))
+                .await
+                .unwrap();
+            assert!(!second.comments.is_empty());
+            assert!(second.comments[0].rpid != first.comments[0].rpid);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "contacts the live Bilibili API with saved credentials; guests hit risk control"]
+    async fn search_kinds_and_suggestions_contract() {
+        use crate::api::search::SearchKind;
+        let credentials = crate::storage::load_credentials().expect("saved credentials");
+        let client = ApiClient::with_cookies(&credentials);
+        let _ = client.ensure_device_cookies().await;
+        for (kind, keyword) in [
+            (SearchKind::Video, "原神"),
+            (SearchKind::User, "原神"),
+            (SearchKind::Bangumi, "间谍过家家"),
+            (SearchKind::Live, "原神"),
+        ] {
+            let (items, total) = client.search(keyword, kind, 1).await.unwrap();
+            assert!(!items.is_empty() && total > 0, "{kind:?}");
+        }
+        assert!(
+            !client
+                .get_search_suggestions("rust")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

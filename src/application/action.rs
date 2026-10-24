@@ -23,6 +23,8 @@ pub enum AppAction {
     SwitchToSettings,
     /// Switch to history page
     SwitchToHistory,
+    /// Reload history from the newest entry.
+    RefreshHistory,
     /// Login was successful with credentials
     LoginSuccess(Credentials),
     /// Play a video with metadata (bvid, aid, cid, duration)
@@ -62,8 +64,10 @@ pub enum AppAction {
     /// Navigate to previous sidebar item
     NavPrev,
     CancelPendingLoads,
-    /// Search for videos
+    /// Search for the keyword with the page's current result kind
     Search(String),
+    /// Show search results of another kind, searching again if needed.
+    SwitchSearchKind(crate::api::search::SearchKind),
     /// Refresh dynamic feed
     RefreshDynamic,
     /// Open video detail page (bvid, aid)
@@ -100,6 +104,8 @@ pub enum AppAction {
     LoadMoreComments,
     /// Toggle comment replies expansion
     ToggleCommentReplies,
+    /// Switch comments between hot and newest first and reload them.
+    ToggleCommentSort,
     /// Switch dynamic tab
     SwitchDynamicTab(DynamicTab),
     /// Select UP master (0 = all, 1+ = specific UP)
@@ -143,6 +149,15 @@ pub enum AppAction {
     PlayLive {
         room_id: i64,
         title: String,
+        /// A quality the user picked; `None` plays the best within the cap.
+        quality: Option<i64>,
+    },
+    /// Fetch the qualities a live room offers for the quality picker.
+    LoadLiveQualities(i64),
+    /// Send a danmaku to a live room.
+    SendLiveDanmaku {
+        room_id: i64,
+        message: String,
     },
     /// Switch to bangumi page
     SwitchToBangumi,
@@ -167,8 +182,58 @@ pub enum AppAction {
     },
     /// Stop the running player
     StopPlayback,
+    /// Like, coin, favourite, follow or send danmaku on the open video.
+    VideoAction(VideoActionRequest),
     /// No action
     None,
+}
+
+/// An account action on a video, sent to the server as one request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoActionRequest {
+    Like {
+        aid: i64,
+        like: bool,
+    },
+    Coin {
+        aid: i64,
+    },
+    Favorite {
+        aid: i64,
+        favorite: bool,
+    },
+    Triple {
+        aid: i64,
+    },
+    WatchLater {
+        aid: i64,
+    },
+    Follow {
+        aid: i64,
+        mid: i64,
+        follow: bool,
+    },
+    /// `progress_ms` is filled in by the app from the running player.
+    SendDanmaku {
+        aid: i64,
+        cid: i64,
+        message: String,
+        progress_ms: i64,
+    },
+}
+
+impl VideoActionRequest {
+    pub fn aid(&self) -> i64 {
+        match self {
+            Self::Like { aid, .. }
+            | Self::Coin { aid }
+            | Self::Favorite { aid, .. }
+            | Self::Triple { aid }
+            | Self::WatchLater { aid }
+            | Self::Follow { aid, .. }
+            | Self::SendDanmaku { aid, .. } => *aid,
+        }
+    }
 }
 
 /// Bangumi page tabs

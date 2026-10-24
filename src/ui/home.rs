@@ -160,13 +160,21 @@ impl HomePage {
         let mut help = shortcut_footer(
             theme,
             [
-                ("↑/↓".into(), "选择视频".into(), theme.fg_accent),
+                (
+                    format!("{}/{}", keys.nav_up, keys.nav_down),
+                    "选择视频".into(),
+                    theme.fg_accent,
+                ),
                 (
                     format!("{} / {}", keys.page_up, keys.page_down),
                     "翻页".into(),
                     theme.fg_accent,
                 ),
-                ("←/→".into(), "切换面板".into(), theme.fg_accent),
+                (
+                    format!("{}/{}", keys.nav_left, keys.nav_right),
+                    "切换面板".into(),
+                    theme.fg_accent,
+                ),
                 (keys.confirm.clone(), "播放".into(), theme.success),
                 (keys.search_focus.clone(), "搜索".into(), theme.info),
                 (keys.refresh.clone(), "刷新".into(), theme.info),
@@ -621,7 +629,7 @@ impl Component for HomePage {
             }
             return Some(AppAction::None);
         }
-        if key == KeyCode::Char('u')
+        if keys.matches_open_up(key)
             && let Some(mid) = self
                 .videos
                 .get(self.selected_index)

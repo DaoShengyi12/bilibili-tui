@@ -3,7 +3,7 @@ use crate::api::{
     article::ArticleData,
     auth::{QrcodeData, QrcodePollStatus},
     bangumi::{SeasonRankItem, SeasonResult},
-    comment::{CommentItem, CommentType},
+    comment::{CommentBatch, CommentItem, CommentSort, CommentType},
     dynamic::DynamicItem,
     dynamic::UpListItem,
     favorite::{
@@ -15,7 +15,7 @@ use crate::api::{
     live_ws::HistoryDanmakuData,
     recommend::{HomeFeed, VideoItem},
     search::HotwordItem,
-    search::SearchVideoItem,
+    search::{SearchKind, SearchResultItem},
     space::{RelationStat, SpaceInfo, SpaceVideoData, SpaceVideoOrder},
     video::RelatedVideoItem,
     video::VideoInfo,
@@ -47,7 +47,12 @@ pub enum NetworkCommand {
     Search {
         req_id: u64,
         keyword: String,
+        kind: SearchKind,
         page: i32,
+    },
+    LoadSearchSuggestions {
+        req_id: u64,
+        term: String,
     },
     LoadDynamicInit {
         req_id: u64,
@@ -144,17 +149,21 @@ pub enum NetworkCommand {
         req_id: u64,
         season_id: i64,
     },
+    /// The first page (`offset: None`) replaces the list, used when the
+    /// sort changes or after posting; later pages are appended.
     LoadVideoComments {
         req_id: u64,
         aid: i64,
-        page: i32,
+        sort: CommentSort,
+        offset: Option<String>,
     },
     LoadDynamicComments {
         req_id: u64,
         dynamic_id: String,
         oid: i64,
         comment_type: i32,
-        page: i32,
+        sort: CommentSort,
+        offset: Option<String>,
     },
     LoadCommentReplies {
         req_id: u64,
@@ -189,6 +198,29 @@ pub enum NetworkCommand {
         req_id: u64,
         qrcode_key: String,
     },
+    LoadLiveQualities {
+        req_id: u64,
+        room_id: i64,
+        quality: crate::storage::VideoQuality,
+    },
+    SendLiveDanmaku {
+        room_id: i64,
+        message: String,
+    },
+    VideoAction {
+        request: crate::application::VideoActionRequest,
+        user_mid: i64,
+    },
+    /// Refresh the login cookies. Without `force`, only when the server
+    /// asks for it; with `force`, after a request reported `-101`.
+    RefreshSession {
+        credentials: Credentials,
+        force: bool,
+    },
+    /// End the session on the server after the app forgot it locally.
+    Logout {
+        credentials: Credentials,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -211,9 +243,15 @@ pub enum NetworkEvent {
     SearchLoaded {
         req_id: u64,
         keyword: String,
+        kind: SearchKind,
         page: i32,
-        results: Vec<SearchVideoItem>,
+        results: Vec<SearchResultItem>,
         total: i32,
+    },
+    SearchSuggestionsLoaded {
+        req_id: u64,
+        term: String,
+        suggestions: Vec<String>,
     },
     DynamicLoaded {
         req_id: u64,
@@ -248,8 +286,9 @@ pub enum NetworkEvent {
         req_id: u64,
         bvid: String,
         video_info: VideoInfo,
-        comments: Vec<CommentItem>,
-        has_more_comments: bool,
+        /// The account's like/coin/favourite/follow state; `None` for guests.
+        relation: Option<crate::api::client::ArchiveRelation>,
+        comments: CommentBatch,
         related_videos: Vec<RelatedVideoItem>,
     },
     UpPageLoaded {
@@ -311,8 +350,7 @@ pub enum NetworkEvent {
         req_id: u64,
         dynamic_id: String,
         dynamic_item: DynamicItem,
-        comments: Vec<CommentItem>,
-        has_more_comments: bool,
+        comments: CommentBatch,
         image_urls: Vec<String>,
     },
     BangumiIndexLoaded {
@@ -328,18 +366,22 @@ pub enum NetworkEvent {
         req_id: u64,
         target: &'static str,
         error: String,
+        /// The server answered `-101`: the saved login no longer works.
+        login_expired: bool,
     },
     VideoCommentsLoaded {
         req_id: u64,
         aid: i64,
-        page: i32,
-        replies: Option<Vec<CommentItem>>,
+        sort: CommentSort,
+        append: bool,
+        batch: CommentBatch,
     },
     DynamicCommentsLoaded {
         req_id: u64,
         dynamic_id: String,
-        page: i32,
-        replies: Option<Vec<CommentItem>>,
+        sort: CommentSort,
+        append: bool,
+        batch: CommentBatch,
     },
     CommentRepliesLoaded {
         req_id: u64,
@@ -379,6 +421,35 @@ pub enum NetworkEvent {
         status: Option<QrcodePollStatus>,
         credentials: Option<Credentials>,
     },
+    LiveQualitiesLoaded {
+        req_id: u64,
+        room_id: i64,
+        qualities: Vec<crate::api::live::LiveQuality>,
+    },
+    LiveDanmakuSent {
+        room_id: i64,
+    },
+    VideoActionDone {
+        request: crate::application::VideoActionRequest,
+        /// What a triple did, for `Triple`.
+        result: Result<Option<crate::api::client::TripleResult>, String>,
+    },
+    LiveDanmakuSendFailed {
+        room_id: i64,
+        message: String,
+        error: String,
+    },
+    SessionRefreshed {
+        credentials: Credentials,
+    },
+    SessionRefreshFailed {
+        error: String,
+        /// The refresh was a reaction to `-101`, so the login is gone.
+        forced: bool,
+    },
+    ServerLogoutFailed {
+        error: String,
+    },
     /// The worker dropped the request before it finished, either because a
     /// newer request with the same key replaced it or because of
     /// `CancelPending`. Pages must leave their loading state.
@@ -409,6 +480,14 @@ pub fn start_network_worker(api_client: Arc<ApiClient>) -> NetworkBridge {
                 Err(_) => return,
             };
 
+            // Device cookies make guest requests look like a browser; every
+            // request still works while they are being fetched.
+            {
+                let api_client = api_client.clone();
+                runtime.spawn(async move {
+                    let _ = api_client.ensure_device_cookies().await;
+                });
+            }
             let mut cancellations =
                 HashMap::<&'static str, tokio_util::sync::CancellationToken>::new();
             while let Ok(command) = command_rx.recv() {
@@ -470,13 +549,21 @@ impl NetworkCommand {
     /// which are never superseded or cancelled.
     pub fn request_key(&self) -> Option<&'static str> {
         Some(match self {
-            Self::CancelPending | Self::LikeComment { .. } | Self::PostComment { .. } => {
+            Self::CancelPending
+            | Self::LikeComment { .. }
+            | Self::PostComment { .. }
+            | Self::RefreshSession { .. }
+            | Self::Logout { .. }
+            | Self::SendLiveDanmaku { .. }
+            | Self::VideoAction { .. } => {
                 return None;
             }
+            Self::LoadLiveQualities { .. } => "live_qualities",
             Self::LoadHome { .. } => "home",
             Self::LoadHomeMore { .. } => "home_more",
             Self::LoadHotwords { .. } => "hotwords",
             Self::Search { .. } => "search",
+            Self::LoadSearchSuggestions { .. } => "search_suggest",
             Self::LoadDynamicInit { .. } | Self::LoadDynamicRefresh { .. } => "dynamic_feed",
             Self::LoadDynamicMore { .. } => "dynamic_more",
             Self::LoadHistoryInit { .. } => "history_init",
@@ -507,13 +594,21 @@ impl NetworkCommand {
 
     fn req_id(&self) -> Option<u64> {
         Some(match self {
-            Self::CancelPending | Self::LikeComment { .. } | Self::PostComment { .. } => {
+            Self::CancelPending
+            | Self::LikeComment { .. }
+            | Self::PostComment { .. }
+            | Self::RefreshSession { .. }
+            | Self::Logout { .. }
+            | Self::SendLiveDanmaku { .. }
+            | Self::VideoAction { .. } => {
                 return None;
             }
+            Self::LoadLiveQualities { req_id, .. } => *req_id,
             Self::LoadHome { req_id, .. }
             | Self::LoadHomeMore { req_id, .. }
             | Self::LoadHotwords { req_id }
             | Self::Search { req_id, .. }
+            | Self::LoadSearchSuggestions { req_id, .. }
             | Self::LoadDynamicInit { req_id, .. }
             | Self::LoadDynamicRefresh { req_id, .. }
             | Self::LoadDynamicMore { req_id, .. }
@@ -592,8 +687,98 @@ async fn handle_command(
                 },
             },
         ),
+        NetworkCommand::VideoAction { request, user_mid } => {
+            let result = run_video_action(&api_client, &request, user_mid)
+                .await
+                .map_err(|error| redact_url_queries(&format!("{error:#}")));
+            Some(NetworkEvent::VideoActionDone { request, result })
+        }
+        NetworkCommand::SendLiveDanmaku { room_id, message } => Some(
+            match api_client.send_live_danmaku(room_id, &message).await {
+                Ok(()) => NetworkEvent::LiveDanmakuSent { room_id },
+                Err(error) => NetworkEvent::LiveDanmakuSendFailed {
+                    room_id,
+                    message,
+                    error: redact_url_queries(&format!("{error:#}")),
+                },
+            },
+        ),
+        NetworkCommand::RefreshSession { credentials, force } => {
+            refresh_session(&api_client, &credentials, force).await
+        }
+        NetworkCommand::Logout { credentials } => {
+            api_client.logout(&credentials).await.err().map(|error| {
+                NetworkEvent::ServerLogoutFailed {
+                    error: redact_url_queries(&format!("{error:#}")),
+                }
+            })
+        }
         command => Some(handle_tracked_command(api_client, command).await),
     }
+}
+
+async fn run_video_action(
+    api_client: &ApiClient,
+    request: &crate::application::VideoActionRequest,
+    user_mid: i64,
+) -> anyhow::Result<Option<crate::api::client::TripleResult>> {
+    use crate::application::VideoActionRequest as Request;
+    match request {
+        Request::Like { aid, like } => api_client.like_video(*aid, *like).await?,
+        Request::Coin { aid } => api_client.coin_video(*aid).await?,
+        Request::Favorite { aid, favorite } => {
+            api_client
+                .set_video_favorite(*aid, user_mid, *favorite)
+                .await?;
+        }
+        Request::Triple { aid } => return Ok(Some(api_client.triple_video(*aid).await?)),
+        Request::WatchLater { aid } => api_client.add_to_watch_later(*aid).await?,
+        Request::Follow { mid, follow, .. } => api_client.set_following(*mid, *follow).await?,
+        Request::SendDanmaku {
+            aid,
+            cid,
+            message,
+            progress_ms,
+        } => {
+            api_client
+                .send_video_danmaku(*aid, *cid, *progress_ms, message)
+                .await?
+        }
+    }
+    Ok(None)
+}
+
+/// `None` when the cookies are still fresh and nothing had to change.
+async fn refresh_session(
+    api_client: &ApiClient,
+    credentials: &Credentials,
+    force: bool,
+) -> Option<NetworkEvent> {
+    let timestamp = if force {
+        chrono::Utc::now().timestamp_millis()
+    } else {
+        match api_client.get_cookie_refresh_info().await {
+            Ok(info) if !info.refresh => return None,
+            Ok(info) => info.timestamp,
+            Err(error) => {
+                return crate::api::client::is_login_expired(&error).then(|| {
+                    NetworkEvent::SessionRefreshFailed {
+                        error: redact_url_queries(&format!("{error:#}")),
+                        forced: true,
+                    }
+                });
+            }
+        }
+    };
+    Some(
+        match api_client.refresh_cookies(credentials, timestamp).await {
+            Ok(credentials) => NetworkEvent::SessionRefreshed { credentials },
+            Err(error) => NetworkEvent::SessionRefreshFailed {
+                error: redact_url_queries(&format!("{error:#}")),
+                forced: force,
+            },
+        },
+    )
 }
 
 async fn handle_tracked_command(
@@ -603,33 +788,58 @@ async fn handle_tracked_command(
     match command {
         NetworkCommand::CancelPending
         | NetworkCommand::LikeComment { .. }
-        | NetworkCommand::PostComment { .. } => unreachable!("handled by handle_command"),
-        NetworkCommand::LoadVideoComments { req_id, aid, page } => {
-            match api_client.get_comments(aid, page).await {
-                Ok(data) => NetworkEvent::VideoCommentsLoaded {
-                    req_id,
-                    aid,
-                    page,
-                    replies: data.replies,
-                },
-                Err(error) => failed(req_id, "video_comments", error),
-            }
-        }
+        | NetworkCommand::PostComment { .. }
+        | NetworkCommand::RefreshSession { .. }
+        | NetworkCommand::Logout { .. }
+        | NetworkCommand::SendLiveDanmaku { .. }
+        | NetworkCommand::VideoAction { .. } => unreachable!("handled by handle_command"),
+        NetworkCommand::LoadLiveQualities {
+            req_id,
+            room_id,
+            quality,
+        } => match api_client.get_live_qualities(room_id, quality).await {
+            Ok(qualities) => NetworkEvent::LiveQualitiesLoaded {
+                req_id,
+                room_id,
+                qualities,
+            },
+            Err(error) => failed(req_id, "live_qualities", error),
+        },
+        NetworkCommand::LoadVideoComments {
+            req_id,
+            aid,
+            sort,
+            offset,
+        } => match api_client
+            .get_main_comments(aid, CommentType::Video.as_i32(), sort, offset.as_deref())
+            .await
+        {
+            Ok(batch) => NetworkEvent::VideoCommentsLoaded {
+                req_id,
+                aid,
+                sort,
+                append: offset.is_some(),
+                batch,
+            },
+            Err(error) => failed(req_id, "video_comments", error),
+        },
         NetworkCommand::LoadDynamicComments {
             req_id,
             dynamic_id,
             oid,
             comment_type,
-            page,
+            sort,
+            offset,
         } => match api_client
-            .get_dynamic_comments(oid, comment_type, page)
+            .get_main_comments(oid, comment_type, sort, offset.as_deref())
             .await
         {
-            Ok(data) => NetworkEvent::DynamicCommentsLoaded {
+            Ok(batch) => NetworkEvent::DynamicCommentsLoaded {
                 req_id,
                 dynamic_id,
-                page,
-                replies: data.replies,
+                sort,
+                append: offset.is_some(),
+                batch,
             },
             Err(error) => failed(req_id, "dynamic_comments", error),
         },
@@ -754,17 +964,29 @@ async fn handle_tracked_command(
         NetworkCommand::Search {
             req_id,
             keyword,
+            kind,
             page,
-        } => match api_client.search_videos(&keyword, page).await {
-            Ok(data) => NetworkEvent::SearchLoaded {
+        } => match api_client.search(&keyword, kind, page).await {
+            Ok((results, total)) => NetworkEvent::SearchLoaded {
                 req_id,
                 keyword,
+                kind,
                 page,
-                results: data.result.unwrap_or_default(),
-                total: data.num_results.unwrap_or(0),
+                results,
+                total,
             },
             Err(e) => failed(req_id, "search", e),
         },
+        NetworkCommand::LoadSearchSuggestions { req_id, term } => {
+            match api_client.get_search_suggestions(&term).await {
+                Ok(suggestions) => NetworkEvent::SearchSuggestionsLoaded {
+                    req_id,
+                    term,
+                    suggestions,
+                },
+                Err(e) => failed(req_id, "search_suggest", e),
+            }
+        }
         NetworkCommand::LoadUpPage { req_id, mid, order } => {
             match api_client.get_space_info(mid).await {
                 Ok(profile) => {
@@ -1079,21 +1301,14 @@ async fn handle_tracked_command(
             Ok(article) => {
                 let comment_oid = if article.id > 0 { article.id } else { cvid };
                 let comments = api_client
-                    .get_dynamic_comments(comment_oid, CommentType::Article.as_i32(), 1)
+                    .get_main_comments(
+                        comment_oid,
+                        CommentType::Article.as_i32(),
+                        CommentSort::Hot,
+                        None,
+                    )
                     .await
-                    .ok()
-                    .map(|data| {
-                        let mut comments = data.hots.unwrap_or_default();
-                        for comment in data.replies.unwrap_or_default() {
-                            if !comments
-                                .iter()
-                                .any(|existing| existing.rpid == comment.rpid)
-                            {
-                                comments.push(comment);
-                            }
-                        }
-                        comments
-                    })
+                    .map(|batch| batch.comments)
                     .unwrap_or_default();
                 NetworkEvent::ArticleLoaded {
                     req_id,
@@ -1138,16 +1353,14 @@ async fn handle_tracked_command(
                 Ok(info) => info,
                 Err(e) => return failed(req_id, "video_detail", e),
             };
-            let (comments, has_more_comments) = match api_client.get_comments(aid, 1).await {
-                Ok(data) => {
-                    let comments = data.replies.unwrap_or_default();
-                    let has_more = data
-                        .page
-                        .map(|p| p.count.unwrap_or(0) > comments.len() as i32)
-                        .unwrap_or(false);
-                    (comments, has_more)
-                }
-                Err(_) => (Vec::new(), false),
+            let comments = api_client
+                .get_main_comments(aid, CommentType::Video.as_i32(), CommentSort::Hot, None)
+                .await
+                .unwrap_or_default();
+            let relation = if api_client.is_logged_in() {
+                api_client.get_archive_relation(video_info.aid).await.ok()
+            } else {
+                None
             };
             let related_videos = if include_related {
                 api_client
@@ -1161,8 +1374,8 @@ async fn handle_tracked_command(
                 req_id,
                 bvid,
                 video_info,
+                relation,
                 comments,
-                has_more_comments,
                 related_videos,
             }
         }
@@ -1173,44 +1386,19 @@ async fn handle_tracked_command(
             };
             let comment_type = dynamic_item.comment_type();
             let comment_oid = dynamic_item.comment_oid(&dynamic_id);
-            let (comments, has_more_comments) = if let Some(oid) = comment_oid {
-                match api_client.get_dynamic_comments(oid, comment_type, 1).await {
-                    Ok(data) => {
-                        let comments = data.replies.unwrap_or_default();
-                        let has_more = data
-                            .page
-                            .map(|p| p.count.unwrap_or(0) > comments.len() as i32)
-                            .unwrap_or(false);
-                        (comments, has_more)
-                    }
-                    Err(_) => (Vec::new(), false),
-                }
-            } else {
-                (Vec::new(), false)
+            let comments = match comment_oid {
+                Some(oid) => api_client
+                    .get_main_comments(oid, comment_type, CommentSort::Hot, None)
+                    .await
+                    .unwrap_or_default(),
+                None => CommentBatch::default(),
             };
-            let mut image_urls = Vec::new();
-            if dynamic_item.is_draw() {
-                image_urls.extend(
-                    dynamic_item
-                        .draw_images()
-                        .into_iter()
-                        .map(|s| s.to_string()),
-                );
-            }
-            if dynamic_item.is_opus() {
-                image_urls.extend(
-                    dynamic_item
-                        .opus_images()
-                        .into_iter()
-                        .map(|s| s.to_string()),
-                );
-            }
+            let image_urls = dynamic_image_urls(&dynamic_item);
             NetworkEvent::DynamicDetailLoaded {
                 req_id,
                 dynamic_id,
                 dynamic_item,
                 comments,
-                has_more_comments,
                 image_urls,
             }
         }
@@ -1229,6 +1417,23 @@ async fn handle_tracked_command(
             }
         }
     }
+}
+
+/// Pictures of a dynamic, or of the dynamic it forwards.
+fn dynamic_image_urls(item: &DynamicItem) -> Vec<String> {
+    let source = match item.kind() {
+        crate::api::dynamic::DynamicKind::Forward => match item.forwarded() {
+            Some(orig) => orig,
+            None => return Vec::new(),
+        },
+        _ => item,
+    };
+    source
+        .draw_images()
+        .into_iter()
+        .chain(source.opus_images())
+        .map(str::to_string)
+        .collect()
 }
 
 async fn enrich_followers(api_client: &Arc<ApiClient>, videos: &mut [VideoItem]) {
@@ -1260,6 +1465,7 @@ async fn enrich_followers(api_client: &Arc<ApiClient>, videos: &mut [VideoItem])
 }
 
 fn failed(req_id: u64, target: &'static str, error: anyhow::Error) -> NetworkEvent {
+    let login_expired = crate::api::client::is_login_expired(&error);
     let safe_error = redact_url_queries(&error.to_string());
     if let Some(mut dir) = dirs::config_dir() {
         dir.push("bilibili-tui");
@@ -1289,6 +1495,7 @@ fn failed(req_id: u64, target: &'static str, error: anyhow::Error) -> NetworkEve
         req_id,
         target,
         error: safe_error,
+        login_expired,
     }
 }
 
@@ -1316,6 +1523,7 @@ mod tests {
             key(NetworkCommand::Search {
                 req_id: 2,
                 keyword: "rust".into(),
+                kind: crate::api::search::SearchKind::Video,
                 page: 1,
             })
         );

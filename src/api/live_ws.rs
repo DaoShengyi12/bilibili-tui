@@ -240,6 +240,25 @@ pub enum LiveMessage {
     },
     /// User entered room
     Enter { uid: i64, uname: String },
+    /// User followed the streamer
+    Follow { uid: i64, uname: String },
+    /// User shared the room
+    Share { uid: i64, uname: String },
+    /// Paid pinned message (醒目留言)
+    SuperChat {
+        uid: i64,
+        uname: String,
+        message: String,
+        /// Price in yuan.
+        price: i64,
+    },
+    /// Guard purchase: level 1 总督, 2 提督, 3 舰长.
+    Guard {
+        uid: i64,
+        uname: String,
+        guard_level: i64,
+        num: i64,
+    },
     /// Gift sent
     Gift {
         uid: i64,
@@ -321,6 +340,9 @@ fn parse_json_message(json_str: &str) -> Option<LiveMessage> {
     match raw.cmd.as_str() {
         "DANMU_MSG" => parse_danmu_msg(&raw.info?),
         "INTERACT_WORD" => parse_interact_word(&raw.data?),
+        "INTERACT_WORD_V2" => parse_interact_word_v2(&raw.data?),
+        "SUPER_CHAT_MESSAGE" => parse_super_chat(&raw.data?),
+        "GUARD_BUY" => parse_guard_buy(&raw.data?),
         "SEND_GIFT" => parse_send_gift(&raw.data?),
         "ONLINE_RANK_V2" => parse_online_rank(&raw.data?),
         cmd if cmd.starts_with("DANMU_MSG") => parse_danmu_msg(&raw.info?),
@@ -360,15 +382,118 @@ fn parse_danmu_msg(info: &serde_json::Value) -> Option<LiveMessage> {
 fn parse_interact_word(data: &serde_json::Value) -> Option<LiveMessage> {
     let uid = data.get("uid")?.as_i64().unwrap_or(0);
     let uname = data.get("uname")?.as_str().unwrap_or("").to_string();
-
-    // msg_type: 1 = enter, 2 = follow, 3 = share
     let msg_type = data.get("msg_type")?.as_i64().unwrap_or(0);
+    interaction(uid, uname, msg_type)
+}
 
-    if msg_type == 1 {
-        Some(LiveMessage::Enter { uid, uname })
-    } else {
-        None
+/// `msg_type`: 1 = enter, 2 = follow, 3 = share.
+fn interaction(uid: i64, uname: String, msg_type: i64) -> Option<LiveMessage> {
+    match msg_type {
+        1 => Some(LiveMessage::Enter { uid, uname }),
+        2 => Some(LiveMessage::Follow { uid, uname }),
+        3 => Some(LiveMessage::Share { uid, uname }),
+        _ => None,
     }
+}
+
+/// Parse INTERACT_WORD_V2, which carries the INTERACT_WORD fields as a
+/// base64 protobuf in `pb`: uid = 1, uname = 2, msg_type = 5.
+fn parse_interact_word_v2(data: &serde_json::Value) -> Option<LiveMessage> {
+    use base64::Engine;
+    let pb = base64::engine::general_purpose::STANDARD
+        .decode(data.get("pb")?.as_str()?)
+        .ok()?;
+    let mut uid = 0;
+    let mut uname = String::new();
+    let mut msg_type = 0;
+    for field in protobuf_fields(&pb)? {
+        match field {
+            (1, ProtoValue::Varint(value)) => uid = value as i64,
+            (2, ProtoValue::Bytes(bytes)) => uname = String::from_utf8_lossy(bytes).into_owned(),
+            (5, ProtoValue::Varint(value)) => msg_type = value as i64,
+            _ => {}
+        }
+    }
+    interaction(uid, uname, msg_type)
+}
+
+enum ProtoValue<'a> {
+    Varint(u64),
+    Bytes(&'a [u8]),
+    Fixed,
+}
+
+/// Top-level fields of a protobuf message, or `None` when it is malformed.
+fn protobuf_fields(mut data: &[u8]) -> Option<Vec<(u64, ProtoValue<'_>)>> {
+    let mut fields = Vec::new();
+    while !data.is_empty() {
+        let key = read_varint(&mut data)?;
+        let value = match key & 7 {
+            0 => ProtoValue::Varint(read_varint(&mut data)?),
+            1 => {
+                data = data.get(8..)?;
+                ProtoValue::Fixed
+            }
+            2 => {
+                let len = usize::try_from(read_varint(&mut data)?).ok()?;
+                let (bytes, rest) = (data.get(..len)?, data.get(len..)?);
+                data = rest;
+                ProtoValue::Bytes(bytes)
+            }
+            5 => {
+                data = data.get(4..)?;
+                ProtoValue::Fixed
+            }
+            _ => return None,
+        };
+        fields.push((key >> 3, value));
+    }
+    Some(fields)
+}
+
+fn read_varint(data: &mut &[u8]) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let (&byte, rest) = data.split_first()?;
+        *data = rest;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Parse SUPER_CHAT_MESSAGE
+fn parse_super_chat(data: &serde_json::Value) -> Option<LiveMessage> {
+    let number = |value: Option<&serde_json::Value>| {
+        value.and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_f64().map(|value| value as i64))
+                .or_else(|| value.as_str()?.parse().ok())
+        })
+    };
+    Some(LiveMessage::SuperChat {
+        uid: number(data.get("uid")).unwrap_or(0),
+        uname: data
+            .pointer("/user_info/uname")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        message: data.get("message")?.as_str()?.to_string(),
+        price: number(data.get("price")).unwrap_or(0),
+    })
+}
+
+/// Parse GUARD_BUY
+fn parse_guard_buy(data: &serde_json::Value) -> Option<LiveMessage> {
+    Some(LiveMessage::Guard {
+        uid: data.get("uid").and_then(|v| v.as_i64()).unwrap_or(0),
+        uname: data.get("username")?.as_str()?.to_string(),
+        guard_level: data.get("guard_level")?.as_i64()?,
+        num: data.get("num").and_then(|v| v.as_i64()).unwrap_or(1),
+    })
 }
 
 /// Parse SEND_GIFT
@@ -520,5 +645,69 @@ mod tests {
             );
         }
         assert!(Packet::decode(&data).is_err());
+    }
+
+    fn message(json: serde_json::Value) -> Option<LiveMessage> {
+        parse_json_message(&json.to_string())
+    }
+
+    fn varint(mut value: u64, out: &mut Vec<u8>) {
+        while value >= 0x80 {
+            out.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    #[test]
+    fn interact_word_v2_protobuf_reports_follows() {
+        use base64::Engine;
+        let mut pb = Vec::new();
+        varint(1 << 3, &mut pb);
+        varint(123_456_789, &mut pb);
+        pb.push((2 << 3) | 2);
+        varint("观众".len() as u64, &mut pb);
+        pb.extend_from_slice("观众".as_bytes());
+        pb.push((3 << 3) | 2); // uname_color, skipped
+        pb.push(0);
+        varint(5 << 3, &mut pb);
+        varint(2, &mut pb);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&pb);
+        let parsed = message(serde_json::json!({
+            "cmd": "INTERACT_WORD_V2", "data": {"dmscore": 1, "pb": encoded}
+        }));
+        assert!(matches!(
+            parsed,
+            Some(LiveMessage::Follow { uid: 123_456_789, ref uname }) if uname == "观众"
+        ));
+    }
+
+    #[test]
+    fn truncated_protobuf_is_ignored() {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode([0x12, 0x05, b'a']);
+        assert!(
+            message(serde_json::json!({"cmd": "INTERACT_WORD_V2", "data": {"pb": encoded}}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn super_chat_and_guard_messages_are_parsed() {
+        let sc = message(serde_json::json!({"cmd": "SUPER_CHAT_MESSAGE", "data": {
+            "uid": 1, "price": 30, "message": "加油", "user_info": {"uname": "老板"}
+        }}));
+        assert!(matches!(
+            sc,
+            Some(LiveMessage::SuperChat { price: 30, ref message, ref uname, .. })
+                if message == "加油" && uname == "老板"
+        ));
+        let guard = message(serde_json::json!({"cmd": "GUARD_BUY", "data": {
+            "uid": 2, "username": "舰长", "guard_level": 3, "num": 1
+        }}));
+        assert!(matches!(
+            guard,
+            Some(LiveMessage::Guard { guard_level: 3, .. })
+        ));
     }
 }

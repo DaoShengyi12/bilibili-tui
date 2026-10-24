@@ -4,7 +4,7 @@ use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent},
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 use std::io;
 
@@ -13,13 +13,16 @@ impl App {
     pub async fn run(mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         // Initialize the first page
         self.init_current_page().await;
+        self.check_session_freshness();
 
         // Store the last content area for mouse handling
         let mut last_content_area = Rect::default();
+        let mut last_frame_area = Rect::default();
 
         while !self.should_quit {
             terminal.draw(|frame| {
                 last_content_area = self.get_content_area(frame.area());
+                last_frame_area = frame.area();
                 self.draw(frame);
             })?;
 
@@ -30,7 +33,12 @@ impl App {
                     }
                     // Terminals report one wheel event per notch, so each
                     // event scrolls one step.
-                    Event::Mouse(mouse) => self.handle_mouse(mouse, last_content_area).await,
+                    Event::Mouse(mouse) => {
+                        let on_sidebar = self.handle_sidebar_click(mouse, last_frame_area).await;
+                        if !on_sidebar {
+                            self.handle_mouse(mouse, last_content_area).await;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -41,6 +49,23 @@ impl App {
         Ok(())
     }
 
+    /// Ask the server once per start whether the login cookies are due for a
+    /// refresh; Bilibili expects web clients to renew them before expiry.
+    pub(super) fn check_session_freshness(&mut self) {
+        if let Some(credentials) = self
+            .credentials
+            .clone()
+            .filter(|credentials| credentials.refresh_token.is_some())
+        {
+            self.send_network_command(
+                crate::application::network::NetworkCommand::RefreshSession {
+                    credentials,
+                    force: false,
+                },
+            );
+        }
+    }
+
     /// Whether the page sends every key to a text field or key capture.
     fn current_page_captures_keys(&self) -> bool {
         match &self.current_page {
@@ -49,6 +74,7 @@ impl App {
             Page::VideoDetail(page) => page.input_mode,
             Page::DynamicDetail(page) => page.input_mode,
             Page::Settings(page) => page.is_capturing_input(),
+            Page::LiveDetail(page) => page.captures_keys(),
             _ => false,
         }
     }
@@ -100,6 +126,7 @@ impl App {
             }
             self.draw_playback_error(frame, area);
             self.draw_status_notice(frame, area);
+            self.draw_login_prompt(frame, area);
             return;
         }
 
@@ -128,6 +155,58 @@ impl App {
         self.draw_playback_error(frame, area);
         self.draw_playback_starting(frame, area);
         self.draw_status_notice(frame, area);
+        self.draw_login_prompt(frame, area);
+    }
+
+    fn draw_login_prompt(&self, frame: &mut Frame, area: Rect) {
+        let Some(reason) = self.login_prompt.as_deref() else {
+            return;
+        };
+        let width = 52.min(area.width);
+        let height = 7.min(area.height);
+        let popup = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        };
+        let footer = crate::ui::shortcut_footer(
+            &self.theme,
+            [
+                (
+                    self.keybindings.confirm.clone(),
+                    "重新登录".into(),
+                    self.theme.success,
+                ),
+                (
+                    self.keybindings.back.clone(),
+                    "稍后".into(),
+                    self.theme.info,
+                ),
+            ],
+        );
+        let text = vec![
+            Line::from(Span::styled(
+                reason.to_string(),
+                Style::default().fg(self.theme.warning),
+            )),
+            Line::from(""),
+            Line::from("保存的登录信息已无法使用，需要重新扫码登录。"),
+            footer,
+        ];
+        let dialog = Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().bg(self.theme.bg_primary))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(self.theme.warning))
+                    .title(" 登录失效 "),
+            );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(dialog, popup);
     }
 
     /// The bottom-row notice for app-level failures. A lost network worker
@@ -226,6 +305,16 @@ impl App {
         // the next key press; the key still performs its normal action.
         self.playback.last_error = None;
         self.status_notice = None;
+        if self.login_prompt.is_some() {
+            if self.keybindings.matches_confirm(key) {
+                self.login_prompt = None;
+                self.handle_action(crate::application::AppAction::SwitchToLogin)
+                    .await;
+            } else if self.keybindings.matches_back(key) || self.keybindings.matches_quit(key) {
+                self.login_prompt = None;
+            }
+            return;
+        }
         let keys = &self.keybindings;
         // Stopping works from every page, but only while a player runs and
         // no text field or key capture would receive the key instead.
@@ -247,7 +336,7 @@ impl App {
             Page::History(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::Favorites(page) => page.handle_input(key, keys),
             Page::Live(page) => page.handle_input(key, keys),
-            Page::LiveDetail(page) => page.handle_input(key, keys),
+            Page::LiveDetail(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::Settings(page) => page.handle_input(key, keys),
             Page::Bangumi(page) => page.handle_input(key, keys),
             Page::BangumiDetail(page) => page.handle_input(key, keys),
@@ -257,6 +346,34 @@ impl App {
         if let Some(action) = action {
             self.handle_action(action).await;
         }
+    }
+
+    /// A left click on a sidebar entry opens that page. Returns whether the
+    /// event was a sidebar click.
+    async fn handle_sidebar_click(&mut self, event: MouseEvent, frame_area: Rect) -> bool {
+        if !self.show_sidebar
+            || self.current_page_uses_full_area()
+            || event.kind
+                != crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        {
+            return false;
+        }
+        let content = self.get_content_area(frame_area);
+        let sidebar_area = Rect {
+            width: content.x.saturating_sub(frame_area.x),
+            ..frame_area
+        };
+        if !sidebar_area.contains(Position::new(event.column, event.row)) {
+            return false;
+        }
+        self.playback.last_error = None;
+        self.status_notice = None;
+        if let Some(item) = self.sidebar.item_at(sidebar_area, event.column, event.row) {
+            self.send_network_command(crate::application::network::NetworkCommand::CancelPending);
+            self.sidebar.select(item);
+            self.switch_to_nav_page().await;
+        }
+        true
     }
 
     async fn handle_mouse(&mut self, event: MouseEvent, area: Rect) {
@@ -293,6 +410,19 @@ impl App {
             Page::Login(page) => page.poll_request(),
             _ => None,
         };
+        let suggestion_term = match &mut self.current_page {
+            Page::Search(page) => page.suggestion_request(),
+            Page::Home(page) => page.search_mut().suggestion_request(),
+            _ => None,
+        };
+        if let Some(term) = suggestion_term
+            && !self.config.minimal_mode
+        {
+            let req_id = self.next_request_id("search_suggest");
+            self.send_network_command(
+                crate::application::network::NetworkCommand::LoadSearchSuggestions { req_id, term },
+            );
+        }
         if let Some(qrcode_key) = qrcode_poll {
             let req_id = self.next_request_id("login_poll");
             self.send_network_command(crate::application::network::NetworkCommand::PollQrcode {
@@ -639,5 +769,53 @@ mod tests {
         assert!(content.replace(' ', "").contains("设置"));
         app.current_page = Page::Up(Box::new(UpPage::new(1)));
         assert_eq!(app.get_content_area(area), area);
+    }
+
+    #[tokio::test]
+    async fn login_prompt_takes_keys_until_answered() {
+        let (mut app, _rx) = minimal_app();
+        app.keybindings = crate::storage::Keybindings::default();
+        app.login_prompt = Some("登录已失效".into());
+
+        app.handle_input(KeyCode::Char('j'), KeyModifiers::NONE)
+            .await;
+        assert!(app.login_prompt.is_some());
+
+        app.handle_input(KeyCode::Enter, KeyModifiers::NONE).await;
+        assert!(app.login_prompt.is_none());
+        assert!(matches!(app.current_page, Page::Login(_)));
+    }
+
+    #[tokio::test]
+    async fn login_prompt_is_dismissed_with_back() {
+        let (mut app, _rx) = minimal_app();
+        app.keybindings = crate::storage::Keybindings::default();
+        app.login_prompt = Some("登录已失效".into());
+        app.handle_input(KeyCode::Esc, KeyModifiers::NONE).await;
+        assert!(app.login_prompt.is_none());
+        assert!(!matches!(app.current_page, Page::Login(_)));
+    }
+
+    #[tokio::test]
+    async fn clicking_a_sidebar_entry_opens_its_page() {
+        let (mut app, _rx) = minimal_app();
+        app.config.minimal_mode = false;
+        app.sidebar.set_minimal_mode(false);
+        app.current_page = Page::Settings(Box::default());
+        app.sidebar.select(NavItem::Settings);
+        let click = MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 4,
+            row: 9, // fifth entry: Live
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(
+            app.handle_sidebar_click(click, Rect::new(0, 0, 100, 30))
+                .await
+        );
+
+        assert_eq!(app.sidebar.selected, NavItem::Live);
+        assert!(matches!(app.current_page, Page::Live(_)));
     }
 }

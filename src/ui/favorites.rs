@@ -369,13 +369,21 @@ impl Component for FavoritesPage {
             Paragraph::new(shortcut_footer(
                 theme,
                 [
-                    ("↑/↓".into(), "选择".into(), theme.fg_accent),
+                    (
+                        format!("{}/{}", keys.nav_up, keys.nav_down),
+                        "选择".into(),
+                        theme.fg_accent,
+                    ),
                     (
                         format!("{}/{}", keys.page_up, keys.page_down),
                         "翻页".into(),
                         theme.fg_accent,
                     ),
-                    ("←/→".into(), "收藏/视频".into(), theme.fg_accent),
+                    (
+                        format!("{}/{}", keys.nav_left, keys.nav_right),
+                        "收藏/视频".into(),
+                        theme.fg_accent,
+                    ),
                     (keys.confirm.clone(), "打开".into(), theme.success),
                     (keys.nav_next_page.clone(), "下一页面".into(), theme.info),
                     (keys.nav_prev_page.clone(), "上一页面".into(), theme.info),

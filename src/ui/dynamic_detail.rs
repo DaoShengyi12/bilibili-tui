@@ -2,8 +2,8 @@
 
 use super::text::wrap_to_width;
 use super::{Component, Theme, footer_notice, shortcut_footer};
-use crate::api::comment::CommentItem;
-use crate::api::dynamic::DynamicItem;
+use crate::api::comment::{CommentBatch, CommentItem, CommentSort};
+use crate::api::dynamic::{DynamicItem, DynamicKind};
 use crate::application::AppAction;
 use crate::storage::Keybindings;
 use image::DynamicImage;
@@ -17,6 +17,79 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Lines describing a dynamic's video, article or live room.
+fn push_major_lines(lines: &mut Vec<String>, item: &DynamicItem, width: usize) {
+    match item.kind() {
+        DynamicKind::Video => {
+            lines.push(format!(
+                "🎬 视频: {}",
+                item.video_title().unwrap_or("无标题")
+            ));
+            lines.push(format!(
+                "   ▶ {}  💬 {}  {}",
+                item.video_play(),
+                item.video_danmaku(),
+                item.video_duration()
+            ));
+        }
+        DynamicKind::Article => {
+            lines.push(format!("📰 专栏: {}", item.summary()));
+            if let Some(desc) = item.article_desc() {
+                for line in wrap_to_width(desc, width.saturating_sub(3)) {
+                    lines.push(format!("   {line}"));
+                }
+            }
+        }
+        DynamicKind::Live => {
+            if let Some(live) = item.live() {
+                let state = if live.is_live {
+                    "直播中"
+                } else {
+                    "未开播"
+                };
+                lines.push(format!(
+                    "📺 直播间 {} · {state}: {}",
+                    live.room_id, live.title
+                ));
+                if let Some(watched) = live.watched {
+                    lines.push(format!("   {watched}"));
+                }
+            }
+        }
+        _ => return,
+    }
+    lines.push(String::new());
+}
+
+/// Where the play key goes from a dynamic: its own video, article or live
+/// room, or the forwarded one's.
+fn linked_content_action(item: &DynamicItem) -> Option<AppAction> {
+    match item.kind() {
+        DynamicKind::Video => Some(AppAction::OpenVideoDetail(
+            item.video_bvid()?.to_string(),
+            0,
+        )),
+        DynamicKind::Article => Some(AppAction::OpenArticle(item.article()?.0)),
+        DynamicKind::Live => Some(AppAction::OpenLiveDetail(item.live()?.room_id)),
+        DynamicKind::Forward => {
+            let orig = item.forwarded()?;
+            linked_content_action(orig)
+                .or_else(|| orig.id_str.clone().map(AppAction::OpenDynamicDetail))
+        }
+        _ => None,
+    }
+}
+
+/// A comment page to load for a dynamic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentRequest {
+    pub oid: i64,
+    pub comment_type: i32,
+    pub sort: CommentSort,
+    /// `None` loads the first page and replaces the list.
+    pub offset: Option<String>,
+}
+
 /// Image download result
 pub struct ImageResult {
     pub index: usize,
@@ -29,7 +102,9 @@ pub struct DynamicDetailPage {
     pub comments: Vec<CommentItem>,
     pub loading: bool,
     pub error_message: Option<String>,
-    pub comment_page: i32,
+    /// Cursor of the next comment page; `None` once all are loaded.
+    pub comment_offset: Option<String>,
+    pub comment_sort: CommentSort,
     pub content_scroll: usize,
     pub comment_scroll: usize,
     pub has_more_comments: bool,
@@ -67,7 +142,8 @@ impl DynamicDetailPage {
             comments: Vec::new(),
             loading: true,
             error_message: None,
-            comment_page: 1,
+            comment_offset: None,
+            comment_sort: CommentSort::default(),
             content_scroll: 0,
             content_width: std::cell::Cell::new(60),
             comment_width: std::cell::Cell::new(80),
@@ -139,28 +215,70 @@ impl DynamicDetailPage {
         image::load_from_memory(&bytes).ok()
     }
 
+    /// The comment area of the loaded dynamic: `(oid, type)`.
+    pub fn comment_target(&self) -> Option<(i64, i32)> {
+        let item = self.dynamic_item.as_ref()?;
+        Some((item.comment_oid(&self.dynamic_id)?, item.comment_type()))
+    }
+
     /// Marks the next comment page as loading and returns the comment
-    /// target and page number, or `None` when there is nothing to load.
-    pub fn begin_load_more_comments(&mut self) -> Option<(i64, i32, i32)> {
+    /// target, sort and cursor, or `None` when there is nothing to load.
+    pub fn begin_load_more_comments(&mut self) -> Option<CommentRequest> {
         if !self.has_more_comments || self.loading_more_comments {
             return None;
         }
-        let item = self.dynamic_item.as_ref()?;
-        let oid = item.comment_oid(&self.dynamic_id)?;
-        let comment_type = item.comment_type();
+        let (oid, comment_type) = self.comment_target()?;
+        let offset = self.comment_offset.clone()?;
         self.loading_more_comments = true;
-        Some((oid, comment_type, self.comment_page + 1))
+        Some(CommentRequest {
+            oid,
+            comment_type,
+            sort: self.comment_sort,
+            offset: Some(offset),
+        })
     }
 
-    pub fn apply_more_comments(&mut self, page: i32, replies: Option<Vec<CommentItem>>) {
-        match replies {
-            Some(replies) if !replies.is_empty() => {
-                self.comments.extend(replies);
-                self.comment_page = page;
-            }
-            _ => self.has_more_comments = false,
-        }
+    pub fn set_comments(&mut self, batch: CommentBatch) {
+        self.comments = batch.comments;
+        self.has_more_comments = batch.next_offset.is_some();
+        self.comment_offset = batch.next_offset;
+        self.comment_scroll = 0;
+        self.selected_comment = 0;
         self.loading_more_comments = false;
+    }
+
+    /// A comment page for `sort`; pages for a sort no longer selected are
+    /// dropped.
+    pub fn apply_comment_batch(&mut self, sort: CommentSort, append: bool, batch: CommentBatch) {
+        if sort != self.comment_sort {
+            return;
+        }
+        if !append {
+            self.set_comments(batch);
+            return;
+        }
+        self.comments.extend(batch.comments);
+        self.has_more_comments = batch.next_offset.is_some();
+        self.comment_offset = batch.next_offset;
+        self.loading_more_comments = false;
+    }
+
+    /// Switch between hot and newest-first comments and return the first
+    /// page to load, or `None` while the dynamic is still loading.
+    pub fn begin_comment_sort_toggle(&mut self) -> Option<CommentRequest> {
+        if self.loading {
+            return None;
+        }
+        let (oid, comment_type) = self.comment_target()?;
+        self.comment_sort = self.comment_sort.toggled();
+        self.set_comments(CommentBatch::default());
+        self.loading_more_comments = true;
+        Some(CommentRequest {
+            oid,
+            comment_type,
+            sort: self.comment_sort,
+            offset: None,
+        })
     }
 
     pub fn apply_more_comments_error(&mut self) {
@@ -189,14 +307,30 @@ impl DynamicDetailPage {
                 item.desc_text()
             };
 
+            let width = self.content_width.get().saturating_sub(2);
             if let Some(text) = content_text
                 && !text.is_empty()
             {
                 lines.push("📝 动态内容:".to_string());
                 lines.push(String::new());
-                let width = self.content_width.get().saturating_sub(2);
                 for line in wrap_to_width(text, width) {
                     lines.push(format!("  {}", line));
+                }
+                lines.push(String::new());
+            }
+            push_major_lines(&mut lines, item, width);
+            if item.kind() == DynamicKind::Forward {
+                lines.push("↪ 转发自:".to_string());
+                match item.forwarded() {
+                    Some(orig) => {
+                        lines.push(format!("  @{}  {}", orig.author_name(), orig.pub_time()));
+                        let text = orig.opus_text().or(orig.desc_text()).unwrap_or_default();
+                        for line in wrap_to_width(text, width.saturating_sub(2)) {
+                            lines.push(format!("    {line}"));
+                        }
+                        push_major_lines(&mut lines, orig, width.saturating_sub(2));
+                    }
+                    None => lines.push("  原动态已删除".to_string()),
                 }
                 lines.push(String::new());
             }
@@ -278,7 +412,12 @@ impl DynamicDetailPage {
         }
 
         if comment_blocks.is_empty() {
-            comment_blocks.push(vec!["暂无评论".to_string()]);
+            let text = if self.loading_more_comments {
+                "⏳ 加载评论中..."
+            } else {
+                "暂无评论"
+            };
+            comment_blocks.push(vec![text.to_string()]);
         }
 
         comment_blocks
@@ -416,7 +555,13 @@ impl Component for DynamicDetailPage {
                     ),
                     (keys.confirm.clone(), "点赞".into(), theme.success),
                     (keys.comment.clone(), "评论".into(), theme.info),
-                    ("n".into(), "加载更多".into(), theme.info),
+                    (
+                        keys.comment_sort.clone(),
+                        self.comment_sort.toggled().label().into(),
+                        theme.info,
+                    ),
+                    (keys.load_more.clone(), "加载更多".into(), theme.info),
+                    (keys.play.clone(), "打开原内容".into(), theme.success),
                     (keys.back.clone(), "返回".into(), theme.info),
                 ],
             )
@@ -431,7 +576,13 @@ impl Component for DynamicDetailPage {
                     ),
                     (keys.confirm.clone(), "点赞".into(), theme.success),
                     (keys.comment.clone(), "评论".into(), theme.info),
-                    ("n".into(), "加载更多".into(), theme.info),
+                    (
+                        keys.comment_sort.clone(),
+                        self.comment_sort.toggled().label().into(),
+                        theme.info,
+                    ),
+                    (keys.load_more.clone(), "加载更多".into(), theme.info),
+                    (keys.play.clone(), "打开原内容".into(), theme.success),
                     (keys.back.clone(), "返回".into(), theme.info),
                 ],
             )
@@ -520,9 +671,24 @@ impl Component for DynamicDetailPage {
             }
             return Some(AppAction::None);
         }
-        // 'n' for load more comments (page-specific)
-        if key == KeyCode::Char('n') {
+        if keys.matches_load_more(key) {
             return Some(AppAction::LoadMoreComments);
+        }
+        if keys.matches_play(key) {
+            return Some(
+                self.dynamic_item
+                    .as_ref()
+                    .and_then(linked_content_action)
+                    .unwrap_or(AppAction::None),
+            );
+        }
+        if keys.matches_open_up(key)
+            && let Some(mid) = self.dynamic_item.as_ref().and_then(DynamicItem::author_mid)
+        {
+            return Some(AppAction::OpenUpPage(mid));
+        }
+        if keys.matches_comment_sort(key) {
+            return Some(AppAction::ToggleCommentSort);
         }
         if keys.matches_down(key) {
             self.move_comment_selection(1);
@@ -713,7 +879,11 @@ impl DynamicDetailPage {
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(theme.border_focused))
-                    .title(format!(" 评论 ({}) ", self.comments.len())),
+                    .title(format!(
+                        " 评论 ({}) · {} ",
+                        self.comments.len(),
+                        self.comment_sort.label()
+                    )),
             );
         frame.render_widget(comments, area);
     }
@@ -774,5 +944,28 @@ mod tests {
         page.handle_input(KeyCode::Up, &keys);
         assert_eq!(page.selected_comment, 1);
         assert_eq!(page.comment_scroll, page.comment_start_line(1));
+    }
+
+    #[test]
+    fn play_key_opens_the_forwarded_video() {
+        let mut page = DynamicDetailPage::new("1".into());
+        page.loading = false;
+        page.dynamic_item = Some(
+            serde_json::from_value(serde_json::json!({
+                "id_str": "1",
+                "type": "DYNAMIC_TYPE_FORWARD",
+                "orig": {"id_str": "2", "modules": {"module_dynamic": {"major": {
+                    "type": "MAJOR_TYPE_ARCHIVE", "archive": {"bvid": "BV1orig"}
+                }}}}
+            }))
+            .unwrap(),
+        );
+        let action = page.handle_input(KeyCode::Char('p'), &Keybindings::default());
+        assert!(matches!(action, Some(AppAction::OpenVideoDetail(bvid, _)) if bvid == "BV1orig"));
+        assert!(
+            page.get_content_lines()
+                .iter()
+                .any(|line| line.contains("转发自"))
+        );
     }
 }

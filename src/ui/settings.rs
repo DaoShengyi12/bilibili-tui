@@ -135,41 +135,7 @@ impl SettingsPage {
     }
 
     fn keybind_labels(&self) -> Vec<(&'static str, &str)> {
-        vec![
-            // Global actions
-            ("退出", &self.keybindings.quit),
-            ("确认", &self.keybindings.confirm),
-            ("返回", &self.keybindings.back),
-            ("刷新", &self.keybindings.refresh),
-            // Navigation
-            ("向上", &self.keybindings.nav_up),
-            ("向下", &self.keybindings.nav_down),
-            ("向左", &self.keybindings.nav_left),
-            ("向右", &self.keybindings.nav_right),
-            ("下一页面", &self.keybindings.nav_next_page),
-            ("上一页面", &self.keybindings.nav_prev_page),
-            ("内容下翻页", &self.keybindings.page_down),
-            ("内容上翻页", &self.keybindings.page_up),
-            // Section/Tab
-            ("上一分区", &self.keybindings.section_prev),
-            ("下一分区", &self.keybindings.section_next),
-            ("标签1", &self.keybindings.tab_1),
-            ("标签2", &self.keybindings.tab_2),
-            ("标签3", &self.keybindings.tab_3),
-            // Actions
-            ("切换主题", &self.keybindings.next_theme),
-            ("播放", &self.keybindings.play),
-            ("设置", &self.keybindings.open_settings),
-            ("搜索", &self.keybindings.search_focus),
-            // Comments
-            ("评论", &self.keybindings.comment),
-            ("展开回复", &self.keybindings.toggle_replies),
-            // Dynamic page
-            ("上一UP", &self.keybindings.up_prev),
-            ("下一UP", &self.keybindings.up_next),
-            // Playback; must stay in step with `Keybindings::update_by_index`.
-            ("停止播放", &self.keybindings.stop_playback),
-        ]
+        self.keybindings.get_all_labels()
     }
 }
 
@@ -720,8 +686,11 @@ impl SettingsPage {
         });
         frame.render_widget(List::new(items), chunks[0]);
         frame.render_widget(
-            Paragraph::new("  按 ←/→ 或 Enter 更改并立即保存")
-                .style(Style::default().fg(theme.fg_secondary)),
+            Paragraph::new(format!(
+                "  按 {}/{} 或 {} 更改并立即保存",
+                self.keybindings.nav_left, self.keybindings.nav_right, self.keybindings.confirm
+            ))
+            .style(Style::default().fg(theme.fg_secondary)),
             chunks[1],
         );
         frame.render_widget(

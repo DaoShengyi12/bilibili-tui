@@ -2,7 +2,7 @@
 
 use super::video_card::{VideoCard, VideoCardGrid};
 use super::{Component, Theme, shortcut_footer};
-use crate::api::search::{HotwordItem, SearchVideoItem};
+use crate::api::search::{HotwordItem, SearchKind, SearchResultItem, SearchTarget};
 use crate::application::AppAction;
 use crate::storage::Keybindings;
 use ratatui::{
@@ -10,10 +10,23 @@ use ratatui::{
     prelude::*,
     widgets::*,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Typing pauses this long before suggestions are requested.
+const SUGGEST_DELAY: Duration = Duration::from_millis(300);
 
 pub struct SearchPage {
     pub query: String,
+    /// Characters after the input cursor; 0 keeps it at the end.
+    pub cursor_back: usize,
+    pub kind: SearchKind,
+    /// What each card opens, by card index.
+    targets: Vec<SearchTarget>,
+    pub suggestions: Vec<String>,
+    suggestion_selected: Option<usize>,
+    last_edit: Option<Instant>,
+    /// The term suggestions were last requested for.
+    suggested_for: String,
     pub grid: VideoCardGrid,
     pub loading: bool,
     pub error_message: Option<String>,
@@ -37,6 +50,13 @@ impl SearchPage {
     pub fn new() -> Self {
         Self {
             query: String::new(),
+            cursor_back: 0,
+            kind: SearchKind::default(),
+            targets: Vec::new(),
+            suggestions: Vec::new(),
+            suggestion_selected: None,
+            last_edit: None,
+            suggested_for: String::new(),
             grid: VideoCardGrid::new_list(),
             loading: false,
             error_message: None,
@@ -65,44 +85,143 @@ impl SearchPage {
         self.hotword_error = None;
     }
 
-    pub fn set_results(&mut self, results: Vec<SearchVideoItem>, total: i32) {
+    pub fn set_results(&mut self, results: Vec<SearchResultItem>, total: i32) {
         self.grid.clear();
-        for item in results {
-            let card = VideoCard::new(
-                item.bvid.clone(),
-                item.aid,
-                item.display_title(),
-                item.author_name().to_string(),
-                item.format_play(),
-                item.duration.clone().unwrap_or_default(),
-                item.cover_url(),
-            )
-            .with_uploader_mid(item.mid);
-            self.grid.add_card(card);
-        }
+        self.targets.clear();
+        self.add_results(results);
         self.total_results = total;
         self.loading = false;
         self.loading_more = false;
         self.input_mode = false;
         self.show_hot_list = false;
         self.error_message = None;
+        self.clear_suggestions();
     }
 
-    pub fn append_results(&mut self, results: Vec<SearchVideoItem>) {
-        for item in results {
-            let card = VideoCard::new(
-                item.bvid.clone(),
-                item.aid,
-                item.display_title(),
-                item.author_name().to_string(),
-                item.format_play(),
-                item.duration.clone().unwrap_or_default(),
-                item.cover_url(),
-            )
-            .with_uploader_mid(item.mid);
-            self.grid.add_card(card);
-        }
+    pub fn append_results(&mut self, results: Vec<SearchResultItem>) {
+        self.add_results(results);
         self.loading_more = false;
+    }
+
+    fn add_results(&mut self, results: Vec<SearchResultItem>) {
+        for item in results {
+            let (bvid, aid) = match &item.target {
+                SearchTarget::Video { bvid, aid } => (Some(bvid.clone()), Some(*aid)),
+                _ => (None, None),
+            };
+            let card = VideoCard::new(
+                bvid,
+                aid,
+                item.title,
+                item.subtitle,
+                item.stats,
+                item.badge,
+                item.cover,
+            )
+            .with_uploader_mid(item.uploader_mid);
+            self.grid.add_card(card);
+            self.targets.push(item.target);
+        }
+    }
+
+    /// The action opening search result `index`.
+    fn open_result(&self, index: usize) -> Option<AppAction> {
+        Some(match self.targets.get(index)? {
+            SearchTarget::Video { bvid, aid } => AppAction::OpenVideoDetail(bvid.clone(), *aid),
+            SearchTarget::User { mid } => AppAction::OpenUpPage(*mid),
+            SearchTarget::Bangumi { season_id } => AppAction::OpenBangumiDetail(*season_id),
+            SearchTarget::Live { room_id } => AppAction::OpenLiveDetail(*room_id),
+        })
+    }
+
+    /// Start a search for `keyword` of the current kind.
+    fn begin_search(&mut self, keyword: String) -> AppAction {
+        self.query = keyword.clone();
+        self.cursor_back = 0;
+        self.loading = true;
+        self.page = 1;
+        self.show_hot_list = false;
+        self.clear_suggestions();
+        AppAction::Search(keyword)
+    }
+
+    fn clear_suggestions(&mut self) {
+        self.suggestions.clear();
+        self.suggestion_selected = None;
+        self.last_edit = None;
+    }
+
+    /// Suggestions are shown instead of the hot list while typing a keyword.
+    fn showing_suggestions(&self) -> bool {
+        self.input_mode && !self.query.trim().is_empty() && !self.suggestions.is_empty()
+    }
+
+    fn after_edit(&mut self) {
+        self.show_hot_list = self.hotwords_enabled;
+        self.suggestion_selected = None;
+        self.last_edit = Some(Instant::now());
+        if self.query.trim().is_empty() {
+            self.suggestions.clear();
+        }
+        if self.hot_selected.is_none() && !self.hotwords.is_empty() {
+            self.hot_selected = Some(0);
+        }
+    }
+
+    /// The term to fetch suggestions for, once typing has paused.
+    pub fn suggestion_request(&mut self) -> Option<String> {
+        let term = self.query.trim();
+        if !self.input_mode
+            || !self.hotwords_enabled
+            || term.is_empty()
+            || term == self.suggested_for
+            || self
+                .last_edit
+                .is_none_or(|edited| edited.elapsed() < SUGGEST_DELAY)
+        {
+            return None;
+        }
+        self.suggested_for = term.to_string();
+        Some(self.suggested_for.clone())
+    }
+
+    /// Suggestions for a term the user has since changed are dropped.
+    pub fn apply_suggestions(&mut self, term: &str, suggestions: Vec<String>) {
+        if self.query.trim() != term {
+            return;
+        }
+        self.suggestions = suggestions;
+        self.suggestion_selected = None;
+    }
+
+    /// Switch the result kind; returns the search to run, if any.
+    pub fn switch_kind(&mut self, kind: SearchKind) -> Option<String> {
+        if self.kind == kind {
+            return None;
+        }
+        self.kind = kind;
+        self.grid.clear();
+        self.targets.clear();
+        self.total_results = 0;
+        self.error_message = None;
+        let query = self.query.trim().to_string();
+        if query.is_empty() {
+            return None;
+        }
+        self.loading = true;
+        self.loading_more = false;
+        self.page = 1;
+        self.show_hot_list = false;
+        Some(query)
+    }
+
+    fn move_suggestion(&mut self, step: isize) {
+        let len = self.suggestions.len() as isize;
+        self.suggestion_selected = Some(match self.suggestion_selected {
+            None if step > 0 => 0,
+            None => len - 1,
+            Some(current) => (current as isize + step).rem_euclid(len),
+        } as usize);
     }
 
     pub fn set_error(&mut self, msg: String) {
@@ -149,17 +268,35 @@ impl SearchPage {
     }
 
     fn search_selected_hotword(&mut self) -> Option<AppAction> {
-        if let Some(idx) = self.hot_selected
-            && let Some(item) = self.hotwords.get(idx)
-            && let Some(keyword) = item.keyword_text()
-        {
-            self.query = keyword.clone();
-            self.loading = true;
-            self.page = 1;
-            self.show_hot_list = false;
-            return Some(AppAction::Search(keyword));
-        }
-        None
+        let keyword = self
+            .hot_selected
+            .and_then(|idx| self.hotwords.get(idx))
+            .and_then(HotwordItem::keyword_text)?;
+        Some(self.begin_search(keyword))
+    }
+
+    fn draw_suggestions(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let items: Vec<ListItem> = self
+            .suggestions
+            .iter()
+            .map(|suggestion| ListItem::new(suggestion.as_str()))
+            .collect();
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.border_subtle))
+                    .title(Span::styled(
+                        " 搜索建议 ",
+                        Style::default().fg(theme.bilibili_pink),
+                    )),
+            )
+            .style(Style::default().fg(theme.fg_primary))
+            .highlight_style(Style::default().fg(theme.bilibili_pink))
+            .highlight_symbol("▶ ");
+        let mut state = ListState::default().with_selected(self.suggestion_selected);
+        frame.render_stateful_widget(list, area, &mut state);
     }
 
     fn draw_hot_list(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -236,6 +373,32 @@ impl SearchPage {
     }
 }
 
+impl SearchPage {
+    /// `🔍 搜索 [视频] 用户 番剧 直播` with the current kind highlighted.
+    fn kind_tabs(&self, theme: &Theme) -> Line<'static> {
+        let mut spans = vec![Span::styled(
+            " 🔍 搜索 ",
+            Style::default().fg(theme.bilibili_pink),
+        )];
+        for kind in SearchKind::ALL {
+            spans.push(if kind == self.kind {
+                Span::styled(
+                    format!("[{}] ", kind.label()),
+                    Style::default()
+                        .fg(theme.bilibili_pink)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    format!("{} ", kind.label()),
+                    Style::default().fg(theme.fg_muted),
+                )
+            });
+        }
+        Line::from(spans)
+    }
+}
+
 impl Default for SearchPage {
     fn default() -> Self {
         Self::new()
@@ -268,19 +431,22 @@ impl Component for SearchPage {
             } else {
                 Style::default().fg(theme.border_subtle)
             })
-            .title(Span::styled(
-                " 🔍 搜索视频 ",
-                Style::default().fg(theme.bilibili_pink),
-            ));
+            .title(self.kind_tabs(theme));
 
-        let cursor_char = if self.input_mode { "▌" } else { "" };
-        let input = Paragraph::new(format!("{}{}", self.query, cursor_char))
-            .style(input_style)
-            .block(input_block);
+        let input = if self.input_mode {
+            let (before, after) = super::text::split_at_cursor(&self.query, self.cursor_back);
+            Paragraph::new(format!("{before}▌{after}"))
+        } else {
+            Paragraph::new(self.query.as_str())
+        }
+        .style(input_style)
+        .block(input_block);
         frame.render_widget(input, chunks[0]);
 
         // Results
-        if self.show_hot_list {
+        if self.showing_suggestions() {
+            self.draw_suggestions(frame, chunks[1], theme);
+        } else if self.show_hot_list {
             self.draw_hot_list(frame, chunks[1], theme);
         } else if self.loading {
             let loading = Paragraph::new("⏳ 搜索中...")
@@ -312,7 +478,7 @@ impl Component for SearchPage {
             let empty = Paragraph::new(if self.query.is_empty() {
                 "输入关键词开始搜索"
             } else {
-                "没有找到相关视频"
+                "没有找到相关结果"
             })
             .style(Style::default().fg(theme.fg_secondary))
             .alignment(Alignment::Center)
@@ -363,8 +529,10 @@ impl Component for SearchPage {
             shortcut_footer(
                 theme,
                 [
-                    (keys.confirm.clone(), "搜索".into(), theme.success),
-                    (keys.back.clone(), "取消".into(), theme.info),
+                    ("Enter".to_string(), "搜索".into(), theme.success),
+                    ("←/→".to_string(), "移动光标".into(), theme.fg_accent),
+                    ("↑/↓".to_string(), "选择建议".into(), theme.fg_accent),
+                    ("Esc".to_string(), "取消".into(), theme.info),
                     (keys.nav_next_page.clone(), "导航".into(), theme.fg_accent),
                 ],
             )
@@ -386,7 +554,13 @@ impl Component for SearchPage {
                         "翻页".into(),
                         theme.fg_accent,
                     ),
-                    (keys.confirm.clone(), "详情".into(), theme.success),
+                    (keys.confirm.clone(), "打开".into(), theme.success),
+                    (
+                        format!("{}/{}", keys.section_prev, keys.section_next),
+                        "类型".into(),
+                        theme.fg_accent,
+                    ),
+                    (keys.open_up.clone(), "UP主".into(), theme.info),
                     (keys.search_focus.clone(), "搜索".into(), theme.info),
                     (keys.nav_next_page.clone(), "切换".into(), theme.info),
                 ],
@@ -402,8 +576,17 @@ impl Component for SearchPage {
         modifiers: crossterm::event::KeyModifiers,
         keys: &crate::storage::Keybindings,
     ) -> Option<AppAction> {
-        if self.input_mode && super::text::apply_line_edit(&mut self.query, key, modifiers) {
-            self.show_hot_list = self.hotwords_enabled;
+        if self.input_mode
+            && !matches!(
+                key,
+                KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Esc
+            )
+            && let Some(changed) =
+                super::text::edit_at_cursor(&mut self.query, &mut self.cursor_back, key, modifiers)
+        {
+            if changed {
+                self.after_edit();
+            }
             return Some(AppAction::None);
         }
         self.handle_input(key, keys)
@@ -416,20 +599,8 @@ impl Component for SearchPage {
     ) -> Option<AppAction> {
         if self.input_mode {
             match key {
-                KeyCode::Char(c) => {
-                    self.query.push(c);
-                    self.show_hot_list = self.hotwords_enabled;
-                    if self.hot_selected.is_none() && !self.hotwords.is_empty() {
-                        self.hot_selected = Some(0);
-                    }
-                    Some(AppAction::None)
-                }
-                KeyCode::Backspace => {
-                    self.query.pop();
-                    self.show_hot_list = self.hotwords_enabled;
-                    if self.hot_selected.is_none() && !self.hotwords.is_empty() {
-                        self.hot_selected = Some(0);
-                    }
+                KeyCode::Up | KeyCode::Down if self.showing_suggestions() => {
+                    self.move_suggestion(if key == KeyCode::Up { -1 } else { 1 });
                     Some(AppAction::None)
                 }
                 KeyCode::Up => {
@@ -451,11 +622,15 @@ impl Component for SearchPage {
                     Some(AppAction::None)
                 }
                 KeyCode::Enter => {
-                    if !self.query.trim().is_empty() {
-                        self.loading = true;
-                        self.page = 1;
-                        self.show_hot_list = false;
-                        Some(AppAction::Search(self.query.clone()))
+                    if let Some(suggestion) = self
+                        .suggestion_selected
+                        .filter(|_| self.showing_suggestions())
+                        .and_then(|index| self.suggestions.get(index))
+                        .cloned()
+                    {
+                        Some(self.begin_search(suggestion))
+                    } else if !self.query.trim().is_empty() {
+                        Some(self.begin_search(self.query.clone()))
                     } else if self.show_hot_list {
                         self.search_selected_hotword()
                     } else {
@@ -464,10 +639,24 @@ impl Component for SearchPage {
                 }
                 KeyCode::Esc => {
                     self.input_mode = false;
+                    self.suggestions.clear();
                     Some(AppAction::None)
                 }
                 _ if keys.matches_nav_next(key) => Some(AppAction::NavNext),
                 _ if keys.matches_nav_prev(key) => Some(AppAction::NavPrev),
+                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete => {
+                    let modifiers = crossterm::event::KeyModifiers::NONE;
+                    if super::text::edit_at_cursor(
+                        &mut self.query,
+                        &mut self.cursor_back,
+                        key,
+                        modifiers,
+                    ) == Some(true)
+                    {
+                        self.after_edit();
+                    }
+                    Some(AppAction::None)
+                }
                 _ => Some(AppAction::None),
             }
         } else if self.show_hot_list {
@@ -539,18 +728,24 @@ impl Component for SearchPage {
                 self.grid.move_left();
                 return Some(AppAction::None);
             }
-            if key == KeyCode::Char('u')
+            if keys.matches_open_up(key)
                 && let Some(mid) = self.grid.selected_card().and_then(|card| card.uploader_mid)
             {
                 return Some(AppAction::OpenUpPage(mid));
             }
             if keys.matches_confirm(key) {
-                if let Some(card) = self.grid.selected_card()
-                    && let (Some(bvid), Some(aid)) = (&card.bvid, card.aid)
-                {
-                    return Some(AppAction::OpenVideoDetail(bvid.clone(), aid));
-                }
-                return Some(AppAction::None);
+                return Some(
+                    self.open_result(self.grid.selected_index)
+                        .unwrap_or(AppAction::None),
+                );
+            }
+            if keys.matches_section_prev(key) || keys.matches_section_next(key) {
+                let step = if keys.matches_section_prev(key) {
+                    -1
+                } else {
+                    1
+                };
+                return Some(AppAction::SwitchSearchKind(self.kind.cycle(step)));
             }
             if keys.matches_search_focus(key) {
                 self.input_mode = true;
@@ -660,10 +855,8 @@ impl Component for SearchPage {
                     if is_double_click {
                         self.last_click_time = None;
                         self.last_click_index = None;
-                        if let Some(card) = self.grid.cards.get(click_idx)
-                            && let (Some(bvid), Some(aid)) = (&card.bvid, card.aid)
-                        {
-                            return Some(AppAction::OpenVideoDetail(bvid.clone(), aid));
+                        if let Some(action) = self.open_result(click_idx) {
+                            return Some(action);
                         }
                     } else {
                         self.grid.selected_index = click_idx;
@@ -706,5 +899,86 @@ mod minimal_mode_tests {
             page.handle_input(key, &keys);
             assert!(!page.show_hot_list);
         }
+    }
+
+    fn typed(page: &mut SearchPage, text: &str) {
+        let keys = Keybindings::default();
+        for c in text.chars() {
+            page.handle_input(KeyCode::Char(c), &keys);
+        }
+    }
+
+    #[test]
+    fn suggestions_wait_for_a_pause_and_ignore_stale_terms() {
+        let mut page = SearchPage::new();
+        typed(&mut page, "rus");
+        assert_eq!(page.suggestion_request(), None, "still typing");
+        page.last_edit = Some(Instant::now() - SUGGEST_DELAY);
+        assert_eq!(page.suggestion_request().as_deref(), Some("rus"));
+        assert_eq!(page.suggestion_request(), None, "asked once per term");
+
+        typed(&mut page, "t");
+        page.apply_suggestions("rus", vec!["rush".into()]);
+        assert!(page.suggestions.is_empty());
+        page.apply_suggestions("rust", vec!["rust 教程".into()]);
+        assert!(page.showing_suggestions());
+    }
+
+    #[test]
+    fn enter_searches_the_chosen_suggestion() {
+        let keys = Keybindings::default();
+        let mut page = SearchPage::new();
+        typed(&mut page, "rust");
+        page.apply_suggestions("rust", vec!["rust 教程".into(), "rust 入门".into()]);
+        page.handle_input(KeyCode::Down, &keys);
+        page.handle_input(KeyCode::Down, &keys);
+        let action = page.handle_input(KeyCode::Enter, &keys);
+        assert!(matches!(action, Some(AppAction::Search(ref keyword)) if keyword == "rust 入门"));
+        assert_eq!(page.query, "rust 入门");
+        assert!(page.suggestions.is_empty());
+    }
+
+    #[test]
+    fn cursor_moves_and_edits_mid_query() {
+        let keys = Keybindings::default();
+        let none = crossterm::event::KeyModifiers::NONE;
+        let mut page = SearchPage::new();
+        typed(&mut page, "ac");
+        page.handle_input_with_modifiers(KeyCode::Left, none, &keys);
+        page.handle_input_with_modifiers(KeyCode::Char('b'), none, &keys);
+        assert_eq!(page.query, "abc");
+        page.handle_input_with_modifiers(KeyCode::Home, none, &keys);
+        page.handle_input_with_modifiers(KeyCode::Delete, none, &keys);
+        assert_eq!(page.query, "bc");
+    }
+
+    #[test]
+    fn results_of_other_kinds_open_their_pages() {
+        let keys = Keybindings::default();
+        let mut page = SearchPage::new();
+        page.query = "q".into();
+        assert_eq!(page.switch_kind(SearchKind::User).as_deref(), Some("q"));
+        assert!(page.loading);
+        page.set_results(
+            vec![SearchResultItem {
+                target: SearchTarget::User { mid: 5 },
+                title: "u".into(),
+                subtitle: String::new(),
+                stats: String::new(),
+                badge: String::new(),
+                cover: None,
+                uploader_mid: Some(5),
+            }],
+            1,
+        );
+        assert!(matches!(
+            page.handle_input(KeyCode::Enter, &keys),
+            Some(AppAction::OpenUpPage(5))
+        ));
+        assert!(matches!(
+            page.handle_input(KeyCode::Char(']'), &keys),
+            Some(AppAction::SwitchSearchKind(SearchKind::Bangumi))
+        ));
+        assert_eq!(page.switch_kind(SearchKind::User), None, "same kind");
     }
 }

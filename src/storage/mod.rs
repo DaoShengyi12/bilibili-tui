@@ -111,10 +111,29 @@ pub struct Keybindings {
     // Comments
     pub comment: String,
     pub toggle_replies: String,
+    /// Switch comments between hot and newest first.
+    pub comment_sort: String,
+    /// Load the next page where a list does not load it on scroll.
+    pub load_more: String,
 
     // Dynamic page specific
     pub up_prev: String,
     pub up_next: String,
+
+    // Video actions
+    pub open_up: String,
+    pub video_like: String,
+    pub video_coin: String,
+    pub video_favorite: String,
+    pub video_triple: String,
+    pub watch_later: String,
+    pub follow: String,
+    /// Send a danmaku to the playing video or the live room.
+    pub send_danmaku: String,
+    /// Pick the live stream quality.
+    pub live_quality: String,
+    /// Cycle forward/reverse/shuffle for "play all".
+    pub play_order: String,
 }
 
 impl Default for Keybindings {
@@ -153,10 +172,24 @@ impl Default for Keybindings {
             // Comments
             comment: "c".to_string(),
             toggle_replies: "r".to_string(),
+            comment_sort: "o".to_string(),
+            load_more: "n".to_string(),
 
             // Dynamic page
             up_prev: "[".to_string(),
             up_next: "]".to_string(),
+
+            // Video actions
+            open_up: "u".to_string(),
+            video_like: "a".to_string(),
+            video_coin: "b".to_string(),
+            video_favorite: "f".to_string(),
+            video_triple: "T".to_string(),
+            watch_later: "w".to_string(),
+            follow: "F".to_string(),
+            send_danmaku: "d".to_string(),
+            live_quality: "v".to_string(),
+            play_order: "s".to_string(),
         }
     }
 }
@@ -329,6 +362,54 @@ impl Keybindings {
         self.matches(&self.toggle_replies, key)
     }
 
+    pub fn matches_comment_sort(&self, key: KeyCode) -> bool {
+        self.matches(&self.comment_sort, key)
+    }
+
+    pub fn matches_load_more(&self, key: KeyCode) -> bool {
+        self.matches(&self.load_more, key)
+    }
+
+    pub fn matches_open_up(&self, key: KeyCode) -> bool {
+        self.matches(&self.open_up, key)
+    }
+
+    pub fn matches_video_like(&self, key: KeyCode) -> bool {
+        self.matches(&self.video_like, key)
+    }
+
+    pub fn matches_video_coin(&self, key: KeyCode) -> bool {
+        self.matches(&self.video_coin, key)
+    }
+
+    pub fn matches_video_favorite(&self, key: KeyCode) -> bool {
+        self.matches(&self.video_favorite, key)
+    }
+
+    pub fn matches_video_triple(&self, key: KeyCode) -> bool {
+        self.matches(&self.video_triple, key)
+    }
+
+    pub fn matches_watch_later(&self, key: KeyCode) -> bool {
+        self.matches(&self.watch_later, key)
+    }
+
+    pub fn matches_follow(&self, key: KeyCode) -> bool {
+        self.matches(&self.follow, key)
+    }
+
+    pub fn matches_send_danmaku(&self, key: KeyCode) -> bool {
+        self.matches(&self.send_danmaku, key)
+    }
+
+    pub fn matches_live_quality(&self, key: KeyCode) -> bool {
+        self.matches(&self.live_quality, key)
+    }
+
+    pub fn matches_play_order(&self, key: KeyCode) -> bool {
+        self.matches(&self.play_order, key)
+    }
+
     /// Whether `key` is bound to moving through or acting on a list. Page
     /// shortcuts that are not configurable (History's Space/`d`/`u`, UP's
     /// `o`/`s`) yield to these so a user's custom binding always works.
@@ -375,80 +456,143 @@ impl Keybindings {
         "←↑↓→".to_string()
     }
 
-    /// Get all keybinding labels for display in settings
+    /// Every configurable binding with its settings label, in settings
+    /// order. `update_by_index` uses the same order.
     pub fn get_all_labels(&self) -> Vec<(&'static str, &str)> {
-        vec![
-            // Global actions
-            ("退出", &self.quit),
-            ("确认", &self.confirm),
-            ("返回", &self.back),
-            ("刷新", &self.refresh),
-            // Navigation
-            ("向上", &self.nav_up),
-            ("向下", &self.nav_down),
-            ("向左", &self.nav_left),
-            ("向右", &self.nav_right),
-            ("下一页面", &self.nav_next_page),
-            ("上一页面", &self.nav_prev_page),
-            ("内容下翻页", &self.page_down),
-            ("内容上翻页", &self.page_up),
-            // Section/Tab
-            ("上一分区", &self.section_prev),
-            ("下一分区", &self.section_next),
-            ("标签1", &self.tab_1),
-            ("标签2", &self.tab_2),
-            ("标签3", &self.tab_3),
-            // Actions
-            ("切换主题", &self.next_theme),
-            ("播放", &self.play),
-            ("设置", &self.open_settings),
-            ("搜索", &self.search_focus),
-            // Comments
-            ("评论", &self.comment),
-            ("展开回复", &self.toggle_replies),
-            // Dynamic page
-            ("上一UP", &self.up_prev),
-            ("下一UP", &self.up_next),
+        Self::LABELS.into_iter().zip(self.bindings()).collect()
+    }
+
+    const LABELS: [&'static str; 38] = [
+        "退出",
+        "确认",
+        "返回",
+        "刷新",
+        "向上",
+        "向下",
+        "向左",
+        "向右",
+        "下一页面",
+        "上一页面",
+        "内容下翻页",
+        "内容上翻页",
+        "上一分区",
+        "下一分区",
+        "标签1",
+        "标签2",
+        "标签3",
+        "切换主题",
+        "播放",
+        "设置",
+        "搜索",
+        "评论",
+        "展开回复",
+        "上一UP",
+        "下一UP",
+        "停止播放",
+        "切换排序",
+        "加载更多",
+        "打开UP主页",
+        "点赞",
+        "投币",
+        "收藏",
+        "一键三连",
+        "稍后再看",
+        "关注UP",
+        "发送弹幕",
+        "直播画质",
+        "播放顺序",
+    ];
+
+    fn bindings(&self) -> [&str; 38] {
+        [
+            &self.quit,
+            &self.confirm,
+            &self.back,
+            &self.refresh,
+            &self.nav_up,
+            &self.nav_down,
+            &self.nav_left,
+            &self.nav_right,
+            &self.nav_next_page,
+            &self.nav_prev_page,
+            &self.page_down,
+            &self.page_up,
+            &self.section_prev,
+            &self.section_next,
+            &self.tab_1,
+            &self.tab_2,
+            &self.tab_3,
+            &self.next_theme,
+            &self.play,
+            &self.open_settings,
+            &self.search_focus,
+            &self.comment,
+            &self.toggle_replies,
+            &self.up_prev,
+            &self.up_next,
+            &self.stop_playback,
+            &self.comment_sort,
+            &self.load_more,
+            &self.open_up,
+            &self.video_like,
+            &self.video_coin,
+            &self.video_favorite,
+            &self.video_triple,
+            &self.watch_later,
+            &self.follow,
+            &self.send_danmaku,
+            &self.live_quality,
+            &self.play_order,
         ]
     }
 
-    /// Update a keybinding by index (for settings page)
+    fn bindings_mut(&mut self) -> [&mut String; 38] {
+        [
+            &mut self.quit,
+            &mut self.confirm,
+            &mut self.back,
+            &mut self.refresh,
+            &mut self.nav_up,
+            &mut self.nav_down,
+            &mut self.nav_left,
+            &mut self.nav_right,
+            &mut self.nav_next_page,
+            &mut self.nav_prev_page,
+            &mut self.page_down,
+            &mut self.page_up,
+            &mut self.section_prev,
+            &mut self.section_next,
+            &mut self.tab_1,
+            &mut self.tab_2,
+            &mut self.tab_3,
+            &mut self.next_theme,
+            &mut self.play,
+            &mut self.open_settings,
+            &mut self.search_focus,
+            &mut self.comment,
+            &mut self.toggle_replies,
+            &mut self.up_prev,
+            &mut self.up_next,
+            &mut self.stop_playback,
+            &mut self.comment_sort,
+            &mut self.load_more,
+            &mut self.open_up,
+            &mut self.video_like,
+            &mut self.video_coin,
+            &mut self.video_favorite,
+            &mut self.video_triple,
+            &mut self.watch_later,
+            &mut self.follow,
+            &mut self.send_danmaku,
+            &mut self.live_quality,
+            &mut self.play_order,
+        ]
+    }
+
+    /// Update a keybinding by its index in `get_all_labels`.
     pub fn update_by_index(&mut self, index: usize, new_key: String) {
-        match index {
-            // Global actions
-            0 => self.quit = new_key,
-            1 => self.confirm = new_key,
-            2 => self.back = new_key,
-            3 => self.refresh = new_key,
-            // Navigation
-            4 => self.nav_up = new_key,
-            5 => self.nav_down = new_key,
-            6 => self.nav_left = new_key,
-            7 => self.nav_right = new_key,
-            8 => self.nav_next_page = new_key,
-            9 => self.nav_prev_page = new_key,
-            10 => self.page_down = new_key,
-            11 => self.page_up = new_key,
-            // Section/Tab
-            12 => self.section_prev = new_key,
-            13 => self.section_next = new_key,
-            14 => self.tab_1 = new_key,
-            15 => self.tab_2 = new_key,
-            16 => self.tab_3 = new_key,
-            // Actions
-            17 => self.next_theme = new_key,
-            18 => self.play = new_key,
-            19 => self.open_settings = new_key,
-            20 => self.search_focus = new_key,
-            // Comments
-            21 => self.comment = new_key,
-            22 => self.toggle_replies = new_key,
-            // Dynamic page
-            23 => self.up_prev = new_key,
-            24 => self.up_next = new_key,
-            // Playback
-            25 => self.stop_playback = new_key,
-            _ => {}
+        if let Some(binding) = self.bindings_mut().into_iter().nth(index) {
+            *binding = new_key;
         }
     }
 }
@@ -892,5 +1036,22 @@ mod config_tests {
         let mut keys = keys;
         keys.update_by_index(25, "X".to_string());
         assert_eq!(keys.stop_playback, "X");
+    }
+
+    #[test]
+    fn new_bindings_default_for_old_configs_and_follow_the_settings_order() {
+        let keys: Keybindings = serde_json::from_value(serde_json::json!({"quit": "Q"})).unwrap();
+        assert_eq!(keys.comment_sort, "o");
+        assert_eq!(keys.play_order, "s");
+        let labels = keys.get_all_labels();
+        assert_eq!(labels.len(), Keybindings::LABELS.len());
+        assert_eq!(labels[25], ("停止播放", "x"));
+        let last = labels.len() - 1;
+        assert_eq!(labels[last], ("播放顺序", "s"));
+        let mut keys = keys;
+        keys.update_by_index(last, "S".into());
+        assert_eq!(keys.play_order, "S");
+        keys.update_by_index(last + 1, "Z".into());
+        assert_eq!(keys.play_order, "S", "out-of-range index changes nothing");
     }
 }

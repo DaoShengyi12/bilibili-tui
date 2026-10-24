@@ -26,6 +26,22 @@ where
     })
 }
 
+/// Read an integer sent as a number, a numeric string or `null` (0).
+/// Pair with `#[serde(default)]`.
+pub fn lenient_i64<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Number(value) => value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|value| value as i64))
+            .unwrap_or_default(),
+        serde_json::Value::String(value) => value.trim().parse().unwrap_or_default(),
+        _ => 0,
+    })
+}
+
 /// Decode a list item by item, skipping entries that no longer match `T`.
 ///
 /// A missing or `null` list is empty. A list whose every entry fails is an

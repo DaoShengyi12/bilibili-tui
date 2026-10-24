@@ -91,6 +91,38 @@ pub struct LivePlayUrlInfo {
 pub struct LivePlayUrl {
     #[serde(default)]
     pub stream: Vec<LiveStream>,
+    /// Names of the quality ladder, for example 10000 = "原画".
+    #[serde(default, deserialize_with = "crate::api::serde_util::null_as_default")]
+    pub g_qn_desc: Vec<LiveQnDesc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiveQnDesc {
+    pub qn: i64,
+    #[serde(default)]
+    pub desc: String,
+}
+
+/// A live quality the user can pick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveQuality {
+    pub qn: i64,
+    pub label: String,
+}
+
+/// Fallback names of the live quality ladder.
+fn live_qn_label(qn: i64) -> String {
+    match qn {
+        30000 => "杜比",
+        20000 => "4K",
+        10000 => "原画",
+        400 => "蓝光",
+        250 => "超清",
+        150 => "高清",
+        80 => "流畅",
+        _ => return format!("qn {qn}"),
+    }
+    .to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,6 +173,35 @@ impl LivePlayInfoData {
                     .url_info
                     .iter()
                     .map(|url| format!("{}{}{}", url.host, codec.base_url, url.extra))
+            })
+            .collect()
+    }
+
+    /// Advertised qualities within `cap`, best first.
+    pub fn qualities_within(&self, cap: Option<i64>) -> Vec<LiveQuality> {
+        let Some(info) = &self.playurl_info else {
+            return Vec::new();
+        };
+        let mut qns: Vec<i64> = info
+            .playurl
+            .stream
+            .iter()
+            .flat_map(|stream| &stream.format)
+            .flat_map(|format| &format.codec)
+            .flat_map(|codec| codec.accept_qn.iter().copied())
+            .filter(|quality| cap.is_none_or(|cap| *quality <= cap))
+            .collect();
+        qns.sort_unstable_by(|a, b| b.cmp(a));
+        qns.dedup();
+        qns.into_iter()
+            .map(|qn| LiveQuality {
+                qn,
+                label: info
+                    .playurl
+                    .g_qn_desc
+                    .iter()
+                    .find(|desc| desc.qn == qn && !desc.desc.is_empty())
+                    .map_or_else(|| live_qn_label(qn), |desc| desc.desc.clone()),
             })
             .collect()
     }
@@ -243,6 +304,42 @@ fn codec_rank(codec: &str) -> u8 {
         "hevc" => 1,
         "av1" => 2,
         _ => 3,
+    }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+
+    #[test]
+    fn qualities_within_the_cap_are_listed_best_first_with_names() {
+        let data: LivePlayInfoData = serde_json::from_value(serde_json::json!({
+            "live_status": 1,
+            "playurl_info": {"playurl": {
+                "g_qn_desc": [{"qn": 10000, "desc": "原画"}, {"qn": 400, "desc": ""}],
+                "stream": [{"protocol_name": "http_stream", "format": [{"format_name": "flv", "codec": [
+                    {"codec_name": "avc", "current_qn": 10000, "accept_qn": [10000, 400, 250],
+                     "base_url": "/a?", "url_info": []},
+                    {"codec_name": "hevc", "current_qn": 10000, "accept_qn": [10000, 20000],
+                     "base_url": "/b?", "url_info": []}
+                ]}]}]
+            }}
+        }))
+        .unwrap();
+        let labels: Vec<(i64, String)> = data
+            .qualities_within(Some(10000))
+            .into_iter()
+            .map(|q| (q.qn, q.label))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                (10000, "原画".to_string()),
+                (400, "蓝光".to_string()),
+                (250, "超清".to_string())
+            ]
+        );
+        assert_eq!(data.qualities_within(None)[0].qn, 20000);
     }
 }
 

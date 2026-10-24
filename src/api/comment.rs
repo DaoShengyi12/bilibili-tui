@@ -1,6 +1,97 @@
 //! Comment API types and functions
 
+use super::serde_util::{lenient_flag, null_as_default};
 use serde::Deserialize;
+
+/// Comment order offered by `/x/v2/reply/wbi/main`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommentSort {
+    #[default]
+    Hot,
+    Time,
+}
+
+impl CommentSort {
+    /// The endpoint's `mode`: 3 sorts by popularity, 2 by time.
+    pub const fn mode(self) -> i32 {
+        match self {
+            Self::Hot => 3,
+            Self::Time => 2,
+        }
+    }
+
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Hot => Self::Time,
+            Self::Time => Self::Hot,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Hot => "按热度",
+            Self::Time => "按时间",
+        }
+    }
+}
+
+/// `data` of `/x/v2/reply/wbi/main`, which pages by cursor instead of number.
+#[derive(Debug, Default, Deserialize)]
+pub struct MainCommentData {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub cursor: MainCommentCursor,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub replies: Vec<CommentItem>,
+    /// Pinned comments, only sent with the first page.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub top_replies: Vec<CommentItem>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct MainCommentCursor {
+    #[serde(default, deserialize_with = "lenient_flag")]
+    pub is_end: bool,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub pagination_reply: PaginationReply,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PaginationReply {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub next_offset: String,
+}
+
+/// One page of comments and the cursor for the next page, if any.
+#[derive(Debug, Clone, Default)]
+pub struct CommentBatch {
+    pub comments: Vec<CommentItem>,
+    pub next_offset: Option<String>,
+}
+
+impl MainCommentData {
+    /// Pinned comments come first; a pinned comment repeated in `replies`
+    /// is shown once.
+    pub fn into_batch(self) -> CommentBatch {
+        let mut comments = self.top_replies;
+        for reply in self.replies {
+            if !comments.iter().any(|existing| existing.rpid == reply.rpid) {
+                comments.push(reply);
+            }
+        }
+        let next_offset = (!self.cursor.is_end)
+            .then_some(self.cursor.pagination_reply.next_offset)
+            .filter(|offset| !offset.is_empty());
+        CommentBatch {
+            comments,
+            next_offset,
+        }
+    }
+}
+
+/// The `pagination_str` parameter for a page after `offset`, or the first page.
+pub fn pagination_str(offset: Option<&str>) -> String {
+    serde_json::json!({ "offset": offset.unwrap_or_default() }).to_string()
+}
 
 /// Comment list response
 #[derive(Debug, Deserialize)]
@@ -148,4 +239,59 @@ pub struct AddCommentResponse {
     pub root: Option<i64>,
     pub parent: Option<i64>,
     pub reply: Option<CommentItem>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn comment(rpid: i64) -> serde_json::Value {
+        serde_json::json!({"rpid": rpid, "oid": 1, "mid": 2, "parent": 0})
+    }
+
+    #[test]
+    fn main_comments_put_pinned_first_without_duplicates() {
+        let data: MainCommentData = serde_json::from_value(serde_json::json!({
+            "cursor": {"is_end": false, "pagination_reply": {"next_offset": "abc"}, "all_count": "12"},
+            "replies": [comment(2), comment(3)],
+            "top_replies": [comment(3)],
+        }))
+        .unwrap();
+        let batch = data.into_batch();
+        let ids: Vec<i64> = batch.comments.iter().map(|c| c.rpid).collect();
+        assert_eq!(ids, [3, 2]);
+        assert_eq!(batch.next_offset.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn last_or_empty_main_comment_page_has_no_next_offset() {
+        let end: MainCommentData = serde_json::from_value(serde_json::json!({
+            "cursor": {"is_end": true, "pagination_reply": {"next_offset": "abc"}},
+            "replies": null,
+            "top_replies": null,
+        }))
+        .unwrap();
+        let batch = end.into_batch();
+        assert!(batch.comments.is_empty() && batch.next_offset.is_none());
+
+        let no_cursor: MainCommentData =
+            serde_json::from_value(serde_json::json!({"cursor": null})).unwrap();
+        assert!(no_cursor.into_batch().next_offset.is_none());
+    }
+
+    #[test]
+    fn pagination_str_escapes_the_offset_as_json() {
+        assert_eq!(pagination_str(None), r#"{"offset":""}"#);
+        assert_eq!(
+            pagination_str(Some(r#"{"type":1}"#)),
+            r#"{"offset":"{\"type\":1}"}"#
+        );
+    }
+
+    #[test]
+    fn sort_modes_match_the_endpoint() {
+        assert_eq!(CommentSort::Hot.mode(), 3);
+        assert_eq!(CommentSort::Time.mode(), 2);
+        assert_eq!(CommentSort::Hot.toggled(), CommentSort::Time);
+    }
 }

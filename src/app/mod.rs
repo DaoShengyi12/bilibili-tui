@@ -53,6 +53,13 @@ pub struct App {
     /// One-line notice drawn over the bottom row until the next key press,
     /// for failures that have no page of their own (config load/save).
     pub status_notice: Option<String>,
+    /// Shown as a dialog when the saved login stopped working; Enter opens
+    /// the login page.
+    pub login_prompt: Option<String>,
+    /// A cookie refresh is running; further `-101`s wait for it.
+    session_refresh_in_flight: bool,
+    /// A forced refresh was tried since the last successful one.
+    session_refresh_forced: bool,
     /// Set once the network worker stops accepting commands or sending events.
     network_worker_lost: std::cell::Cell<bool>,
     pub playback: PlaybackState,
@@ -68,6 +75,8 @@ pub struct App {
     playback_event_rx: mpsc::Receiver<PlaybackEvent>,
     auto_return_after_playback: Option<(u64, String)>,
     next_playback_session_id: u64,
+    /// Position of the running single-video player, for sending danmaku.
+    playback_position: crate::infrastructure::media::SharedPosition,
     /// Stops the player of the current session.
     player_stop: Option<tokio_util::sync::CancellationToken>,
     /// Actions produced while handling network events, which cannot await;
@@ -140,6 +149,9 @@ impl App {
             pending_home_notice: used_fallback
                 .then_some("⚠ 旧主题配置无效，请前往设置页重新选择主题".to_string()),
             status_notice: config_notice,
+            login_prompt: None,
+            session_refresh_in_flight: false,
+            session_refresh_forced: false,
             network_worker_lost: std::cell::Cell::new(false),
             playback: PlaybackState::default(),
             live_danmaku_hub: None,
@@ -150,6 +162,7 @@ impl App {
             playback_event_rx,
             auto_return_after_playback: None,
             next_playback_session_id: 1,
+            playback_position: Default::default(),
             player_stop: None,
             deferred_actions: Vec::new(),
             cached_home: None,

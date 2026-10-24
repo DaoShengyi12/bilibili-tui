@@ -91,6 +91,7 @@ impl App {
             network::NetworkEvent::SearchLoaded {
                 req_id,
                 keyword,
+                kind,
                 page,
                 results,
                 total,
@@ -101,7 +102,7 @@ impl App {
                 let Some(search_page) = self.search_page_mut() else {
                     return;
                 };
-                if search_page.query != keyword {
+                if search_page.query != keyword || search_page.kind != kind {
                     return;
                 }
                 if page <= 1 {
@@ -111,6 +112,18 @@ impl App {
                     search_page.page = page;
                     search_page.total_results = total;
                     search_page.append_results(results);
+                }
+            }
+            network::NetworkEvent::SearchSuggestionsLoaded {
+                req_id,
+                term,
+                suggestions,
+            } => {
+                if !self.is_latest_request("search_suggest", req_id) {
+                    return;
+                }
+                if let Some(page) = self.search_page_mut() {
+                    page.apply_suggestions(&term, suggestions);
                 }
             }
             network::NetworkEvent::DynamicLoaded {
@@ -208,8 +221,8 @@ impl App {
                 req_id,
                 bvid,
                 video_info,
+                relation,
                 comments,
-                has_more_comments,
                 mut related_videos,
             } => {
                 if self.config.minimal_mode {
@@ -220,9 +233,9 @@ impl App {
                 }
                 if let Some(page) = find_page!(self, VideoDetail(page) if page.bvid == bvid) {
                     page.video_info = Some(video_info);
-                    page.comments = comments;
-                    page.comment_page = 1;
-                    page.has_more_comments = has_more_comments;
+                    page.relation = relation;
+                    page.comment_sort = crate::api::comment::CommentSort::Hot;
+                    page.set_comments(comments);
                     page.related_videos = related_videos.clone();
                     page.related_card_grid.clear();
                     for video in &related_videos {
@@ -394,7 +407,6 @@ impl App {
                 dynamic_id,
                 dynamic_item,
                 comments,
-                has_more_comments,
                 image_urls,
             } => {
                 if !self.is_latest_request("dynamic_detail", req_id) {
@@ -404,9 +416,8 @@ impl App {
                     find_page!(self, DynamicDetail(page) if page.dynamic_id == dynamic_id)
                 {
                     page.dynamic_item = Some(dynamic_item);
-                    page.comments = comments;
-                    page.comment_page = 1;
-                    page.has_more_comments = has_more_comments;
+                    page.comment_sort = crate::api::comment::CommentSort::Hot;
+                    page.set_comments(comments);
                     page.image_urls = image_urls;
                     page.image_protocols = (0..page.image_urls.len()).map(|_| None).collect();
                     page.loading = false;
@@ -438,21 +449,23 @@ impl App {
             network::NetworkEvent::VideoCommentsLoaded {
                 req_id,
                 aid,
-                page,
-                replies,
+                sort,
+                append,
+                batch,
             } => {
                 if !self.is_latest_request("video_comments", req_id) {
                     return;
                 }
                 if let Some(detail) = find_page!(self, VideoDetail(detail) if detail.aid == aid) {
-                    detail.apply_more_comments(page, replies);
+                    detail.apply_comment_batch(sort, append, batch);
                 }
             }
             network::NetworkEvent::DynamicCommentsLoaded {
                 req_id,
                 dynamic_id,
-                page,
-                replies,
+                sort,
+                append,
+                batch,
             } => {
                 if !self.is_latest_request("dynamic_comments", req_id) {
                     return;
@@ -460,7 +473,7 @@ impl App {
                 if let Some(detail) =
                     find_page!(self, DynamicDetail(detail) if detail.dynamic_id == dynamic_id)
                 {
-                    detail.apply_more_comments(page, replies);
+                    detail.apply_comment_batch(sort, append, batch);
                 }
             }
             network::NetworkEvent::CommentRepliesLoaded {
@@ -543,16 +556,116 @@ impl App {
                 req_id,
                 target,
                 error,
+                login_expired,
             } => {
+                if login_expired {
+                    self.handle_login_expired();
+                }
                 if self.is_latest_request(target, req_id) {
                     self.apply_request_failure(target, &error);
                 }
+            }
+            network::NetworkEvent::LiveQualitiesLoaded {
+                req_id,
+                room_id,
+                qualities,
+            } => {
+                if !self.is_latest_request("live_qualities", req_id) {
+                    return;
+                }
+                if let Some(page) = find_page!(self, LiveDetail(page) if page.room_id() == room_id)
+                {
+                    page.apply_qualities(qualities);
+                }
+            }
+            network::NetworkEvent::VideoActionDone { request, result } => {
+                if let Some(page) = find_page!(self, VideoDetail(page) if page.aid == request.aid())
+                {
+                    page.apply_video_action(request, result);
+                }
+            }
+            network::NetworkEvent::LiveDanmakuSent { room_id } => {
+                if let Page::LiveDetail(page) = &mut self.current_page
+                    && page.room_id() == room_id
+                {
+                    page.apply_danmaku_sent();
+                }
+            }
+            network::NetworkEvent::LiveDanmakuSendFailed {
+                room_id,
+                message,
+                error,
+            } => {
+                if let Page::LiveDetail(page) = &mut self.current_page
+                    && page.room_id() == room_id
+                {
+                    page.restore_danmaku_draft(message, format!("弹幕发送失败：{error}"));
+                }
+            }
+            network::NetworkEvent::SessionRefreshed { credentials } => {
+                self.apply_refreshed_session(credentials);
+            }
+            network::NetworkEvent::SessionRefreshFailed { error, forced } => {
+                self.session_refresh_in_flight = false;
+                if forced && self.credentials.is_some() {
+                    self.login_prompt = Some(format!("登录已失效：{error}"));
+                }
+            }
+            network::NetworkEvent::ServerLogoutFailed { error } => {
+                self.status_notice = Some(format!("⚠ 已在本地退出，但服务端注销失败：{error}"));
             }
             network::NetworkEvent::RequestCancelled { req_id, target } => {
                 if self.is_latest_request(target, req_id) {
                     self.apply_request_failure(target, REQUEST_CANCELLED);
                 }
             }
+        }
+    }
+
+    /// A request answered `-101`. Try the refresh token once; when that is
+    /// gone or already failed, ask the user to log in again.
+    fn handle_login_expired(&mut self) {
+        let Some(credentials) = self.credentials.clone() else {
+            return;
+        };
+        if self.session_refresh_in_flight || self.login_prompt.is_some() {
+            return;
+        }
+        if credentials.refresh_token.is_none() || self.session_refresh_forced {
+            self.login_prompt = Some("登录已失效".to_string());
+            return;
+        }
+        self.session_refresh_forced = true;
+        self.session_refresh_in_flight = true;
+        self.send_network_command(network::NetworkCommand::RefreshSession {
+            credentials,
+            force: true,
+        });
+    }
+
+    fn apply_refreshed_session(&mut self, credentials: crate::storage::Credentials) {
+        self.session_refresh_in_flight = false;
+        // A logout or another login while the refresh ran wins.
+        let same_account = self
+            .credentials
+            .as_ref()
+            .is_some_and(|current| current.dede_user_id == credentials.dede_user_id);
+        if !same_account {
+            if let Some(current) = &self.credentials {
+                self.api_client.set_credentials(current);
+            } else {
+                self.api_client.clear_credentials();
+            }
+            return;
+        }
+        self.report_save_result(
+            "保存登录信息",
+            crate::infrastructure::persistence::save_credentials(&credentials),
+        );
+        self.credentials = Some(credentials);
+        self.session_refresh_forced = false;
+        if self.status_notice.is_none() {
+            self.status_notice = Some("登录状态已自动续期".to_string());
         }
     }
 
@@ -598,16 +711,13 @@ impl App {
     fn reload_comments_after_post(&mut self, oid: i64) {
         match &self.current_page {
             Page::VideoDetail(page) if page.aid == oid => {
-                let (bvid, aid) = (page.bvid.clone(), page.aid);
-                // The reload replaces the comment list; drop any page in flight.
-                self.next_request_id("video_comments");
-                let req_id = self.next_request_id("video_detail");
-                self.send_network_command(network::NetworkCommand::LoadVideoDetail {
-                    req_id,
-                    bvid,
-                    aid,
-                    include_related: !self.config.minimal_mode,
-                });
+                // The first page in the current sort replaces the list and
+                // supersedes any page in flight.
+                let (aid, sort) = (page.aid, page.comment_sort);
+                if let Page::VideoDetail(page) = &mut self.current_page {
+                    page.loading_more_comments = true;
+                }
+                self.request_video_comments(aid, sort, None);
             }
             Page::DynamicDetail(page)
                 if page
@@ -617,11 +727,20 @@ impl App {
                     == Some(oid) =>
             {
                 let dynamic_id = page.dynamic_id.clone();
-                let req_id = self.next_request_id("dynamic_detail");
-                self.send_network_command(network::NetworkCommand::LoadDynamicDetail {
-                    req_id,
-                    dynamic_id,
+                let request = page.comment_target().map(|(oid, comment_type)| {
+                    crate::presentation::tui::CommentRequest {
+                        oid,
+                        comment_type,
+                        sort: page.comment_sort,
+                        offset: None,
+                    }
                 });
+                if let Some(request) = request {
+                    if let Page::DynamicDetail(page) = &mut self.current_page {
+                        page.loading_more_comments = true;
+                    }
+                    self.request_dynamic_comments(dynamic_id, request);
+                }
             }
             _ => {}
         }
@@ -749,6 +868,11 @@ impl App {
                     page.apply_room_info_error(format!("加载房间信息失败: {error}"));
                 }
             }
+            "live_qualities" => {
+                if let Some(page) = find_page!(self, LiveDetail(page)) {
+                    page.apply_qualities_error(format!("获取画质失败: {error}"));
+                }
+            }
             "live_danmaku" => {
                 if let Some(page) = find_page!(self, LiveDetail(page)) {
                     page.set_ws_error(format!("WS连接失败: {error}"));
@@ -831,6 +955,7 @@ mod tests {
             req_id,
             target: "history_more",
             error: "timeout".into(),
+            login_expired: false,
         });
         app.handle_action(AppAction::BackToList).await;
 
@@ -1126,6 +1251,7 @@ mod tests {
             req_id,
             target: "live_detail",
             error: "timeout".into(),
+            login_expired: false,
         });
         assert!(matches!(&app.current_page, Page::LiveDetail(page) if !page.is_loading()));
     }
@@ -1134,18 +1260,23 @@ mod tests {
     async fn more_comments_load_in_the_background() {
         let (mut app, rx) = app();
         let mut page = crate::presentation::tui::VideoDetailPage::new("BV1test".into(), 7);
-        page.has_more_comments = true;
+        page.set_comments(crate::api::comment::CommentBatch {
+            comments: Vec::new(),
+            next_offset: Some("next".into()),
+        });
         app.current_page = Page::VideoDetail(Box::new(page));
 
         app.handle_action(AppAction::LoadMoreComments).await;
         let Ok(NetworkCommand::LoadVideoComments {
             req_id,
             aid: 7,
-            page: 2,
+            offset: Some(offset),
+            ..
         }) = rx.try_recv()
         else {
             panic!("comments were not requested");
         };
+        assert_eq!(offset, "next");
         assert!(matches!(&app.current_page, Page::VideoDetail(page) if page.loading_more_comments));
 
         app.handle_network_event(NetworkEvent::RequestCancelled {
@@ -1221,5 +1352,153 @@ mod tests {
             Ok(NetworkCommand::LoadLiveInit { .. })
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    fn expired(req_id: u64) -> NetworkEvent {
+        NetworkEvent::RequestFailed {
+            req_id,
+            target: "history_init",
+            error: "API error (-101): 账号未登录".into(),
+            login_expired: true,
+        }
+    }
+
+    fn with_refresh_token(app: &mut App) {
+        if let Some(credentials) = app.credentials.as_mut() {
+            credentials.refresh_token = Some("token".into());
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_login_tries_one_forced_refresh_before_prompting() {
+        let (mut app, rx) = app();
+        with_refresh_token(&mut app);
+
+        app.handle_network_event(expired(1));
+        app.handle_network_event(expired(2));
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NetworkCommand::RefreshSession { force: true, .. })
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "a refresh in flight is not repeated"
+        );
+        assert!(app.login_prompt.is_none());
+
+        app.handle_network_event(NetworkEvent::SessionRefreshFailed {
+            error: "HTTP 404".into(),
+            forced: true,
+        });
+        assert!(app.login_prompt.as_deref().unwrap().contains("HTTP 404"));
+    }
+
+    #[tokio::test]
+    async fn expired_login_without_refresh_token_prompts_at_once() {
+        let (mut app, rx) = app();
+        app.handle_network_event(expired(1));
+        assert!(app.login_prompt.is_some());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn guests_are_not_asked_to_log_in_again() {
+        let (mut app, _rx) = app();
+        app.credentials = None;
+        app.handle_network_event(expired(1));
+        assert!(app.login_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn unforced_refresh_failure_does_not_prompt() {
+        let (mut app, _rx) = app();
+        app.handle_network_event(NetworkEvent::SessionRefreshFailed {
+            error: "timeout".into(),
+            forced: false,
+        });
+        assert!(app.login_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_for_a_replaced_account_is_dropped() {
+        let (mut app, _rx) = app();
+        let mut other = app.credentials.clone().unwrap();
+        other.dede_user_id = "2".into();
+        other.sessdata = "other".into();
+
+        app.handle_network_event(NetworkEvent::SessionRefreshed { credentials: other });
+
+        assert_eq!(app.credentials.as_ref().unwrap().dede_user_id, "1");
+        assert!(app.status_notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn posted_comment_reloads_the_first_page_in_the_current_sort() {
+        let (mut app, rx) = app();
+        let mut page = crate::presentation::tui::VideoDetailPage::new("BV1test".into(), 9);
+        page.loading = false;
+        page.comment_sort = crate::api::comment::CommentSort::Time;
+        app.current_page = Page::VideoDetail(Box::new(page));
+
+        app.handle_network_event(NetworkEvent::CommentPosted { oid: 9 });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NetworkCommand::LoadVideoComments {
+                aid: 9,
+                sort: crate::api::comment::CommentSort::Time,
+                offset: None,
+                ..
+            })
+        ));
+        assert!(matches!(&app.current_page, Page::VideoDetail(page) if page.loading_more_comments));
+    }
+
+    #[tokio::test]
+    async fn sent_danmaku_takes_the_position_of_the_playing_part() {
+        let (mut app, rx) = app();
+        let mut page = crate::presentation::tui::VideoDetailPage::new("BV1test".into(), 1);
+        page.loading = false;
+        app.current_page = Page::VideoDetail(Box::new(page));
+        *app.playback_position.lock().unwrap() = Some((11, 65.5));
+
+        app.handle_action(AppAction::VideoAction(
+            crate::application::VideoActionRequest::SendDanmaku {
+                aid: 1,
+                cid: 11,
+                message: "hi".into(),
+                progress_ms: 0,
+            },
+        ))
+        .await;
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NetworkCommand::VideoAction {
+                request: crate::application::VideoActionRequest::SendDanmaku {
+                    progress_ms: 65_500,
+                    ..
+                },
+                user_mid: 1,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn video_actions_need_login() {
+        let (mut app, rx) = app();
+        app.credentials = None;
+        let mut page = crate::presentation::tui::VideoDetailPage::new("BV1test".into(), 1);
+        page.loading = false;
+        app.current_page = Page::VideoDetail(Box::new(page));
+        app.handle_action(AppAction::VideoAction(
+            crate::application::VideoActionRequest::Coin { aid: 1 },
+        ))
+        .await;
+        assert!(rx.try_recv().is_err());
+        assert!(
+            matches!(&app.current_page, Page::VideoDetail(page) if page.notice.is_some() && !page.action_pending)
+        );
     }
 }

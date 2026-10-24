@@ -37,6 +37,16 @@ impl DynamicTab {
         [DynamicTab::All, DynamicTab::Videos, DynamicTab::Images]
     }
 
+    pub fn includes(&self, item: &DynamicItem) -> bool {
+        use crate::api::dynamic::DynamicKind;
+        match (self, item.kind()) {
+            (_, DynamicKind::Other) => false,
+            (DynamicTab::All, _) => true,
+            (DynamicTab::Videos, kind) => kind == DynamicKind::Video,
+            (DynamicTab::Images, kind) => matches!(kind, DynamicKind::Draw | DynamicKind::Opus),
+        }
+    }
+
     /// Get the API feed type parameter for this tab
     pub fn get_feed_type(&self) -> Option<&str> {
         match self {
@@ -152,83 +162,7 @@ impl DynamicPage {
     pub fn set_feed(&mut self, items: Vec<DynamicItem>, offset: Option<String>, has_more: bool) {
         self.grid.clear();
         self.dynamic_items.clear();
-
-        // Process items based on current tab filter
-        for item in items.into_iter() {
-            let should_include = match self.current_tab {
-                DynamicTab::All => item.is_video() || item.is_draw() || item.is_opus(),
-                DynamicTab::Videos => item.is_video(),
-                DynamicTab::Images => item.is_draw() || item.is_opus(),
-            };
-
-            if !should_include {
-                continue;
-            }
-
-            // Store the item
-            self.dynamic_items.push(item.clone());
-
-            // Handle video dynamics
-            if item.is_video() {
-                if let Some(bvid) = item.video_bvid() {
-                    let card = VideoCard::new(
-                        Some(bvid.to_string()),
-                        None,
-                        item.video_title().unwrap_or("无标题").to_string(),
-                        item.author_name().to_string(),
-                        format!("▶ {}", item.video_play()),
-                        item.video_duration().to_string(),
-                        item.video_cover().map(|s| s.to_string()),
-                    );
-                    self.grid.add_card(card);
-                }
-            }
-            // Handle image dynamics (带图动态)
-            else if item.is_draw() {
-                let images = item.draw_images();
-                let image_url = images.first().map(|s| s.to_string());
-                let desc = item.desc_text().unwrap_or("图片动态");
-                let image_count = if images.len() > 1 {
-                    format!(" [{}P]", images.len())
-                } else {
-                    String::new()
-                };
-
-                let card = VideoCard::new(
-                    None, // No bvid for images
-                    None,
-                    format!("{}{}", desc, image_count),
-                    item.author_name().to_string(),
-                    "📷 图片动态".to_string(),
-                    "".to_string(),
-                    image_url,
-                );
-                self.grid.add_card(card);
-            }
-            // Handle text/opus dynamics (图文动态)
-            else if item.is_opus() {
-                let text = item.opus_text().unwrap_or("图文动态");
-                let images = item.opus_images();
-                let image_url = images.first().map(|s| s.to_string());
-                let image_count = if !images.is_empty() {
-                    format!(" [{}P]", images.len())
-                } else {
-                    String::new()
-                };
-
-                let card = VideoCard::new(
-                    None,
-                    None,
-                    format!("{}{}", text, image_count),
-                    item.author_name().to_string(),
-                    "📝 图文".to_string(),
-                    "".to_string(),
-                    image_url,
-                );
-                self.grid.add_card(card);
-            }
-        }
-
+        self.add_items(items);
         // Save offset for current tab
         self.tab_offsets.insert(self.current_tab, offset.clone());
         self.offset = offset;
@@ -237,87 +171,27 @@ impl DynamicPage {
     }
 
     pub fn append_feed(&mut self, items: Vec<DynamicItem>, offset: Option<String>, has_more: bool) {
-        // Process items based on current tab filter
-        for item in items.into_iter() {
-            let should_include = match self.current_tab {
-                DynamicTab::All => item.is_video() || item.is_draw() || item.is_opus(),
-                DynamicTab::Videos => item.is_video(),
-                DynamicTab::Images => item.is_draw() || item.is_opus(),
-            };
-
-            if !should_include {
-                continue;
-            }
-
-            // Store the item
-            self.dynamic_items.push(item.clone());
-
-            // Handle video dynamics
-            if item.is_video() {
-                if let Some(bvid) = item.video_bvid() {
-                    let card = VideoCard::new(
-                        Some(bvid.to_string()),
-                        None,
-                        item.video_title().unwrap_or("无标题").to_string(),
-                        item.author_name().to_string(),
-                        format!("▶ {}", item.video_play()),
-                        item.video_duration().to_string(),
-                        item.video_cover().map(|s| s.to_string()),
-                    );
-                    self.grid.add_card(card);
-                }
-            }
-            // Handle image dynamics
-            else if item.is_draw() {
-                let images = item.draw_images();
-                let image_url = images.first().map(|s| s.to_string());
-                let desc = item.desc_text().unwrap_or("图片动态");
-                let image_count = if images.len() > 1 {
-                    format!(" [{}P]", images.len())
-                } else {
-                    String::new()
-                };
-
-                let card = VideoCard::new(
-                    None,
-                    None,
-                    format!("{}{}", desc, image_count),
-                    item.author_name().to_string(),
-                    "📷 图片动态".to_string(),
-                    "".to_string(),
-                    image_url,
-                );
-                self.grid.add_card(card);
-            }
-            // Handle text/opus dynamics
-            else if item.is_opus() {
-                let text = item.opus_text().unwrap_or("图文动态");
-                let images = item.opus_images();
-                let image_url = images.first().map(|s| s.to_string());
-                let image_count = if !images.is_empty() {
-                    format!(" [{}P]", images.len())
-                } else {
-                    String::new()
-                };
-
-                let card = VideoCard::new(
-                    None,
-                    None,
-                    format!("{}{}", text, image_count),
-                    item.author_name().to_string(),
-                    "📝 图文".to_string(),
-                    "".to_string(),
-                    image_url,
-                );
-                self.grid.add_card(card);
-            }
-        }
-
+        self.add_items(items);
         // Save offset for current tab
         self.tab_offsets.insert(self.current_tab, offset.clone());
         self.offset = offset;
         self.has_more = has_more;
         self.loading_more = false;
+    }
+
+    /// Keep the dynamics the current tab shows, one card per item so that
+    /// card and item indices stay aligned.
+    fn add_items(&mut self, items: Vec<DynamicItem>) {
+        for item in items {
+            if !self.current_tab.includes(&item) {
+                continue;
+            }
+            let Some(card) = dynamic_card(&item) else {
+                continue;
+            };
+            self.grid.add_card(card);
+            self.dynamic_items.push(item);
+        }
     }
 
     pub fn set_error(&mut self, msg: String) {
@@ -338,6 +212,121 @@ impl DynamicPage {
     pub fn selected_dynamic_item(&self) -> Option<&DynamicItem> {
         let selected_index = self.grid.selected_index;
         self.dynamic_items.get(selected_index)
+    }
+}
+
+/// The card for a dynamic, or `None` for one that cannot be shown.
+fn dynamic_card(item: &DynamicItem) -> Option<VideoCard> {
+    use crate::api::dynamic::DynamicKind;
+    let author = item.author_name().to_string();
+    let card = match item.kind() {
+        DynamicKind::Video => VideoCard::new(
+            Some(item.video_bvid()?.to_string()),
+            None,
+            item.summary(),
+            author,
+            format!("▶ {}", item.video_play()),
+            item.video_duration().to_string(),
+            item.cover(),
+        ),
+        DynamicKind::Draw | DynamicKind::Opus => {
+            let images = if item.kind() == DynamicKind::Draw {
+                item.draw_images().len()
+            } else {
+                item.opus_images().len()
+            };
+            let count = if images > 1 {
+                format!(" [{images}P]")
+            } else {
+                String::new()
+            };
+            let label = if item.kind() == DynamicKind::Draw {
+                "📷 图片动态"
+            } else {
+                "📝 图文"
+            };
+            VideoCard::new(
+                None,
+                None,
+                format!("{}{count}", item.summary()),
+                author,
+                label.to_string(),
+                String::new(),
+                item.cover(),
+            )
+        }
+        DynamicKind::Article => VideoCard::new(
+            None,
+            None,
+            item.summary(),
+            author,
+            "📰 专栏".to_string(),
+            String::new(),
+            item.cover(),
+        ),
+        DynamicKind::Live => {
+            let live = item.live()?;
+            VideoCard::new(
+                None,
+                None,
+                live.title,
+                author,
+                if live.is_live {
+                    "🔴 直播中"
+                } else {
+                    "📺 直播"
+                }
+                .to_string(),
+                live.watched.unwrap_or_default(),
+                live.cover,
+            )
+        }
+        DynamicKind::Forward => {
+            let orig = item.forwarded();
+            let orig_text = orig.map_or_else(
+                || "原动态已删除".to_string(),
+                |orig| format!("@{}: {}", orig.author_name(), orig.summary()),
+            );
+            let reason = item.desc_text().unwrap_or("转发动态");
+            VideoCard::new(
+                None,
+                None,
+                format!("{reason} // {orig_text}"),
+                author,
+                "↪ 转发".to_string(),
+                String::new(),
+                item.cover(),
+            )
+        }
+        DynamicKind::Word => VideoCard::new(
+            None,
+            None,
+            item.summary(),
+            author,
+            "💬 动态".to_string(),
+            String::new(),
+            None,
+        ),
+        DynamicKind::Other => return None,
+    };
+    Some(card)
+}
+
+/// What opening a dynamic from the list does: videos, articles and live
+/// rooms open directly; everything else opens the dynamic's detail page.
+pub fn open_dynamic_action(item: &DynamicItem) -> Option<AppAction> {
+    use crate::api::dynamic::DynamicKind;
+    match item.kind() {
+        DynamicKind::Video => Some(AppAction::OpenVideoDetail(
+            item.video_bvid()?.to_string(),
+            0,
+        )),
+        DynamicKind::Article => Some(AppAction::OpenArticle(item.article()?.0)),
+        DynamicKind::Live => Some(AppAction::OpenLiveDetail(item.live()?.room_id)),
+        DynamicKind::Draw | DynamicKind::Opus | DynamicKind::Forward | DynamicKind::Word => {
+            Some(AppAction::OpenDynamicDetail(item.id_str.clone()?))
+        }
+        DynamicKind::Other => None,
     }
 }
 
@@ -472,15 +461,28 @@ impl Component for DynamicPage {
             Paragraph::new(shortcut_footer(
                 theme,
                 [
-                    ("↑/↓".into(), "选择动态".into(), theme.fg_accent),
+                    (
+                        format!("{}/{}", keys.nav_up, keys.nav_down),
+                        "选择动态".into(),
+                        theme.fg_accent,
+                    ),
                     (
                         format!("{}/{}", keys.page_up, keys.page_down),
                         "翻页".into(),
                         theme.fg_accent,
                     ),
-                    ("←/→".into(), "切换面板".into(), theme.fg_accent),
-                    (keys.tab_1.clone(), "切标签".into(), theme.info),
+                    (
+                        format!("{}/{}", keys.nav_left, keys.nav_right),
+                        "切换面板".into(),
+                        theme.fg_accent,
+                    ),
+                    (
+                        format!("{}/{}/{}", keys.tab_1, keys.tab_2, keys.tab_3),
+                        "切标签".into(),
+                        theme.info,
+                    ),
                     (keys.confirm.clone(), "详情".into(), theme.success),
+                    (keys.open_up.clone(), "UP主".into(), theme.info),
                     (keys.refresh.clone(), "刷新".into(), theme.info),
                 ],
             ))
@@ -574,7 +576,7 @@ impl Component for DynamicPage {
         }
 
         // Open selected card
-        if key == KeyCode::Char('u')
+        if keys.matches_open_up(key)
             && let Some(mid) = self
                 .selected_dynamic_item()
                 .and_then(|item| item.author_mid())
@@ -582,20 +584,11 @@ impl Component for DynamicPage {
             return Some(AppAction::OpenUpPage(mid));
         }
         if keys.matches_confirm(key) {
-            if let Some(card) = self.grid.selected_card() {
-                // Video card - open video detail
-                if let Some(ref bvid) = card.bvid {
-                    return Some(AppAction::OpenVideoDetail(bvid.clone(), 0));
-                }
-                // Non-video card (draw/opus) - open dynamic detail
-                else if let Some(item) = self.selected_dynamic_item()
-                    && (item.is_draw() || item.is_opus())
-                    && let Some(id) = &item.id_str
-                {
-                    return Some(AppAction::OpenDynamicDetail(id.clone()));
-                }
-            }
-            return Some(AppAction::None);
+            return Some(
+                self.selected_dynamic_item()
+                    .and_then(open_dynamic_action)
+                    .unwrap_or(AppAction::None),
+            );
         }
 
         // Refresh
@@ -672,15 +665,12 @@ impl Component for DynamicPage {
                     if is_double_click {
                         self.last_click_time = None;
                         self.last_click_index = None;
-                        if let Some(card) = self.grid.cards.get(click_idx) {
-                            if let Some(ref bvid) = card.bvid {
-                                return Some(AppAction::OpenVideoDetail(bvid.clone(), 0));
-                            } else if let Some(item) = self.dynamic_items.get(click_idx)
-                                && (item.is_draw() || item.is_opus())
-                                && let Some(id) = &item.id_str
-                            {
-                                return Some(AppAction::OpenDynamicDetail(id.clone()));
-                            }
+                        if let Some(action) = self
+                            .dynamic_items
+                            .get(click_idx)
+                            .and_then(open_dynamic_action)
+                        {
+                            return Some(action);
                         }
                     } else {
                         self.grid.selected_index = click_idx;

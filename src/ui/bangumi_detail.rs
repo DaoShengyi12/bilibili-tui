@@ -377,6 +377,7 @@ impl Component for BangumiDetailPage {
                     theme.fg_accent,
                 ),
                 (keys.confirm.clone(), "播放".into(), theme.success),
+                (keys.stop_playback.clone(), "停止播放".into(), theme.warning),
                 (keys.back.clone(), "返回".into(), theme.info),
             ],
         ))

@@ -22,7 +22,7 @@ pub use article_detail::ArticleDetailPage;
 pub use bangumi::BangumiPage;
 pub use bangumi_detail::BangumiDetailPage;
 pub use dynamic::{DynamicPage, DynamicTab};
-pub use dynamic_detail::DynamicDetailPage;
+pub use dynamic_detail::{CommentRequest, DynamicDetailPage};
 pub use favorites::FavoritesPage;
 pub use history::HistoryPage;
 pub use home::HomePage;

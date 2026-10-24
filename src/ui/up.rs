@@ -317,8 +317,8 @@ impl Component for UpPage {
                 "翻页".into(),
                 theme.fg_accent,
             ),
-            ("o".into(), "最新/热门".into(), theme.info),
-            ("s".into(), "顺序/倒序/随机".into(), theme.info),
+            (keys.comment_sort.clone(), "排序".into(), theme.info),
+            (keys.play_order.clone(), "顺序/倒序/随机".into(), theme.info),
             (keys.play.clone(), "连播".into(), theme.success),
             (keys.confirm.clone(), "打开".into(), theme.success),
             (keys.back.clone(), "返回".into(), theme.info),
@@ -377,7 +377,7 @@ impl Component for UpPage {
         // Fixed shortcuts give way to keys the user bound for navigation.
         match key {
             _ if keys.matches_list_navigation(key) => {}
-            KeyCode::Char('o') if self.tab == UpTab::Videos => {
+            _ if keys.matches_comment_sort(key) && self.tab == UpTab::Videos => {
                 self.video_order = if self.video_order == SpaceVideoOrder::Latest {
                     SpaceVideoOrder::Popular
                 } else {
@@ -385,7 +385,7 @@ impl Component for UpPage {
                 };
                 return Some(AppAction::SwitchUpVideoOrder(self.video_order));
             }
-            KeyCode::Char('o') if self.tab == UpTab::Favorites => {
+            _ if keys.matches_comment_sort(key) && self.tab == UpTab::Favorites => {
                 self.favorite_order = self.favorite_order.next();
                 if let Some(media_id) = self.pending_folder {
                     // Results in the old order are discarded, so request the
@@ -398,7 +398,7 @@ impl Component for UpPage {
                 }
                 return Some(AppAction::None);
             }
-            KeyCode::Char('s') => {
+            _ if keys.matches_play_order(key) => {
                 self.play_order = match self.play_order {
                     PlayOrder::Forward => PlayOrder::Reverse,
                     PlayOrder::Reverse => PlayOrder::Shuffle,

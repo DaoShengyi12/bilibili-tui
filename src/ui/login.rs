@@ -160,13 +160,16 @@ impl LoginPage {
         self.error_message = Some(msg);
     }
 
-    fn status_text(&self, theme: &Theme) -> (&str, Color) {
+    fn status_text(&self, theme: &Theme, keys: &Keybindings) -> (String, Color) {
         match self.poll_status {
-            QrcodePollStatus::Waiting => ("⏳ 等待扫描二维码...", theme.warning),
-            QrcodePollStatus::Scanned => ("📱 已扫描，请在手机上确认登录", theme.info),
-            QrcodePollStatus::Success => ("✅ 登录成功！", theme.success),
-            QrcodePollStatus::Expired => ("❌ 二维码已过期，请按 r 刷新", theme.error),
-            QrcodePollStatus::Unknown(_) => ("❓ 未知状态", theme.fg_secondary),
+            QrcodePollStatus::Waiting => ("⏳ 等待扫描二维码...".into(), theme.warning),
+            QrcodePollStatus::Scanned => ("📱 已扫描，请在手机上确认登录".into(), theme.info),
+            QrcodePollStatus::Success => ("✅ 登录成功！".into(), theme.success),
+            QrcodePollStatus::Expired => (
+                format!("❌ 二维码已过期，请按 {} 刷新", keys.refresh),
+                theme.error,
+            ),
+            QrcodePollStatus::Unknown(_) => ("❓ 未知状态".into(), theme.fg_secondary),
         }
     }
 }
@@ -270,7 +273,7 @@ impl Component for LoginPage {
         }
 
         // Status with enhanced styling
-        let (status_text, status_color) = self.status_text(theme);
+        let (status_text, status_color) = self.status_text(theme, keys);
         let status = Paragraph::new(status_text)
             .style(
                 Style::default()
@@ -294,6 +297,7 @@ impl Component for LoginPage {
             theme,
             [
                 (keys.refresh.clone(), "刷新二维码".into(), theme.warning),
+                (keys.back.clone(), "返回".into(), theme.info),
                 (keys.quit.clone(), "退出".into(), theme.error),
             ],
         );
@@ -308,6 +312,9 @@ impl Component for LoginPage {
     ) -> Option<AppAction> {
         if keys.matches_quit(key) {
             return Some(AppAction::Quit);
+        }
+        if keys.matches_back(key) {
+            return Some(AppAction::SwitchToSettings);
         }
         if keys.matches_refresh(key) {
             // Request refresh - will be handled by App
@@ -361,5 +368,15 @@ mod tests {
         assert!(matches!(action, Some(AppAction::LoginSuccess(_))));
         page.last_poll = None;
         assert_eq!(page.poll_request(), None);
+    }
+
+    #[test]
+    fn back_leaves_the_login_page_for_settings() {
+        let mut page = waiting_page();
+        let keys = Keybindings::default();
+        assert!(matches!(
+            page.handle_input(KeyCode::Esc, &keys),
+            Some(AppAction::SwitchToSettings)
+        ));
     }
 }

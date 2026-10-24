@@ -9,6 +9,7 @@ where
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
     match value {
         None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) if value.trim().is_empty() => Ok(None),
         Some(serde_json::Value::Number(number)) => number
             .as_i64()
             .ok_or_else(|| serde::de::Error::custom("integer is out of range"))
@@ -65,7 +66,7 @@ pub struct DynamicFeedData {
 
 #[cfg(test)]
 mod tests {
-    use super::{DynamicFeedData, DynamicItem};
+    use super::{DynamicFeedData, DynamicItem, DynamicKind};
     use serde::Deserialize;
 
     #[test]
@@ -107,6 +108,84 @@ mod tests {
             forward.comment_oid("1262523297597227011"),
             Some(1262523297597227011)
         );
+    }
+
+    #[test]
+    fn forward_article_and_live_dynamics_are_classified() {
+        let forward: DynamicItem = serde_json::from_value(serde_json::json!({
+            "id_str": "1",
+            "type": "DYNAMIC_TYPE_FORWARD",
+            "modules": {"module_dynamic": {"desc": {"text": "转发理由"}, "major": null}},
+            "orig": {
+                "id_str": "2",
+                "type": "DYNAMIC_TYPE_AV",
+                "modules": {
+                    "module_author": {"name": "原UP"},
+                    "module_dynamic": {"major": {
+                        "type": "MAJOR_TYPE_ARCHIVE",
+                        "archive": {"bvid": "BV1x", "title": "原视频", "cover": "c.jpg"}
+                    }}
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(forward.kind(), DynamicKind::Forward);
+        let orig = forward.forwarded().unwrap();
+        assert_eq!(orig.kind(), DynamicKind::Video);
+        assert_eq!(orig.summary(), "原视频");
+        assert_eq!(forward.cover().as_deref(), Some("c.jpg"));
+
+        let article: DynamicItem = serde_json::from_value(serde_json::json!({
+            "type": "DYNAMIC_TYPE_ARTICLE",
+            "modules": {"module_dynamic": {"major": {
+                "type": "MAJOR_TYPE_ARTICLE",
+                "article": {"id": "123", "title": "专栏标题", "covers": ["a.jpg"]}
+            }}}
+        }))
+        .unwrap();
+        assert_eq!(article.kind(), DynamicKind::Article);
+        assert_eq!(article.article(), Some((123, "专栏标题")));
+        assert_eq!(article.cover().as_deref(), Some("a.jpg"));
+
+        let content = serde_json::json!({"live_play_info": {
+            "room_id": 456, "title": "直播中", "cover": "l.jpg", "live_status": 1,
+            "watched_show": {"text_large": "1万人看过"}
+        }})
+        .to_string();
+        let live: DynamicItem = serde_json::from_value(serde_json::json!({
+            "type": "DYNAMIC_TYPE_LIVE_RCMD",
+            "modules": {"module_dynamic": {"major": {
+                "type": "MAJOR_TYPE_LIVE_RCMD",
+                "live_rcmd": {"content": content}
+            }}}
+        }))
+        .unwrap();
+        assert_eq!(live.kind(), DynamicKind::Live);
+        let room = live.live().unwrap();
+        assert_eq!((room.room_id, room.is_live), (456, true));
+        assert_eq!(room.watched.as_deref(), Some("1万人看过"));
+    }
+
+    #[test]
+    fn empty_numeric_strings_read_as_missing() {
+        let item: DynamicItem = serde_json::from_value(serde_json::json!({
+            "basic": {"comment_type": "", "comment_id_str": ""},
+            "modules": {"module_author": {"pub_ts": ""}}
+        }))
+        .unwrap();
+        assert!(item.basic.unwrap().comment_id.is_none());
+    }
+
+    #[test]
+    fn unreadable_live_content_is_not_a_live_dynamic() {
+        let live: DynamicItem = serde_json::from_value(serde_json::json!({
+            "modules": {"module_dynamic": {"major": {
+                "type": "MAJOR_TYPE_LIVE_RCMD",
+                "live_rcmd": {"content": "not json"}
+            }}}
+        }))
+        .unwrap();
+        assert_eq!(live.kind(), DynamicKind::Other);
     }
 
     #[test]
@@ -216,6 +295,35 @@ pub struct DynamicItem {
     pub modules: Option<DynamicModules>,
     #[serde(default)]
     pub basic: Option<DynamicBasic>,
+    /// The forwarded dynamic of a `DYNAMIC_TYPE_FORWARD`.
+    #[serde(default)]
+    pub orig: Option<Box<DynamicItem>>,
+}
+
+/// What a dynamic shows, as far as this client can display it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicKind {
+    Video,
+    Draw,
+    Opus,
+    Article,
+    Live,
+    Forward,
+    /// Plain text without a major.
+    Word,
+    Other,
+}
+
+/// A live room shared in a dynamic, from `MAJOR_TYPE_LIVE_RCMD` (whose
+/// `content` is a JSON string) or the older `MAJOR_TYPE_LIVE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicLive {
+    pub room_id: i64,
+    pub title: String,
+    pub cover: Option<String>,
+    pub is_live: bool,
+    /// For example "1.2万人看过".
+    pub watched: Option<String>,
 }
 
 /// Server-provided comment target. Video dynamics comment on the aid and
@@ -261,6 +369,62 @@ pub struct DynamicMajor {
     pub archive: Option<ArchiveInfo>,
     pub draw: Option<DrawInfo>,
     pub opus: Option<OpusInfo>,
+    #[serde(default)]
+    pub article: Option<ArticleMajor>,
+    #[serde(default)]
+    pub live_rcmd: Option<LiveRcmdMajor>,
+    #[serde(default)]
+    pub live: Option<LiveMajor>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArticleMajor {
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub id: Option<i64>,
+    pub title: Option<String>,
+    pub desc: Option<String>,
+    #[serde(default)]
+    pub covers: Option<Vec<String>>,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiveRcmdMajor {
+    /// JSON text holding `live_play_info`.
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiveMajor {
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub id: Option<i64>,
+    pub title: Option<String>,
+    pub cover: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub live_state: Option<i64>,
+    pub desc_first: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LiveRcmdContent {
+    live_play_info: LivePlayInfo,
+}
+
+#[derive(Deserialize)]
+struct LivePlayInfo {
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    room_id: Option<i64>,
+    title: Option<String>,
+    cover: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    live_status: Option<i64>,
+    #[serde(default)]
+    watched_show: Option<WatchedShow>,
+}
+
+#[derive(Deserialize)]
+struct WatchedShow {
+    text_large: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -334,6 +498,123 @@ pub struct RichTextNode {
 }
 
 impl DynamicItem {
+    fn major(&self) -> Option<&DynamicMajor> {
+        self.modules
+            .as_ref()
+            .and_then(|m| m.module_dynamic.as_ref())
+            .and_then(|d| d.major.as_ref())
+    }
+
+    pub fn kind(&self) -> DynamicKind {
+        if self.dynamic_type.as_deref() == Some("DYNAMIC_TYPE_FORWARD") {
+            return DynamicKind::Forward;
+        }
+        match self.major().and_then(|m| m.major_type.as_deref()) {
+            Some("MAJOR_TYPE_ARCHIVE") => DynamicKind::Video,
+            Some("MAJOR_TYPE_DRAW") => DynamicKind::Draw,
+            Some("MAJOR_TYPE_OPUS") => DynamicKind::Opus,
+            Some("MAJOR_TYPE_ARTICLE") => DynamicKind::Article,
+            Some("MAJOR_TYPE_LIVE_RCMD" | "MAJOR_TYPE_LIVE") if self.live().is_some() => {
+                DynamicKind::Live
+            }
+            None if self.desc_text().is_some_and(|text| !text.is_empty()) => DynamicKind::Word,
+            _ => DynamicKind::Other,
+        }
+    }
+
+    /// The forwarded dynamic, when this is a forward.
+    pub fn forwarded(&self) -> Option<&DynamicItem> {
+        self.orig.as_deref()
+    }
+
+    /// `(cvid, title)` of an article dynamic.
+    pub fn article(&self) -> Option<(i64, &str)> {
+        let article = self.major()?.article.as_ref()?;
+        let cvid = article.id.filter(|id| *id > 0)?;
+        Some((cvid, article.title.as_deref().unwrap_or("专栏")))
+    }
+
+    pub fn article_desc(&self) -> Option<&str> {
+        self.major()?.article.as_ref()?.desc.as_deref()
+    }
+
+    pub fn article_cover(&self) -> Option<&str> {
+        self.major()?
+            .article
+            .as_ref()?
+            .covers
+            .as_ref()?
+            .first()
+            .map(String::as_str)
+    }
+
+    pub fn live(&self) -> Option<DynamicLive> {
+        let major = self.major()?;
+        if let Some(content) = major.live_rcmd.as_ref().and_then(|l| l.content.as_deref()) {
+            let info = serde_json::from_str::<LiveRcmdContent>(content)
+                .ok()?
+                .live_play_info;
+            return Some(DynamicLive {
+                room_id: info.room_id.filter(|id| *id > 0)?,
+                title: info.title.unwrap_or_default(),
+                cover: info.cover,
+                is_live: info.live_status == Some(1),
+                watched: info.watched_show.and_then(|show| show.text_large),
+            });
+        }
+        let live = major.live.as_ref()?;
+        Some(DynamicLive {
+            room_id: live.id.filter(|id| *id > 0)?,
+            title: live.title.clone().unwrap_or_default(),
+            cover: live.cover.clone(),
+            is_live: live.live_state == Some(1),
+            watched: live.desc_first.clone(),
+        })
+    }
+
+    /// One-line summary used for cards and forwarded content.
+    pub fn summary(&self) -> String {
+        match self.kind() {
+            DynamicKind::Video => self.video_title().unwrap_or("视频").to_string(),
+            DynamicKind::Draw => self.desc_text().unwrap_or("图片动态").to_string(),
+            DynamicKind::Opus => self
+                .opus_title()
+                .or(self.opus_text())
+                .unwrap_or("图文动态")
+                .to_string(),
+            DynamicKind::Article => self
+                .article()
+                .map_or("专栏", |(_, title)| title)
+                .to_string(),
+            DynamicKind::Live => self.live().map(|live| live.title).unwrap_or_default(),
+            DynamicKind::Forward | DynamicKind::Word | DynamicKind::Other => {
+                self.desc_text().unwrap_or("动态").to_string()
+            }
+        }
+    }
+
+    /// The first picture to show for this dynamic.
+    pub fn cover(&self) -> Option<String> {
+        match self.kind() {
+            DynamicKind::Video => self.video_cover().map(str::to_string),
+            DynamicKind::Draw => self.draw_images().first().map(|url| url.to_string()),
+            DynamicKind::Opus => self.opus_images().first().map(|url| url.to_string()),
+            DynamicKind::Article => self.article_cover().map(str::to_string),
+            DynamicKind::Live => self.live()?.cover,
+            DynamicKind::Forward => self.forwarded()?.cover(),
+            DynamicKind::Word | DynamicKind::Other => None,
+        }
+    }
+
+    pub fn opus_title(&self) -> Option<&str> {
+        self.major()?
+            .opus
+            .as_ref()?
+            .title
+            .as_deref()
+            .filter(|title| !title.is_empty())
+    }
+
     pub fn is_video(&self) -> bool {
         self.modules
             .as_ref()

@@ -89,17 +89,7 @@ impl Sidebar {
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
-
-        // Split into header and nav items
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(4), // Header with branding
-                Constraint::Length(1), // Separator
-                Constraint::Min(5),    // Nav items
-                Constraint::Length(1), // Footer separator
-            ])
-            .split(inner);
+        let chunks = Self::layout(inner);
 
         // Bilibili branding header with modern styling
         let brand_lines = vec![
@@ -166,6 +156,33 @@ impl Sidebar {
         frame.render_widget(list, chunks[2]);
     }
 
+    /// Header, separator, nav items and footer of the sidebar's inner area.
+    fn layout(inner: Rect) -> std::rc::Rc<[Rect]> {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4), // Header with branding
+                Constraint::Length(1), // Separator
+                Constraint::Min(5),    // Nav items
+                Constraint::Length(1), // Footer separator
+            ])
+            .split(inner)
+    }
+
+    /// The nav item drawn at a screen position inside `area`, the area the
+    /// sidebar was drawn in.
+    pub fn item_at(&self, area: Rect, column: u16, row: u16) -> Option<NavItem> {
+        let inner = Rect {
+            width: area.width.saturating_sub(1),
+            ..area
+        };
+        let nav = Self::layout(inner)[2];
+        if !nav.contains(Position::new(column, row)) {
+            return None;
+        }
+        self.items().get(usize::from(row - nav.y)).copied()
+    }
+
     pub fn next(&mut self) {
         let items = self.items();
         let current_idx = items.iter().position(|i| *i == self.selected).unwrap_or(0);
@@ -220,5 +237,16 @@ mod tests {
         sidebar.set_minimal_mode(false);
         assert_eq!(sidebar.items(), NavItem::all());
         assert_eq!(sidebar.selected, NavItem::Home);
+    }
+
+    #[test]
+    fn clicks_map_to_the_drawn_nav_rows() {
+        let sidebar = Sidebar::new();
+        let area = Rect::new(0, 0, 16, 30);
+        assert_eq!(sidebar.item_at(area, 3, 5), Some(NavItem::Home));
+        assert_eq!(sidebar.item_at(area, 3, 6), Some(NavItem::Dynamic));
+        assert_eq!(sidebar.item_at(area, 3, 2), None, "branding");
+        assert_eq!(sidebar.item_at(area, 3, 25), None, "below the items");
+        assert_eq!(sidebar.item_at(area, 20, 5), None, "outside");
     }
 }

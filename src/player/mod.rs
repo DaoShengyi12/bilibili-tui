@@ -64,6 +64,63 @@ fn configure_vod_buffering(cmd: &mut Command) {
 pub struct PlayerControl {
     pub stop: CancellationToken,
     pub danmaku_config: tokio::sync::watch::Receiver<DanmakuConfig>,
+    /// Where single-video playback is: part cid and seconds. Cleared when
+    /// the player exits; used to place danmaku the user sends.
+    pub position: SharedPosition,
+}
+
+pub type SharedPosition = Arc<std::sync::Mutex<Option<(i64, f64)>>>;
+
+fn set_position(position: &SharedPosition, value: Option<(i64, f64)>) {
+    if let Ok(mut slot) = position.lock() {
+        *slot = value;
+    }
+}
+
+/// Up to two subtitle tracks to load: human Chinese, other human, then AI
+/// Chinese. Only a human track is shown by default.
+fn pick_subtitles(
+    tracks: &[crate::api::client::SubtitleTrack],
+) -> Vec<&crate::api::client::SubtitleTrack> {
+    let rank = |track: &crate::api::client::SubtitleTrack| match (
+        track.is_ai(),
+        track.lan.trim_start_matches("ai-").starts_with("zh"),
+    ) {
+        (false, true) => 0,
+        (false, false) => 1,
+        (true, true) => 2,
+        (true, false) => 3,
+    };
+    let mut tracks: Vec<_> = tracks
+        .iter()
+        .filter(|track| !track.subtitle_url.is_empty() && rank(track) < 3)
+        .collect();
+    tracks.sort_by_key(|track| rank(track));
+    tracks.truncate(2);
+    tracks
+}
+
+fn write_private_temp(prefix: &str, extension: &str, content: &str) -> Result<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}.{extension}",
+        std::process::id(),
+        MPV_IPC_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    StdWrite::write_all(&mut file, content.as_bytes())?;
+    Ok(path)
+}
+
+fn format_clock(seconds: f64) -> String {
+    let total = seconds.max(0.0) as u64;
+    format!("{:02}:{:02}", total / 60, total % 60)
 }
 
 /// One upload part or PGC episode played in its own mpv window.
@@ -343,10 +400,27 @@ async fn play_vod(
         }
     };
 
-    let danmaku = api_client
-        .get_video_danmaku(watch.cid)
-        .await
-        .unwrap_or_default();
+    let (danmaku, player_info) = tokio::join!(
+        api_client.get_video_danmaku(watch.cid),
+        api_client.get_player_info(watch.aid, watch.cid)
+    );
+    let danmaku = danmaku.unwrap_or_default();
+    let player_info = player_info.unwrap_or_default();
+    let mut subtitle_files = Vec::new();
+    let mut show_subtitles = false;
+    for (index, track) in pick_subtitles(&player_info.subtitle.subtitles)
+        .into_iter()
+        .enumerate()
+    {
+        let Ok(srt) = api_client.get_subtitle_srt(track).await else {
+            continue;
+        };
+        if let Ok(path) = write_private_temp("bilibili-tui-sub", "srt", &srt) {
+            show_subtitles |= index == 0 && !track.is_ai();
+            subtitle_files.push((path, track.lan_doc.clone()));
+        }
+    }
+    let resume_at = player_info.resume_position(watch.cid);
     let ipc_path = vod_mpv_ipc_path(watch.cid);
     remove_stale_mpv_ipc(&ipc_path);
     let danmaku_script_path = create_live_danmaku_script()?;
@@ -354,6 +428,24 @@ async fn play_vod(
 
     let mut cmd = Command::new("mpv");
     cmd.kill_on_drop(true);
+    for (path, _) in &subtitle_files {
+        cmd.arg(format!("--sub-file={}", path.display()));
+    }
+    if !subtitle_files.is_empty() {
+        cmd.arg(if show_subtitles {
+            "--sid=1"
+        } else {
+            "--sid=no"
+        });
+    }
+    session_files.extend(subtitle_files.into_iter().map(|(path, _)| path));
+    if let Some(position) = resume_at {
+        cmd.arg(format!("--start={position}"));
+        let _ = playback_event_tx.send(PlaybackEvent::Notice {
+            session_id,
+            message: format!("从 {} 继续播放", format_clock(position)),
+        });
+    }
 
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
@@ -453,6 +545,7 @@ async fn play_vod(
                 _ = position_interval.tick() => {
                     if let Some(position) = mpv_time_pos(&ipc_path).await {
                         played_time = position.max(0.0) as i64;
+                        set_position(&control.position, Some((watch.cid, position)));
                     }
                 }
                 // Keep polling after the last comment so seeking back resumes danmaku.
@@ -545,6 +638,7 @@ async fn play_vod(
             }
         }
 
+        set_position(&control.position, None);
         drop(session_files);
         drop(media);
         let event = match exit_error {
@@ -734,6 +828,10 @@ impl SessionFiles {
 
     fn push(&mut self, path: std::path::PathBuf) {
         self.0.push(path);
+    }
+
+    fn extend(&mut self, paths: impl IntoIterator<Item = std::path::PathBuf>) {
+        self.0.extend(paths);
     }
 }
 
@@ -1526,21 +1624,24 @@ fn ordered_playlist(
 
 /// Play a live stream using mpv
 /// This function spawns mpv in a background task to avoid blocking the TUI
+#[allow(clippy::too_many_arguments)]
 pub async fn play_live(
     api_client: Arc<ApiClient>,
     room_id: i64,
     danmaku_hub: Option<Arc<LiveDanmakuHub>>,
     control: PlayerControl,
     video_quality: VideoQuality,
+    live_qn: Option<i64>,
     playback_event_tx: Sender<PlaybackEvent>,
     session_id: u64,
 ) -> Result<()> {
     let PlayerControl {
         stop,
         danmaku_config: mut danmaku_config_rx,
+        ..
     } = control;
     let mut urls = api_client
-        .get_live_stream_urls(room_id, video_quality)
+        .get_live_stream_urls(room_id, video_quality, live_qn)
         .await?;
     let first_url = urls
         .first()
@@ -1631,7 +1732,7 @@ pub async fn play_live(
                             let Some(refreshed) = live_or_exit(
                                 &mut child,
                                 &stop,
-                                api_client.get_live_stream_urls(room_id, video_quality),
+                                api_client.get_live_stream_urls(room_id, video_quality, live_qn),
                             ).await else {
                                 write_live_diagnostic(room_id, "MPV exited during live URL refresh");
                                 break 'playback;
@@ -2274,7 +2375,7 @@ mod playlist_tests {
             .next()
             .expect("an active live room");
         let url = client
-            .get_live_stream_urls(room.roomid, VideoQuality::Best)
+            .get_live_stream_urls(room.roomid, VideoQuality::Best, None)
             .await
             .expect("best stream")
             .into_iter()
@@ -2359,5 +2460,44 @@ mod playlist_tests {
         assert!(mpv_time_pos(&ipc).await.expect("position after switch") >= position);
         child.kill().await.expect("stop test mpv");
         let _ = std::fs::remove_file(ipc);
+    }
+}
+
+#[cfg(test)]
+mod subtitle_tests {
+    use super::*;
+    use crate::api::client::SubtitleTrack;
+
+    fn track(lan: &str) -> SubtitleTrack {
+        SubtitleTrack {
+            lan: lan.into(),
+            lan_doc: lan.into(),
+            subtitle_url: "//example/sub.json".into(),
+        }
+    }
+
+    #[test]
+    fn human_chinese_subtitles_come_first_and_at_most_two_load() {
+        let tracks = [
+            track("ai-en"),
+            track("ai-zh"),
+            track("en-US"),
+            track("zh-CN"),
+        ];
+        let picked: Vec<&str> = pick_subtitles(&tracks)
+            .into_iter()
+            .map(|track| track.lan.as_str())
+            .collect();
+        assert_eq!(picked, ["zh-CN", "en-US"]);
+
+        let ai_only = [track("ai-zh"), track("ai-en")];
+        let picked = pick_subtitles(&ai_only);
+        assert_eq!(picked.len(), 1);
+        assert!(picked[0].is_ai());
+    }
+
+    #[test]
+    fn resume_notice_formats_minutes_and_seconds() {
+        assert_eq!(format_clock(125.9), "02:05");
     }
 }
