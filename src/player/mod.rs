@@ -1324,17 +1324,11 @@ pub async fn play_live(
     let ipc_path = mpv_ipc_path("bilibili-tui-live", &format!("{room_id}-{sequence}"));
     remove_stale_mpv_ipc(&ipc_path);
     let danmaku_script_path = create_live_danmaku_script()?;
-    let mut child = match spawn_live_mpv(&ipc_path, &danmaku_script_path) {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = tokio::fs::remove_file(&danmaku_script_path).await;
-            return Err(error);
-        }
-    };
+    // Removes the socket and script on every exit path, including app exit.
+    let session_files = SessionFiles::new(vec![ipc_path.clone(), danmaku_script_path.clone()]);
+    let mut child = spawn_live_mpv(&ipc_path, &danmaku_script_path)?;
     if let Err(error) = wait_for_ipc(&ipc_path, &mut child).await {
         shutdown_live_child(&ipc_path, &mut child, Duration::from_secs(1)).await;
-        let _ = tokio::fs::remove_file(&ipc_path).await;
-        let _ = tokio::fs::remove_file(&danmaku_script_path).await;
         return Err(error);
     }
     let initial_danmaku_config = danmaku_config_rx.borrow_and_update().clone();
@@ -1353,15 +1347,11 @@ pub async fn play_live(
     if !matches!(timeout(Duration::from_secs(2), ready_rx).await, Ok(Ok(()))) {
         observer.abort();
         shutdown_live_child(&ipc_path, &mut child, Duration::from_secs(1)).await;
-        let _ = tokio::fs::remove_file(&ipc_path).await;
-        let _ = tokio::fs::remove_file(&danmaku_script_path).await;
         anyhow::bail!("直播 MPV 事件监听启动超时");
     }
     if let Err(error) = load_live_and_wait(&ipc_path, first_url).await {
         observer.abort();
         shutdown_live_child(&ipc_path, &mut child, Duration::from_secs(1)).await;
-        let _ = tokio::fs::remove_file(&ipc_path).await;
-        let _ = tokio::fs::remove_file(&danmaku_script_path).await;
         return Err(error);
     }
 
@@ -1370,6 +1360,7 @@ pub async fn play_live(
         // Keep the shared connection alive even if the application switches to
         // another room while this MPV instance is still playing.
         let _danmaku_hub = danmaku_hub;
+        let _session_files = session_files;
         let mut next_url = 1usize;
         let mut consecutive_failures = 0usize;
         let mut loaded_at = Instant::now();
@@ -1498,8 +1489,6 @@ pub async fn play_live(
         }
         shutdown_live_child(&ipc_path, &mut child, Duration::from_secs(2)).await;
         observer.abort();
-        let _ = tokio::fs::remove_file(ipc_path).await;
-        let _ = tokio::fs::remove_file(danmaku_script_path).await;
     });
 
     Ok(())
@@ -1929,6 +1918,13 @@ mod playlist_tests {
         assert_eq!(value["text"], "你好");
         assert_eq!(value["color"], 0x12_34_56);
         assert!(live_danmaku_payload(&LiveMessage::Popularity(1)).is_none());
+    }
+
+    #[test]
+    fn live_danmaku_escaping_breaks_ass_tags_with_a_word_joiner() {
+        assert!(LIVE_DANMAKU_SCRIPT.contains(r#"WORD_JOINER = "\226\129\160""#));
+        assert!(LIVE_DANMAKU_SCRIPT.contains(r#"text:gsub("\\", "\\" .. WORD_JOINER)"#));
+        assert!(!LIVE_DANMAKU_SCRIPT.contains(r#"gsub("\\", "\\\\")"#));
     }
 
     #[test]

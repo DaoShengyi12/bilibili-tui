@@ -27,8 +27,15 @@ local function utf8_count(text)
     return count
 end
 
+-- libass has no escape for a backslash, so `\\N` would still be a line
+-- break. Like mpv's own OSD, follow every backslash with U+2060 WORD JOINER
+-- so no override tag can form, then escape the braces.
+local WORD_JOINER = "\226\129\160"
+
 local function escape_ass(text)
-    return text:gsub("\\", "\\\\"):gsub("{", "\\{"):gsub("}", "\\}"):gsub("[\r\n]", " ")
+    local escaped = text:gsub("\\", "\\" .. WORD_JOINER)
+        :gsub("{", "\\{"):gsub("}", "\\}"):gsub("[\r\n]", " ")
+    return escaped
 end
 
 local function safe_font_name(text)
