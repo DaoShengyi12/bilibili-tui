@@ -1,7 +1,7 @@
 //! Video detail page showing video info, comments, and related videos
 
 use super::video_card::VideoCardGrid;
-use super::{Component, Theme, shortcut_footer};
+use super::{Component, Theme, footer_notice, shortcut_footer};
 use crate::api::comment::CommentItem;
 use crate::api::video::{RelatedVideoItem, VideoInfo};
 use crate::application::AppAction;
@@ -43,6 +43,8 @@ pub struct VideoDetailPage {
     pub liked_comments: HashSet<i64>,
     pub input_mode: bool,
     pub input_buffer: String,
+    /// Transient message shown in the footer until the next key press.
+    pub notice: Option<String>,
     last_click_time: Option<Instant>,
     last_click_index: Option<usize>,
     /// Current episode index for multi-part videos (0-based)
@@ -80,12 +82,20 @@ impl VideoDetailPage {
             liked_comments: HashSet::new(),
             input_mode: false,
             input_buffer: String::new(),
+            notice: None,
             last_click_time: None,
             last_click_index: None,
             current_page_index: 0,
             episode_scroll: 0,
             auto_play_pending: true,
         }
+    }
+
+    /// Reopen the comment box with a draft that could not be posted.
+    pub fn restore_comment_draft(&mut self, message: String, notice: String) {
+        self.input_mode = true;
+        self.input_buffer = message;
+        self.notice = Some(notice);
     }
 
     pub fn play_action(&self) -> AppAction {
@@ -671,7 +681,9 @@ impl Component for VideoDetailPage {
         } else {
             chunks[2]
         };
-        let help = if self.input_mode {
+        let help = if let Some(notice) = &self.notice {
+            footer_notice(theme, notice)
+        } else if self.input_mode {
             shortcut_footer(
                 theme,
                 [
@@ -706,6 +718,7 @@ impl Component for VideoDetailPage {
         key: KeyCode,
         keys: &crate::storage::Keybindings,
     ) -> Option<AppAction> {
+        self.notice = None;
         // Handle input mode for adding comments
         if self.input_mode {
             match key {

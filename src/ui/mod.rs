@@ -119,6 +119,16 @@ pub fn shortcut_footer(
     Line::from(spans)
 }
 
+/// A one-line footer notice that replaces the shortcut hints until the next key.
+pub fn footer_notice(theme: &Theme, notice: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        notice.to_string(),
+        Style::default()
+            .fg(theme.warning)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
 /// UI Component trait
 pub trait Component {
     fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, keys: &Keybindings);

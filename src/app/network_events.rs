@@ -474,6 +474,11 @@ impl App {
                 self.apply_comment_like(oid, rpid, liked);
             }
             network::NetworkEvent::CommentPosted { oid } => self.reload_comments_after_post(oid),
+            network::NetworkEvent::CommentPostFailed {
+                oid,
+                message,
+                error,
+            } => self.restore_comment_draft(oid, message, format!("评论发送失败：{error}")),
             network::NetworkEvent::LiveDetailLoaded {
                 req_id,
                 room_id,
@@ -564,6 +569,25 @@ impl App {
 
     /// Reloads the detail page a comment was posted to so the new comment
     /// shows up.
+    /// Give an unsent comment back to the page it was written on.
+    pub(super) fn restore_comment_draft(&mut self, oid: i64, message: String, notice: String) {
+        match &mut self.current_page {
+            Page::VideoDetail(page) if page.aid == oid => {
+                page.restore_comment_draft(message, notice)
+            }
+            Page::DynamicDetail(page)
+                if page
+                    .dynamic_item
+                    .as_ref()
+                    .and_then(|item| item.comment_oid(&page.dynamic_id))
+                    == Some(oid) =>
+            {
+                page.restore_comment_draft(message, notice)
+            }
+            _ => {}
+        }
+    }
+
     fn reload_comments_after_post(&mut self, oid: i64) {
         match &self.current_page {
             Page::VideoDetail(page) if page.aid == oid => {
@@ -893,6 +917,59 @@ mod tests {
             rx.try_recv(),
             Ok(NetworkCommand::LoadDynamicInit { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_comment_post_reopens_the_draft_with_a_notice() {
+        let (mut app, _rx) = app();
+        let mut page = crate::presentation::tui::VideoDetailPage::new("BV1test".into(), 9);
+        page.loading = false;
+        app.current_page = Page::VideoDetail(Box::new(page));
+
+        app.handle_network_event(NetworkEvent::CommentPostFailed {
+            oid: 9,
+            message: "草稿".into(),
+            error: "API error (12015): 需要评论验证码".into(),
+        });
+
+        let Page::VideoDetail(page) = &app.current_page else {
+            panic!("expected video detail");
+        };
+        assert!(page.input_mode);
+        assert_eq!(page.input_buffer, "草稿");
+        assert!(page.notice.as_deref().unwrap().contains("12015"));
+        assert!(page.error_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn login_hint_is_a_footer_notice_that_keeps_the_detail_content() {
+        let (mut app, _rx) = app();
+        app.credentials = None;
+        let mut page = crate::presentation::tui::VideoDetailPage::new("BV1test".into(), 9);
+        page.loading = false;
+        app.current_page = Page::VideoDetail(Box::new(page));
+
+        app.handle_action(AppAction::AddComment {
+            oid: 9,
+            comment_type: 1,
+            message: "草稿".into(),
+            root: None,
+        })
+        .await;
+
+        let Page::VideoDetail(page) = &mut app.current_page else {
+            panic!("expected video detail");
+        };
+        assert!(page.error_message.is_none());
+        assert_eq!(page.input_buffer, "草稿");
+        assert!(page.notice.is_some());
+        let keys = crate::storage::Keybindings::default();
+        crate::presentation::tui::Component::handle_input(
+            page.as_mut(),
+            crossterm::event::KeyCode::Char('x'),
+            &keys,
+        );
+        assert!(page.notice.is_none(), "the next key clears the notice");
     }
 
     #[tokio::test]

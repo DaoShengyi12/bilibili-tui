@@ -21,14 +21,9 @@ impl App {
                 page.set_error(msg);
             }
             Page::History(page) => page.apply_load_more_error(msg),
-            Page::VideoDetail(page) => {
-                page.error_message = Some(msg);
-                page.loading = false;
-            }
-            Page::DynamicDetail(page) => {
-                page.error_message = Some(msg);
-                page.loading = false;
-            }
+            // A footer notice keeps the loaded detail content on screen.
+            Page::VideoDetail(page) => page.notice = Some(msg),
+            Page::DynamicDetail(page) => page.notice = Some(msg),
             _ => {}
         }
     }
@@ -705,7 +700,7 @@ impl App {
                 root,
             } => {
                 if self.credentials.is_none() {
-                    self.apply_login_required_hint();
+                    self.restore_comment_draft(oid, message, Self::login_required_message());
                     return;
                 }
                 self.send_network_command(network::NetworkCommand::PostComment {

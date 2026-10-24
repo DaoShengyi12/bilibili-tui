@@ -354,6 +354,11 @@ pub enum NetworkEvent {
     CommentPosted {
         oid: i64,
     },
+    CommentPostFailed {
+        oid: i64,
+        message: String,
+        error: String,
+    },
     LiveDetailLoaded {
         req_id: u64,
         room_id: i64,
@@ -574,11 +579,19 @@ async fn handle_command(
             comment_type,
             message,
             root,
-        } => api_client
-            .add_comment(oid, comment_type, &message, root, root)
-            .await
-            .ok()
-            .map(|_| NetworkEvent::CommentPosted { oid }),
+        } => Some(
+            match api_client
+                .add_comment(oid, comment_type, &message, root, root)
+                .await
+            {
+                Ok(_) => NetworkEvent::CommentPosted { oid },
+                Err(error) => NetworkEvent::CommentPostFailed {
+                    oid,
+                    message,
+                    error: redact_url_queries(&error.to_string()),
+                },
+            },
+        ),
         command => Some(handle_tracked_command(api_client, command).await),
     }
 }
