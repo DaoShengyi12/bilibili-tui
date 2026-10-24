@@ -10,6 +10,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::io::Write;
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -36,6 +37,26 @@ pub struct ApiResponse<T> {
     pub data: Option<T>,
 }
 
+/// A non-zero `code` returned by a Bilibili endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiCodeError {
+    pub code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for ApiCodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "API error ({}): {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ApiCodeError {}
+
+/// Signature rejected; usually means the cached WBI keys have rotated.
+const WBI_SIGNATURE_REJECTED: i32 = -352;
+/// Bilibili rotates WBI keys daily; refetching hourly keeps signing valid.
+const WBI_KEY_TTL: Duration = Duration::from_secs(60 * 60);
+
 /// WBI keys for signing requests
 #[derive(Debug, Clone)]
 pub struct WbiKeys {
@@ -43,10 +64,22 @@ pub struct WbiKeys {
     pub sub_key: String,
 }
 
+#[derive(Debug, Clone)]
+struct CachedWbiKeys {
+    keys: WbiKeys,
+    fetched_at: Instant,
+}
+
+impl CachedWbiKeys {
+    fn is_fresh(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.fetched_at) < WBI_KEY_TTL
+    }
+}
+
 pub struct ApiClient {
     client: Client,
     cookies: RwLock<Option<String>>,
-    wbi_keys: RwLock<Option<WbiKeys>>,
+    wbi_keys: RwLock<Option<CachedWbiKeys>>,
 }
 
 impl ApiClient {
@@ -199,21 +232,38 @@ impl ApiClient {
                 return Err(anyhow!("HTTP {status} from {safe_url}"));
             }
 
-            let response: ApiResponse<T> = serde_json::from_slice(&body).map_err(|error| {
-                Self::write_decode_diagnostic(url, &error);
-                anyhow!("invalid JSON response from {safe_url}: {error}")
-            })?;
-            if response.code != 0 {
-                return Err(anyhow!(
-                    "API error ({}): {}",
-                    response.code,
-                    response.message
-                ));
-            }
-            return Ok(response);
+            return Self::decode_api_response(&body).map_err(|error| match error {
+                ResponseError::Api(error) => anyhow::Error::new(error),
+                ResponseError::Decode(error) => {
+                    Self::write_decode_diagnostic(url, &error);
+                    anyhow!("invalid JSON response from {safe_url}: {error}")
+                }
+            });
         }
 
         unreachable!("GET retry loop always returns")
+    }
+
+    /// Check `code` before decoding `data`, so error responses whose `data`
+    /// does not match `T` are reported as API errors rather than bad JSON.
+    fn decode_api_response<T: for<'de> Deserialize<'de>>(
+        body: &[u8],
+    ) -> std::result::Result<ApiResponse<T>, ResponseError> {
+        #[derive(Deserialize)]
+        struct Envelope {
+            code: i32,
+            #[serde(default)]
+            message: Option<String>,
+        }
+
+        let envelope: Envelope = serde_json::from_slice(body).map_err(ResponseError::Decode)?;
+        if envelope.code != 0 {
+            return Err(ResponseError::Api(ApiCodeError {
+                code: envelope.code,
+                message: envelope.message.unwrap_or_default(),
+            }));
+        }
+        serde_json::from_slice(body).map_err(ResponseError::Decode)
     }
 
     /// Make a GET request and return raw JSON
@@ -280,36 +330,48 @@ impl ApiClient {
         Ok(api_resp)
     }
 
-    /// Make a WBI-signed GET request
+    /// Make a WBI-signed GET request. A signature rejection (-352) refreshes
+    /// the keys and retries once.
     pub async fn get_with_wbi<T: for<'de> Deserialize<'de>>(
         &self,
         base_url: &str,
         params: Vec<(&str, String)>,
     ) -> Result<ApiResponse<T>> {
-        // Ensure we have WBI keys
-        self.ensure_wbi_keys().await?;
+        for attempt in 0..2 {
+            let keys = self.wbi_keys().await?;
+            let query = wbi::encode_wbi(params.clone(), &keys.img_key, &keys.sub_key);
+            let url = format!("{}?{}", base_url, query);
+            match self.get(&url).await {
+                Err(error) if attempt == 0 && Self::is_wbi_rejection(&error) => {
+                    self.invalidate_wbi_keys();
+                }
+                result => return result,
+            }
+        }
 
-        let query = {
-            let keys = self.wbi_keys.read().expect("wbi_keys lock poisoned");
-            let keys = keys
-                .as_ref()
-                .expect("WBI keys should be set after ensure_wbi_keys");
-            wbi::encode_wbi(params, &keys.img_key, &keys.sub_key)
-        };
-        let url = format!("{}?{}", base_url, query);
-
-        self.get(&url).await
+        unreachable!("WBI retry loop always returns")
     }
 
-    /// Fetch WBI keys from nav API
-    async fn ensure_wbi_keys(&self) -> Result<()> {
-        if self
+    fn is_wbi_rejection(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<ApiCodeError>()
+            .is_some_and(|error| error.code == WBI_SIGNATURE_REJECTED)
+    }
+
+    fn invalidate_wbi_keys(&self) {
+        *self.wbi_keys.write().expect("wbi_keys lock poisoned") = None;
+    }
+
+    /// Return cached WBI keys, fetching them from nav when absent or expired.
+    async fn wbi_keys(&self) -> Result<WbiKeys> {
+        if let Some(cached) = self
             .wbi_keys
             .read()
             .expect("wbi_keys lock poisoned")
-            .is_some()
+            .as_ref()
+            .filter(|cached| cached.is_fresh(Instant::now()))
         {
-            return Ok(());
+            return Ok(cached.keys.clone());
         }
 
         // The nav endpoint answers guests and expired sessions with code -101
@@ -321,9 +383,12 @@ impl ApiClient {
             .context("failed to fetch WBI keys from nav")?;
         let keys = Self::parse_nav_wbi_keys(&value)?;
 
-        *self.wbi_keys.write().expect("wbi_keys lock poisoned") = Some(keys);
+        *self.wbi_keys.write().expect("wbi_keys lock poisoned") = Some(CachedWbiKeys {
+            keys: keys.clone(),
+            fetched_at: Instant::now(),
+        });
 
-        Ok(())
+        Ok(keys)
     }
 
     fn parse_nav_wbi_keys(value: &serde_json::Value) -> Result<WbiKeys> {
@@ -869,11 +934,7 @@ impl ApiClient {
         let url = self.build_url(BilibiliApiDomain::Main, "/pgc/web/timeline?types=1");
         let value = self.get_json(&url).await?;
         Self::check_code(&value)?;
-        let result = value
-            .get("result")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        Ok(result)
+        super::serde_util::parse_lenient_list(value.get("result"), "bangumi timeline")
     }
 
     pub async fn get_bangumi_rank(&self) -> Result<Vec<super::bangumi::SeasonRankItem>> {
@@ -883,12 +944,8 @@ impl ApiClient {
         );
         let value = self.get_json(&url).await?;
         Self::check_code(&value)?;
-        let list = value
-            .get("result")
-            .and_then(|r| r.get("list"))
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        Ok(list)
+        let list = value.get("result").and_then(|result| result.get("list"));
+        super::serde_util::parse_lenient_list(list, "bangumi rank")
     }
 
     pub async fn get_bangumi_season(&self, season_id: i64) -> Result<super::bangumi::SeasonResult> {
@@ -1442,64 +1499,17 @@ impl ApiClient {
         let base_url = "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo";
 
         // WBI signature is REQUIRED since 2025-05-26
-        self.ensure_wbi_keys().await?;
-
-        // Helper to build signed URL with the current WBI keys
-        let build_signed_url = |keys: &WbiKeys| {
-            let query_string = wbi::encode_wbi(
+        let resp: ApiResponse<super::live_ws::DanmuInfoData> = self
+            .get_with_wbi(
+                base_url,
                 vec![
                     ("id", room_id.to_string()),
                     ("type", "0".to_string()),
                     ("web_location", "444.8".to_string()),
                 ],
-                &keys.img_key,
-                &keys.sub_key,
-            );
-            format!("{}?{}", base_url, query_string)
-        };
-
-        // Try once, then refresh WBI keys and retry on signature error (-352)
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-
-            let keys = {
-                let guard = self.wbi_keys.read().expect("wbi lock");
-                guard
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("WBI keys unavailable"))?
-            };
-
-            let url = build_signed_url(&keys);
-
-            let mut req = self.client.get(&url);
-            if let Some(ref cookies) = *self.cookies.read().expect("cookies lock") {
-                req = req.header(COOKIE, cookies.as_str());
-            }
-
-            let resp = req.send().await?.error_for_status()?;
-            let resp_text = resp.text().await?;
-
-            let api_resp: ApiResponse<super::live_ws::DanmuInfoData> =
-                serde_json::from_str(&resp_text).map_err(|e| anyhow::anyhow!("解析失败: {e}"))?;
-
-            if api_resp.code == 0 {
-                return api_resp.data.ok_or_else(|| anyhow::anyhow!("响应无数据"));
-            }
-
-            // If signature failed, refresh keys and retry once
-            if api_resp.code == -352 && attempt == 1 {
-                *self.wbi_keys.write().expect("wbi lock") = None;
-                self.ensure_wbi_keys().await?;
-                continue;
-            }
-
-            return Err(anyhow::anyhow!(
-                "API错误 {}: {}",
-                api_resp.code,
-                api_resp.message
-            ));
-        }
+            )
+            .await?;
+        resp.data.ok_or_else(|| anyhow!("响应无数据"))
     }
 
     pub async fn get_buvid3(&self) -> Result<String> {
@@ -1543,6 +1553,11 @@ impl ApiClient {
         api_resp.data.ok_or_else(|| anyhow::anyhow!("响应无数据"))
     }
 }
+enum ResponseError {
+    Api(ApiCodeError),
+    Decode(serde_json::Error),
+}
+
 fn parse_home_videos(items: Vec<serde_json::Value>) -> Vec<super::recommend::VideoItem> {
     items
         .into_iter()
@@ -1579,6 +1594,61 @@ mod live_contract_tests {
         let keys = ApiClient::parse_nav_wbi_keys(&value).unwrap();
         assert_eq!(keys.img_key, "7cd084941338484aae1ad9425b84077c");
         assert_eq!(keys.sub_key, "4932caff0ff746eab6f01bf08b70ac45");
+    }
+
+    #[test]
+    fn error_code_is_reported_before_data_shape() {
+        // -352/-412 responses carry data that does not match the success type.
+        let body = br#"{"code":-352,"message":"risk control","data":{"v_voucher":"x"}}"#;
+        let Err(super::ResponseError::Api(error)) =
+            ApiClient::decode_api_response::<Vec<i64>>(body)
+        else {
+            panic!("expected an API code error");
+        };
+        assert_eq!(error.code, -352);
+        assert_eq!(error.to_string(), "API error (-352): risk control");
+        assert!(ApiClient::is_wbi_rejection(&anyhow::Error::new(error)));
+    }
+
+    #[test]
+    fn success_with_mismatched_data_is_a_decode_error() {
+        let body = br#"{"code":0,"message":"0","data":{"a":1}}"#;
+        assert!(matches!(
+            ApiClient::decode_api_response::<Vec<i64>>(body),
+            Err(super::ResponseError::Decode(_))
+        ));
+        let body = br#"{"code":0,"message":"0","data":[1,2]}"#;
+        let response = ApiClient::decode_api_response::<Vec<i64>>(body)
+            .ok()
+            .unwrap();
+        assert_eq!(response.data, Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn non_signature_errors_do_not_trigger_wbi_retry() {
+        let error = anyhow::Error::new(super::ApiCodeError {
+            code: -101,
+            message: "账号未登录".to_string(),
+        });
+        assert!(!ApiClient::is_wbi_rejection(&error));
+        assert!(!ApiClient::is_wbi_rejection(&anyhow::anyhow!("timeout")));
+    }
+
+    #[test]
+    fn cached_wbi_keys_expire_after_ttl() {
+        let fetched_at = std::time::Instant::now();
+        let cached = super::CachedWbiKeys {
+            keys: super::WbiKeys {
+                img_key: "img".to_string(),
+                sub_key: "sub".to_string(),
+            },
+            fetched_at,
+        };
+        assert!(cached.is_fresh(fetched_at));
+        assert!(
+            cached.is_fresh(fetched_at + super::WBI_KEY_TTL - std::time::Duration::from_secs(1))
+        );
+        assert!(!cached.is_fresh(fetched_at + super::WBI_KEY_TTL));
     }
 
     #[test]

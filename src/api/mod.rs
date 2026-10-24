@@ -15,6 +15,7 @@ pub mod live_danmaku_hub;
 pub mod live_ws;
 pub mod recommend;
 pub mod search;
+pub mod serde_util;
 pub mod space;
 pub mod video;
 pub mod wbi;

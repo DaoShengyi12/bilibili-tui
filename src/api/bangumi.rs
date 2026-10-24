@@ -1,41 +1,48 @@
 //! Bangumi (番剧/影视) API types
 
+use super::serde_util::null_as_default;
 use serde::Deserialize;
 
 // ─── Timeline ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct TimelineDay {
+    #[serde(default, deserialize_with = "null_as_default")]
     pub date: String,
-    #[serde(rename = "date_ts")]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub date_ts: i64,
-    #[serde(rename = "day_of_week")]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub day_of_week: i32,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub episodes: Vec<TimelineEpisode>,
-    #[serde(rename = "is_today")]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub is_today: i32,
 }
 
+/// Only the identifiers and title are required; display fields drift often.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TimelineEpisode {
+    #[serde(default, deserialize_with = "null_as_default")]
     pub cover: String,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub delay: i32,
-    #[serde(rename = "ep_cover")]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub ep_cover: String,
-    #[serde(rename = "episode_id")]
     pub episode_id: i64,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub follows: String,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub plays: String,
-    #[serde(rename = "pub_index")]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub pub_index: String,
-    #[serde(rename = "pub_time")]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub pub_time: String,
-    #[serde(rename = "pub_ts")]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub pub_ts: i64,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub published: i32,
-    #[serde(rename = "season_id")]
     pub season_id: i64,
-    #[serde(rename = "square_cover")]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub square_cover: String,
     pub title: String,
 }
@@ -59,20 +66,23 @@ impl TimelineEpisode {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SeasonRankItem {
+    #[serde(default, deserialize_with = "null_as_default")]
     pub badge: String,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub cover: String,
-    #[serde(rename = "new_ep")]
+    #[serde(default)]
     pub new_ep: Option<NewEp>,
-    #[serde(rename = "season_id")]
     pub season_id: i64,
     pub title: String,
+    #[serde(default)]
     pub rating: Option<String>,
+    #[serde(default)]
     pub stat: Option<RankStat>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewEp {
-    #[serde(rename = "index_show")]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub index_show: String,
 }
 
@@ -273,5 +283,37 @@ impl SeasonResult {
 
     pub fn total_episodes(&self) -> usize {
         self.all_sections().iter().map(|s| s.episodes.len()).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SeasonRankItem, TimelineDay};
+    use crate::api::serde_util::parse_lenient_list;
+    use serde_json::json;
+
+    #[test]
+    fn rank_keeps_items_with_drifted_display_fields() {
+        let list = json!([
+            {"season_id": 1, "title": "A", "badge": null, "new_ep": {"index_show": null}},
+            {"season_id": "oops", "title": "B"},
+            {"season_id": 3, "title": "C", "cover": "//i0.hdslb.com/c.jpg", "stat": {"view": 12}}
+        ]);
+        let items: Vec<SeasonRankItem> = parse_lenient_list(Some(&list), "rank").unwrap();
+        let ids: Vec<i64> = items.iter().map(|item| item.season_id).collect();
+        assert_eq!(ids, vec![1, 3]);
+        assert_eq!(items[0].badge_text(), None);
+        assert_eq!(items[1].cover_url(), "https://i0.hdslb.com/c.jpg");
+    }
+
+    #[test]
+    fn timeline_day_with_null_episodes_is_empty() {
+        let days = json!([
+            {"date": "10-24", "episodes": null, "is_today": 1},
+            {"date": "10-25", "episodes": [{"episode_id": 9, "season_id": 8, "title": "T"}]}
+        ]);
+        let days: Vec<TimelineDay> = parse_lenient_list(Some(&days), "timeline").unwrap();
+        assert!(days[0].episodes.is_empty());
+        assert_eq!(days[1].episodes[0].episode_id, 9);
     }
 }

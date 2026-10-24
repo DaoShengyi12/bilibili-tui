@@ -1,5 +1,6 @@
 //! Favorite-folder and favorite-resource API models.
 
+use super::serde_util::null_as_default;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,11 +52,43 @@ mod tests {
         assert_eq!(FavoriteOrder::MostPlayed.api_value(), "view");
         assert_eq!(FavoriteOrder::RecentlyPublished.api_value(), "pubtime");
     }
+
+    #[test]
+    fn empty_folders_with_null_lists_decode_as_empty() {
+        let resources: super::FavoriteResourceData = serde_json::from_value(serde_json::json!({
+            "info": null,
+            "medias": null,
+            "has_more": false
+        }))
+        .unwrap();
+        assert!(resources.medias.is_empty());
+
+        let created: super::FavoriteFolderData =
+            serde_json::from_value(serde_json::json!({"count": 0, "list": null})).unwrap();
+        assert!(created.list.is_empty());
+
+        let collected: super::CollectedFolderData = serde_json::from_value(
+            serde_json::json!({"count": 0, "list": null, "has_more": false}),
+        )
+        .unwrap();
+        assert!(collected.list.is_empty());
+
+        let watch_later: super::WatchLaterData =
+            serde_json::from_value(serde_json::json!({"count": 0, "list": null})).unwrap();
+        assert!(watch_later.list.is_empty());
+
+        let archives: super::SeasonArchivesData = serde_json::from_value(serde_json::json!({
+            "archives": null,
+            "page": {"page_num": 1, "total": 0}
+        }))
+        .unwrap();
+        assert!(archives.archives.is_empty());
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FavoriteFolderData {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub list: Vec<FavoriteFolder>,
 }
 
@@ -73,7 +106,7 @@ pub struct FavoriteFolder {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FavoriteResourceData {
     pub info: Option<FavoriteInfo>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub medias: Vec<FavoriteMedia>,
     pub has_more: Option<bool>,
 }
@@ -114,7 +147,7 @@ pub struct FavoriteCountInfo {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WatchLaterData {
     pub count: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub list: Vec<WatchLaterItem>,
 }
 
@@ -137,7 +170,7 @@ pub struct WatchLaterStat {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollectedFolderData {
     pub count: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub list: Vec<CollectedFolder>,
     pub has_more: Option<bool>,
 }
@@ -153,7 +186,7 @@ pub struct CollectedFolder {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SeasonArchivesData {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub archives: Vec<SeasonArchive>,
     pub page: SeasonPage,
 }
