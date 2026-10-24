@@ -187,7 +187,8 @@ pub async fn play_video(
                         played_time = position.max(0.0) as i64;
                     }
                 }
-                _ = danmaku_interval.tick(), if next_danmaku < danmaku.len() => {
+                // Keep polling after the last comment so seeking back resumes danmaku.
+                _ = danmaku_interval.tick(), if !danmaku.is_empty() => {
                     if let Some(position) = mpv_time_pos(&ipc_path).await {
                         if !danmaku_ready {
                             danmaku_ready = send_live_danmaku_config(
@@ -199,23 +200,22 @@ pub async fn play_video(
                                 continue;
                             }
                         }
-                        if position + 0.25 < last_danmaku_position {
-                            next_danmaku = danmaku.partition_point(|message| message.time < position);
-                        }
+                        let due = due_danmaku_range(
+                            &danmaku,
+                            next_danmaku,
+                            last_danmaku_position,
+                            position,
+                        );
+                        next_danmaku = due.end;
                         last_danmaku_position = position;
-                        let mut due_messages = Vec::new();
-                        while let Some(message) = danmaku.get(next_danmaku)
-                            && message.time <= position + 0.02
-                        {
-                            due_messages.push(message.clone());
-                            next_danmaku += 1;
+                        if !due.is_empty() {
+                            let _ = send_video_danmaku_batch(
+                                &ipc_path,
+                                &danmaku_script_path,
+                                &danmaku[due],
+                            )
+                            .await;
                         }
-                        let _ = send_video_danmaku_batch(
-                            &ipc_path,
-                            &danmaku_script_path,
-                            &due_messages,
-                        )
-                        .await;
                     }
                 }
                 result = child.wait() => {
@@ -308,6 +308,29 @@ pub async fn play_video(
     });
 
     Ok(())
+}
+
+/// A position change larger than this between two polls is treated as a seek.
+const DANMAKU_SEEK_THRESHOLD: f64 = 1.0;
+
+/// Comments to send for `position`, given the cursor `next` and the position
+/// of the previous poll. After a seek in either direction the cursor jumps to
+/// `position`, so comments that were skipped over are not replayed in bulk.
+fn due_danmaku_range(
+    danmaku: &[crate::api::danmaku::VideoDanmaku],
+    next: usize,
+    last_position: f64,
+    position: f64,
+) -> std::ops::Range<usize> {
+    let seeked =
+        position + 0.25 < last_position || position > last_position + DANMAKU_SEEK_THRESHOLD;
+    let start = if seeked {
+        danmaku.partition_point(|message| message.time < position)
+    } else {
+        next.min(danmaku.len())
+    };
+    let end = start + danmaku[start..].partition_point(|message| message.time <= position + 0.02);
+    start..end
 }
 
 async fn send_video_danmaku_batch(
@@ -535,12 +558,85 @@ fn ensure_mpv_success(value: &serde_json::Value) -> Result<()> {
     }
 }
 
+/// File lifecycle events from the mpv IPC stream. `entry` is mpv's
+/// `playlist_entry_id`, absent on old mpv versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MpvFileEvent {
+    Started { entry: Option<i64> },
+    Loaded,
+    Ended { entry: Option<i64>, reason: String },
+}
+
+fn mpv_file_event(value: &serde_json::Value) -> Option<MpvFileEvent> {
+    let entry = value
+        .get("playlist_entry_id")
+        .and_then(serde_json::Value::as_i64);
+    match value.get("event")?.as_str()? {
+        "start-file" => Some(MpvFileEvent::Started { entry }),
+        "file-loaded" => Some(MpvFileEvent::Loaded),
+        "end-file" => Some(MpvFileEvent::Ended {
+            entry,
+            reason: value
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+        }),
+        _ => None,
+    }
+}
+
+/// Whether an `end-file` belongs to the file currently playing. Events for an
+/// entry replaced since then are stale. Without ids every event is accepted.
+fn is_current_entry(current: Option<i64>, ended: Option<i64>) -> bool {
+    match (current, ended) {
+        (Some(current), Some(ended)) => current == ended,
+        _ => true,
+    }
+}
+
+/// Tracks one `loadfile` until the new file has loaded or failed.
+#[derive(Default)]
+struct LoadProgress {
+    command_ok: bool,
+    started: bool,
+    entry: Option<i64>,
+    loaded: bool,
+}
+
+impl LoadProgress {
+    /// Apply one file event. The replaced file ends before the new one
+    /// starts, so only an `end-file: error` after `start-file` is a failure.
+    fn apply(&mut self, event: MpvFileEvent) -> Result<()> {
+        match event {
+            MpvFileEvent::Started { entry } => {
+                self.started = true;
+                self.entry = entry;
+            }
+            MpvFileEvent::Loaded => self.loaded = true,
+            MpvFileEvent::Ended { entry, reason }
+                if reason == "error" && self.started && is_current_entry(self.entry, entry) =>
+            {
+                anyhow::bail!("MPV failed to load the stream")
+            }
+            MpvFileEvent::Ended { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn done(&self) -> bool {
+        self.command_ok && self.loaded
+    }
+}
+
+/// Replace the current file and wait until it has loaded. Returns the new
+/// `playlist_entry_id` when mpv reports one.
 async fn loadfile_and_wait(
     path: &std::path::Path,
     video_url: &str,
     audio_url: &str,
     position: f64,
-) -> Result<()> {
+) -> Result<Option<i64>> {
     timeout(Duration::from_secs(10), async {
         if audio_url.contains(',') {
             anyhow::bail!("audio CDN URL cannot be represented as an MPV option list");
@@ -561,9 +657,8 @@ async fn loadfile_and_wait(
         bytes.push(b'\n');
         stream.write_all(&bytes).await?;
         let mut lines = BufReader::new(stream).lines();
-        let mut command_ok = false;
-        let mut loaded = false;
-        while !(command_ok && loaded) {
+        let mut progress = LoadProgress::default();
+        while !progress.done() {
             let line = lines
                 .next_line()
                 .await?
@@ -571,11 +666,13 @@ async fn loadfile_and_wait(
             let value: serde_json::Value = serde_json::from_str(&line)?;
             if value.get("request_id").and_then(|value| value.as_u64()) == Some(request_id) {
                 ensure_mpv_success(&value)?;
-                command_ok = true;
+                progress.command_ok = true;
             }
-            loaded |= value.get("event").and_then(|value| value.as_str()) == Some("file-loaded");
+            if let Some(event) = mpv_file_event(&value) {
+                progress.apply(event)?;
+            }
         }
-        Ok(())
+        Ok(progress.entry)
     })
     .await
     .map_err(|_| anyhow::anyhow!("MPV file load timed out"))?
@@ -644,28 +741,37 @@ async fn replace_mpv_stream(
     video_url: &str,
     audio_url: &str,
     position: f64,
-) -> Result<()> {
+) -> Result<Option<i64>> {
     loadfile_and_wait(path, video_url, audio_url, position).await
 }
 
+/// Try the remaining video CDNs in order. `current_entry` follows the file
+/// mpv ends up playing, so `end-file` events of replaced files are ignored.
 async fn switch_to_working_video_cdn(
     prepared: &mut PreparedPlaylistItem,
     ipc_path: &std::path::Path,
     position: f64,
+    current_entry: &mut Option<i64>,
 ) -> bool {
     let previous = prepared.proxy.video_url.clone();
     let mut candidate = prepared.proxy.next_video_cdn();
     while let Some((index, url)) = candidate {
-        let switched = replace_mpv_stream(ipc_path, &url, &prepared.proxy.audio_url, position)
-            .await
-            .is_ok()
-            || mpv_path(ipc_path).await.as_deref() == Some(url.as_str());
-        if switched {
-            return prepared.proxy.commit_video_cdn(index);
+        match replace_mpv_stream(ipc_path, &url, &prepared.proxy.audio_url, position).await {
+            Ok(entry) => {
+                *current_entry = entry;
+                return prepared.proxy.commit_video_cdn(index);
+            }
+            Err(_) if mpv_path(ipc_path).await.as_deref() == Some(url.as_str()) => {
+                *current_entry = None;
+                return prepared.proxy.commit_video_cdn(index);
+            }
+            Err(_) => candidate = prepared.proxy.video_cdn(index + 1),
         }
-        candidate = prepared.proxy.video_cdn(index + 1);
     }
-    let _ = replace_mpv_stream(ipc_path, &previous, &prepared.proxy.audio_url, position).await;
+    *current_entry = replace_mpv_stream(ipc_path, &previous, &prepared.proxy.audio_url, position)
+        .await
+        .ok()
+        .flatten();
     false
 }
 
@@ -877,7 +983,7 @@ async fn run_playlist(
     let mut item_started = Instant::now();
     let mut start_ts = chrono::Utc::now().timestamp();
     let mut played_any = false;
-    start_playlist_media(ipc_path, &items[index], &prepared).await?;
+    let mut current_entry = start_playlist_media(ipc_path, &items[index], &prepared).await?;
     let _ = tx.send(PlaybackEvent::ItemChanged {
         session_id,
         index,
@@ -927,15 +1033,18 @@ async fn run_playlist(
                     Err(error) => Err(error.into()),
                 };
             }
-            reason = end_rx.recv() => {
-                let Some(reason) = reason else { break Err(anyhow::anyhow!("MPV IPC event stream closed")); };
+            ended = end_rx.recv() => {
+                let Some((entry, reason)) = ended else { break Err(anyhow::anyhow!("MPV IPC event stream closed")); };
+                if !is_current_entry(current_entry, entry) {
+                    continue;
+                }
                 if reason == "error" {
                     if !corrupted {
                         prepared.proxy.record_current_corruption();
                         corrupted = true;
                     }
                     let current_pos = mpv_time_pos(ipc_path).await.unwrap_or(played_time as f64);
-                    if switch_to_working_video_cdn(&mut prepared, ipc_path, current_pos).await {
+                    if switch_to_working_video_cdn(&mut prepared, ipc_path, current_pos, &mut current_entry).await {
                         corrupted = false;
                         last_switch = Instant::now();
                         continue;
@@ -967,7 +1076,7 @@ async fn run_playlist(
                 };
                 index = next_index;
                 prepared = next_prepared;
-                start_playlist_media(ipc_path, &items[index], &prepared).await?;
+                current_entry = start_playlist_media(ipc_path, &items[index], &prepared).await?;
                 played_time = 0;
                 corrupted = false;
                 item_started = Instant::now();
@@ -993,7 +1102,7 @@ async fn run_playlist(
                     decode_errors.clear();
                     if !corrupted { prepared.proxy.record_current_corruption(); corrupted = true; }
                     let current_pos = mpv_time_pos(ipc_path).await.unwrap_or(played_time as f64);
-                    if switch_to_working_video_cdn(&mut prepared, ipc_path, current_pos).await {
+                    if switch_to_working_video_cdn(&mut prepared, ipc_path, current_pos, &mut current_entry).await {
                         corrupted = false;
                         last_switch = Instant::now();
                     }
@@ -1023,21 +1132,14 @@ async fn start_playlist_media(
     path: &std::path::Path,
     item: &PlaylistItem,
     prepared: &PreparedPlaylistItem,
-) -> Result<()> {
+) -> Result<Option<i64>> {
     let page = match item.page {
         Some(page) if page > 1 => format!("https://www.bilibili.com/video/{}?p={page}", item.bvid),
         _ => format!("https://www.bilibili.com/video/{}", item.bvid),
     };
     let _ = mpv_ipc(path, serde_json::json!(["set_property", "referrer", page])).await;
-    let _ = mpv_ipc(
-        path,
-        serde_json::json!([
-            "set_property",
-            "options/script-opts",
-            format!("cid={}", prepared.cid)
-        ]),
-    )
-    .await;
+    // Append so options the user set in mpv.conf survive; only `cid` changes.
+    let _ = mpv_ipc(path, playlist_cid_option(prepared.cid)).await;
     loadfile_and_wait(
         path,
         &prepared.proxy.video_url,
@@ -1045,6 +1147,10 @@ async fn start_playlist_media(
         0.0,
     )
     .await
+}
+
+fn playlist_cid_option(cid: i64) -> serde_json::Value {
+    serde_json::json!(["change-list", "script-opts", "append", format!("cid={cid}")])
 }
 
 async fn report_playlist_heartbeat(
@@ -1072,7 +1178,7 @@ async fn report_playlist_heartbeat(
 
 async fn observe_end_files(
     path: &std::path::Path,
-    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    tx: tokio::sync::mpsc::UnboundedSender<(Option<i64>, String)>,
     ready: tokio::sync::oneshot::Sender<()>,
 ) -> Result<()> {
     let mut stream = connect_mpv_ipc(path).await?;
@@ -1084,12 +1190,8 @@ async fn observe_end_files(
     let mut lines = BufReader::new(stream).lines();
     while let Some(line) = lines.next_line().await? {
         let value: serde_json::Value = serde_json::from_str(&line)?;
-        if value.get("event").and_then(|v| v.as_str()) == Some("end-file") {
-            let reason = value
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let _ = tx.send(reason.to_owned());
+        if let Some(MpvFileEvent::Ended { entry, reason }) = mpv_file_event(&value) {
+            let _ = tx.send((entry, reason));
         }
     }
     Ok(())
@@ -1281,7 +1383,7 @@ pub async fn play_live(
                     break;
                 }
                 reason = end_rx.recv() => {
-                    let Some(reason) = reason else {
+                    let Some((_, reason)) = reason else {
                         write_live_diagnostic(room_id, "MPV event observer stopped");
                         break;
                     };
@@ -1531,6 +1633,99 @@ fn write_live_diagnostic(_room_id: i64, message: &str) {
 #[cfg(test)]
 mod playlist_tests {
     use super::*;
+
+    fn danmaku_at(times: &[f64]) -> Vec<VideoDanmaku> {
+        times
+            .iter()
+            .map(|&time| VideoDanmaku {
+                time,
+                text: String::new(),
+                color: 0,
+            })
+            .collect()
+    }
+
+    fn file_event(json: serde_json::Value) -> MpvFileEvent {
+        mpv_file_event(&json).expect("file event")
+    }
+
+    #[test]
+    fn stale_end_file_of_a_replaced_entry_is_ignored() {
+        assert!(!is_current_entry(Some(3), Some(2)));
+        assert!(is_current_entry(Some(3), Some(3)));
+        assert!(is_current_entry(None, Some(2)));
+        assert!(is_current_entry(Some(3), None));
+        assert_eq!(
+            file_event(
+                serde_json::json!({"event": "end-file", "reason": "error", "playlist_entry_id": 2})
+            ),
+            MpvFileEvent::Ended {
+                entry: Some(2),
+                reason: "error".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn load_fails_fast_when_the_new_file_errors() {
+        let mut progress = LoadProgress::default();
+        // The replaced file ending with an error does not fail the new load.
+        progress
+            .apply(file_event(
+                serde_json::json!({"event": "end-file", "reason": "error", "playlist_entry_id": 1}),
+            ))
+            .unwrap();
+        progress
+            .apply(file_event(
+                serde_json::json!({"event": "start-file", "playlist_entry_id": 2}),
+            ))
+            .unwrap();
+        assert_eq!(progress.entry, Some(2));
+        assert!(
+            progress
+                .apply(file_event(serde_json::json!({"event": "end-file", "reason": "error", "playlist_entry_id": 2})))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn load_completes_after_command_and_file_loaded() {
+        let mut progress = LoadProgress::default();
+        progress
+            .apply(file_event(
+                serde_json::json!({"event": "start-file", "playlist_entry_id": 5}),
+            ))
+            .unwrap();
+        progress
+            .apply(file_event(serde_json::json!({"event": "file-loaded"})))
+            .unwrap();
+        assert!(!progress.done());
+        progress.command_ok = true;
+        assert!(progress.done());
+    }
+
+    #[test]
+    fn playlist_appends_cid_without_replacing_user_script_opts() {
+        assert_eq!(
+            playlist_cid_option(42),
+            serde_json::json!(["change-list", "script-opts", "append", "cid=42"])
+        );
+    }
+
+    #[test]
+    fn danmaku_resume_after_seeking_back_past_the_last_comment() {
+        let danmaku = danmaku_at(&[1.0, 2.0, 3.0]);
+        assert_eq!(due_danmaku_range(&danmaku, 3, 10.0, 10.02), 3..3);
+        assert_eq!(due_danmaku_range(&danmaku, 3, 10.0, 1.5), 1..1);
+        assert_eq!(due_danmaku_range(&danmaku, 1, 1.5, 2.0), 1..2);
+    }
+
+    #[test]
+    fn forward_seek_skips_comments_instead_of_sending_them_in_bulk() {
+        let danmaku = danmaku_at(&[1.0, 2.0, 3.0, 50.0, 60.0]);
+        assert_eq!(due_danmaku_range(&danmaku, 0, 0.5, 55.0), 4..4);
+        assert_eq!(due_danmaku_range(&danmaku, 0, 0.5, 1.01), 0..1);
+    }
 
     #[test]
     fn ytdl_format_caps_by_stream_qn() {
