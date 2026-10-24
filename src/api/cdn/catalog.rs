@@ -6,6 +6,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 const REFRESH_SECS: i64 = 24 * 60 * 60;
+/// Upper bound on hosts kept from third-party catalogs.
+const MAX_EXTRACTED_HOSTS: usize = 64;
+/// Bilibili-owned media domains. Shared CDN domains such as `akamaized.net`
+/// are trusted only for the built-in hosts, because anyone can own a subdomain.
+const TRUSTED_SUFFIXES: [&str; 2] = [".bilivideo.com", ".bilibilivideo.com"];
 const SOURCES: [&str; 2] = [
     "https://gist.githubusercontent.com/maguowei/20a39ed03b43b87704c47c517064e3d7/raw/bilibili.snd.sgmodule",
     "https://raw.githubusercontent.com/BiliUniverse/Redirect/main/src/function/database.mjs",
@@ -96,6 +101,32 @@ fn extract_hosts(text: &str) -> impl Iterator<Item = String> + '_ {
     .map(str::to_ascii_lowercase)
 }
 
+/// Whether a host may receive a signed media URL rewritten from another edge.
+pub(super) fn is_trusted_media_host(host: &str) -> bool {
+    PILIPLUS_DOMESTIC.contains(&host)
+        || PILIPLUS_OVERSEAS.contains(&host)
+        || TRUSTED_SUFFIXES.iter().any(|suffix| {
+            host.strip_suffix(suffix)
+                .is_some_and(|prefix| !prefix.is_empty())
+        })
+}
+
+/// Built-in hosts plus a capped set of trusted hosts from the latest catalog.
+fn merge_catalog(extracted: impl IntoIterator<Item = String>) -> Vec<String> {
+    let extracted: BTreeSet<String> = extracted
+        .into_iter()
+        .filter(|host| is_trusted_media_host(host))
+        .take(MAX_EXTRACTED_HOSTS)
+        .collect();
+    let mut hosts: BTreeSet<String> = PILIPLUS_DOMESTIC
+        .into_iter()
+        .chain(PILIPLUS_OVERSEAS)
+        .map(str::to_string)
+        .collect();
+    hosts.extend(extracted);
+    hosts.into_iter().collect()
+}
+
 pub(super) fn is_overseas_host(host: &str) -> bool {
     PILIPLUS_OVERSEAS.contains(&host)
 }
@@ -142,19 +173,23 @@ async fn fetch_catalog(client: &Client, source: &str) -> Option<String> {
 pub(super) async fn regional_hosts(client: &Client) -> (Option<Region>, Vec<String>) {
     let now = chrono::Utc::now().timestamp();
     let mut cache = load_cache();
-    let mut hosts = BTreeSet::new();
-    hosts.extend(PILIPLUS_DOMESTIC.into_iter().map(str::to_string));
-    hosts.extend(PILIPLUS_OVERSEAS.into_iter().map(str::to_string));
-    hosts.extend(cache.hosts.iter().cloned());
     if now - cache.updated_at >= REFRESH_SECS || cache.hosts.is_empty() {
+        let mut extracted = Vec::new();
+        let mut fetched = false;
         for source in SOURCES {
             if let Some(text) = fetch_catalog(client, source).await {
-                hosts.extend(extract_hosts(&text));
+                fetched = true;
+                extracted.extend(extract_hosts(&text));
             }
+        }
+        // Replace rather than accumulate, so hosts dropped upstream are pruned.
+        // Keep the previous catalog when every source is unreachable.
+        if fetched {
+            cache.hosts = extracted;
         }
         cache.updated_at = now;
     }
-    cache.hosts = hosts.into_iter().collect();
+    cache.hosts = merge_catalog(std::mem::take(&mut cache.hosts));
     if (now - cache.region_updated_at >= REFRESH_SECS || cache.region.is_none())
         && let Some(region) = detect_region(client).await
     {
@@ -183,6 +218,24 @@ mod tests {
         assert!(is_overseas_host("upos-sz-mirrorhwov.bilivideo.com"));
         assert!(is_overseas_host("cn-hk-eq-bcache-01.bilivideo.com"));
         assert_eq!(extract_hosts("proxy-evilakamaized.net").count(), 0);
+    }
+
+    #[test]
+    fn third_party_catalog_is_trusted_and_capped() {
+        let extracted = (0..200)
+            .map(|index| format!("upos-x{index:03}.bilivideo.com"))
+            .chain(["upos-evil.akamaized.net".to_string()]);
+        let hosts = merge_catalog(extracted);
+        let builtin = PILIPLUS_DOMESTIC.len() + PILIPLUS_OVERSEAS.len();
+        assert_eq!(hosts.len(), builtin + MAX_EXTRACTED_HOSTS);
+        assert!(!hosts.iter().any(|host| host == "upos-evil.akamaized.net"));
+        assert!(
+            hosts
+                .iter()
+                .any(|host| host == "upos-hz-mirrorakam.akamaized.net")
+        );
+        assert!(!is_trusted_media_host("bilivideo.com"));
+        assert!(!is_trusted_media_host("evilbilivideo.com"));
     }
 
     #[test]

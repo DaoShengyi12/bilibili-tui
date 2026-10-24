@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use futures_util::future::join_all;
+use futures_util::{StreamExt, stream};
 use reqwest::header::{RANGE, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -15,6 +15,10 @@ const PROBE_BYTES: u64 = 512 * 1024 - 1;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
 const SCORE_TTL: Duration = Duration::from_secs(15 * 60);
+/// Catalog hosts probed per stream in addition to the ones the API returned.
+const MAX_CATALOG_PROBES: usize = 6;
+/// Concurrent media probes per stream kind.
+const PROBE_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlayUrlData {
@@ -348,9 +352,6 @@ fn catalog_prior(host: &str) -> Option<f64> {
 fn record_rank(host: &str, kind: StreamKind, score: f64, speed_ratio: f64, bandwidth: i64) {
     if let Ok(mut values) = history().lock() {
         let entry = values.entry(host.to_string()).or_default();
-        if entry.probe_samples > 0 {
-            entry.last_probe_ok = true;
-        }
         match kind {
             StreamKind::Video => {
                 entry.video_score = Some(score);
@@ -402,13 +403,64 @@ fn cached_score(url: &str) -> Option<ProbeScore> {
         return Some(cached.probe);
     }
     let value = history().lock().ok()?.get(&host).cloned()?;
-    let age = chrono::Utc::now().timestamp() - value.last_probed_at;
-    (age >= 0 && age < SCORE_TTL.as_secs() as i64 && value.probe_samples > 0).then_some(
-        ProbeScore {
+    history_score(&value, chrono::Utc::now().timestamp())
+}
+
+/// Reuse a persisted probe only while it is recent and the latest probe of
+/// the host succeeded.
+fn history_score(value: &CdnHistory, now: i64) -> Option<ProbeScore> {
+    let age = now - value.last_probed_at;
+    (value.last_probe_ok && value.probe_samples > 0 && age >= 0 && age < SCORE_TTL.as_secs() as i64)
+        .then(|| ProbeScore {
             latency: Duration::from_secs_f64(value.latency_ms / 1000.0),
             throughput_bps: value.throughput_bps,
-        },
-    )
+        })
+}
+
+fn failed_recently(value: &CdnHistory, now: i64) -> bool {
+    let age = now - value.last_probed_at;
+    !value.last_probe_ok && value.probe_failures > 0 && age >= 0 && age < SCORE_TTL.as_secs() as i64
+}
+
+/// Pick a few catalog hosts worth probing: skip hosts the API already gave
+/// and hosts that just failed, prefer the detected region and hosts with a
+/// good probe history, then fill remaining slots with unexplored hosts.
+fn select_catalog_hosts<'a>(
+    catalog_hosts: &'a [String],
+    known_hosts: &[String],
+    region: Option<catalog::Region>,
+    history: &HashMap<String, CdnHistory>,
+    now: i64,
+) -> Vec<&'a str> {
+    let mut candidates: Vec<(&str, Option<&CdnHistory>)> = catalog_hosts
+        .iter()
+        .map(String::as_str)
+        .filter(|host| catalog::is_trusted_media_host(host))
+        .filter(|host| !known_hosts.iter().any(|known| known == host))
+        .map(|host| (host, history.get(host)))
+        .filter(|(_, value)| !value.is_some_and(|value| failed_recently(value, now)))
+        .collect();
+    candidates.sort_by(|(a_host, a), (b_host, b)| {
+        let rank = |host: &str, value: Option<&CdnHistory>| {
+            let region_mismatch = region_factor(region, host) < 1.0;
+            let known_good = value.is_some_and(|value| value.last_probe_ok);
+            let latency = value
+                .filter(|value| value.last_probe_ok)
+                .map_or(f64::INFINITY, |value| value.latency_ms);
+            (region_mismatch, !known_good, latency)
+        };
+        let (a_region, a_unknown, a_latency) = rank(a_host, *a);
+        let (b_region, b_unknown, b_latency) = rank(b_host, *b);
+        a_region
+            .cmp(&b_region)
+            .then(a_unknown.cmp(&b_unknown))
+            .then(a_latency.total_cmp(&b_latency))
+    });
+    candidates
+        .into_iter()
+        .take(MAX_CATALOG_PROBES)
+        .map(|(host, _)| host)
+        .collect()
 }
 
 async fn probe(client: &reqwest::Client, url: String) -> (String, Option<ProbeScore>) {
@@ -462,6 +514,9 @@ async fn probe(client: &reqwest::Client, url: String) -> (String, Option<ProbeSc
             }
             record_probe(&host, score);
         } else {
+            if let Ok(mut cache) = scores().lock() {
+                cache.remove(&host);
+            }
             record_probe_failure(&host);
         }
     }
@@ -488,9 +543,23 @@ async fn rank_urls(
     urls.extend(stream.backup_urls().cloned());
     // Bilibili UPOS signatures belong to the media path/query and can be used
     // with another UPOS edge. Preserve every signed component and replace only
-    // the host so catalog nodes participate in real media probing.
+    // the host so a few trusted catalog nodes participate in media probing.
+    let known_hosts: Vec<String> = urls.iter().filter_map(|url| host(url)).collect();
+    let selected = {
+        let history = history()
+            .lock()
+            .map(|values| values.clone())
+            .unwrap_or_default();
+        select_catalog_hosts(
+            catalog_hosts,
+            &known_hosts,
+            region,
+            &history,
+            chrono::Utc::now().timestamp(),
+        )
+    };
     if let Ok(template) = reqwest::Url::parse(primary) {
-        for catalog_host in catalog_hosts {
+        for catalog_host in selected {
             let mut rewritten = template.clone();
             if rewritten.set_host(Some(catalog_host)).is_ok() {
                 urls.push(rewritten.to_string());
@@ -500,7 +569,10 @@ async fn rank_urls(
     urls.sort_by_key(|url| host(url));
     urls.dedup_by(|a, b| host(a) == host(b));
 
-    let results = join_all(urls.into_iter().map(|url| probe(&client, url))).await;
+    let results: Vec<_> = stream::iter(urls.into_iter().map(|url| probe(&client, url)))
+        .buffer_unordered(PROBE_CONCURRENCY)
+        .collect()
+        .await;
     let all_ranked = results
         .into_iter()
         .filter_map(|(url, probe)| {
@@ -694,6 +766,54 @@ mod tests {
         assert_eq!(value.probe_samples, 0);
         assert!(value.video_score.is_none());
         assert_eq!(value.catalog_reachable, None);
+    }
+
+    fn probed(ok: bool, latency_ms: f64, at: i64) -> CdnHistory {
+        CdnHistory {
+            probe_samples: 1,
+            probe_failures: u64::from(!ok),
+            last_probe_ok: ok,
+            latency_ms,
+            last_probed_at: at,
+            ..CdnHistory::default()
+        }
+    }
+
+    #[test]
+    fn host_that_just_failed_is_not_scored_from_history() {
+        let now = 1_000_000;
+        assert!(history_score(&probed(true, 40.0, now - 10), now).is_some());
+        assert!(history_score(&probed(false, 40.0, now - 10), now).is_none());
+        let expired = now - SCORE_TTL.as_secs() as i64;
+        assert!(history_score(&probed(true, 40.0, expired), now).is_none());
+    }
+
+    #[test]
+    fn catalog_selection_is_capped_trusted_and_skips_failed_hosts() {
+        let now = 1_000_000;
+        let mut catalog_hosts: Vec<String> = (0..20)
+            .map(|index| format!("upos-sz-mirror{index:02}.bilivideo.com"))
+            .collect();
+        catalog_hosts.push("upos-evil.akamaized.net".to_string());
+        let history = HashMap::from([
+            (
+                "upos-sz-mirror05.bilivideo.com".to_string(),
+                probed(true, 30.0, now - 60),
+            ),
+            (
+                "upos-sz-mirror00.bilivideo.com".to_string(),
+                probed(false, 0.0, now - 60),
+            ),
+        ]);
+        let known = vec!["upos-sz-mirror01.bilivideo.com".to_string()];
+
+        let selected = select_catalog_hosts(&catalog_hosts, &known, None, &history, now);
+
+        assert_eq!(selected.len(), MAX_CATALOG_PROBES);
+        assert_eq!(selected[0], "upos-sz-mirror05.bilivideo.com");
+        assert!(!selected.contains(&"upos-sz-mirror00.bilivideo.com"));
+        assert!(!selected.contains(&"upos-sz-mirror01.bilivideo.com"));
+        assert!(!selected.contains(&"upos-evil.akamaized.net"));
     }
 
     #[test]
