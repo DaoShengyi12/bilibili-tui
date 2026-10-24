@@ -554,6 +554,20 @@ impl VideoQuality {
         }
     }
 
+    /// Highest live-room `qn` allowed by this cap. Live rooms use their own
+    /// quality ladder (80 流畅, 150 高清, 250 超清, 400 蓝光, 10000 原画,
+    /// 20000 4K, 30000 杜比), so the mapping is by nominal resolution.
+    pub const fn live_qn_cap(self) -> Option<i64> {
+        match self {
+            Self::Best => None,
+            Self::Q4k => Some(20000),
+            Self::Q1080pHigh | Self::Q1080p => Some(10000),
+            Self::Q720p => Some(250),
+            Self::Q480p => Some(150),
+            Self::Q360p => Some(80),
+        }
+    }
+
     pub const fn max_height(self) -> Option<u16> {
         match self {
             Self::Best => None,

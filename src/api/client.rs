@@ -1376,22 +1376,31 @@ impl ApiClient {
             .ok_or_else(|| anyhow!("live play response has no data"))
     }
 
-    pub async fn get_best_live_stream_urls(&self, room_id: i64) -> Result<Vec<String>> {
+    /// Stream URLs for the best live quality that does not exceed `quality`.
+    pub async fn get_live_stream_urls(
+        &self,
+        room_id: i64,
+        quality: VideoQuality,
+    ) -> Result<Vec<String>> {
+        let cap = quality.live_qn_cap();
         let initial = self.get_live_play_info(room_id, 0).await?;
         if initial.live_status != 1 {
             return Err(anyhow!("直播间当前未开播"));
         }
-        let best_quality = initial.highest_available_quality().unwrap_or_default();
-        let selected = if best_quality > 0 {
-            self.get_live_play_info(room_id, best_quality)
+        let target_quality = initial.highest_quality_within(cap).unwrap_or_default();
+        let selected = if target_quality > 0 {
+            self.get_live_play_info(room_id, target_quality)
                 .await
                 .unwrap_or(initial)
         } else {
             initial
         };
-        let urls = selected.stream_urls();
+        let urls = selected.stream_urls_within(cap);
         if urls.is_empty() {
-            return Err(anyhow!("最高画质没有可用播放地址"));
+            return Err(match cap {
+                Some(_) => anyhow!("直播间没有不超过画质上限 {} 的播放地址", quality.label()),
+                None => anyhow!("最高画质没有可用播放地址"),
+            });
         }
         Ok(urls)
     }
@@ -1667,7 +1676,7 @@ mod live_contract_tests {
         let live_rooms = client.get_live_home_rooms().await.expect("live homepage");
         if let Some(room) = live_rooms.first() {
             let urls = client
-                .get_best_live_stream_urls(room.roomid)
+                .get_live_stream_urls(room.roomid, VideoQuality::Best)
                 .await
                 .expect("best live stream URLs");
             assert!(!urls.is_empty());

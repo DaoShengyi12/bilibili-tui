@@ -950,6 +950,7 @@ impl App {
                     room_id,
                     danmaku_hub,
                     self.danmaku_config_tx.subscribe(),
+                    self.config.video_quality,
                 )
                 .await
                 {

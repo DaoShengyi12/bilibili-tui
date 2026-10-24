@@ -28,10 +28,17 @@ static LIVE_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static MPV_IPC_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const LIVE_DANMAKU_SCRIPT: &str = include_str!("live_danmaku.lua");
 
+/// yt-dlp's Bilibili extractor stores the stream `qn` in `quality`, so the cap
+/// is applied to the same identifier as the DASH path. Height alone would let
+/// 1080P+ / 1080P60 through a 1080P cap and mis-cap portrait videos. Formats
+/// without a `quality` value are excluded rather than risk exceeding the cap.
 fn ytdl_format(quality: VideoQuality) -> String {
-    match quality.max_height() {
-        None => "bestvideo+bestaudio/best".to_string(),
-        Some(height) => format!("bestvideo[height<={height}]+bestaudio/best[height<={height}]"),
+    match quality {
+        VideoQuality::Best => "bestvideo+bestaudio/best".to_string(),
+        _ => {
+            let qn = quality.qn();
+            format!("bestvideo[quality<={qn}]+bestaudio/best[quality<={qn}]")
+        }
     }
 }
 
@@ -1202,8 +1209,11 @@ pub async fn play_live(
     room_id: i64,
     danmaku_hub: Option<Arc<LiveDanmakuHub>>,
     mut danmaku_config_rx: tokio::sync::watch::Receiver<DanmakuConfig>,
+    video_quality: VideoQuality,
 ) -> Result<()> {
-    let mut urls = api_client.get_best_live_stream_urls(room_id).await?;
+    let mut urls = api_client
+        .get_live_stream_urls(room_id, video_quality)
+        .await?;
     let first_url = urls
         .first()
         .ok_or_else(|| anyhow::anyhow!("直播播放地址为空"))?;
@@ -1297,7 +1307,7 @@ pub async fn play_live(
                         if next_url >= urls.len() {
                             let Some(refreshed) = live_or_exit(
                                 &mut child,
-                                api_client.get_best_live_stream_urls(room_id),
+                                api_client.get_live_stream_urls(room_id, video_quality),
                             ).await else {
                                 write_live_diagnostic(room_id, "MPV exited during live URL refresh");
                                 break 'playback;
@@ -1519,6 +1529,19 @@ fn write_live_diagnostic(_room_id: i64, message: &str) {
 #[cfg(test)]
 mod playlist_tests {
     use super::*;
+
+    #[test]
+    fn ytdl_format_caps_by_stream_qn() {
+        assert_eq!(ytdl_format(VideoQuality::Best), "bestvideo+bestaudio/best");
+        assert_eq!(
+            ytdl_format(VideoQuality::Q1080p),
+            "bestvideo[quality<=80]+bestaudio/best[quality<=80]"
+        );
+        assert_eq!(
+            ytdl_format(VideoQuality::Q720p),
+            "bestvideo[quality<=64]+bestaudio/best[quality<=64]"
+        );
+    }
 
     #[test]
     fn session_files_are_removed_when_guard_drops() {
@@ -1772,7 +1795,7 @@ mod playlist_tests {
             .next()
             .expect("an active live room");
         let url = client
-            .get_best_live_stream_urls(room.roomid)
+            .get_live_stream_urls(room.roomid, VideoQuality::Best)
             .await
             .expect("best stream")
             .into_iter()

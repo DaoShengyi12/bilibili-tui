@@ -145,7 +145,8 @@ impl LivePlayInfoData {
             .collect()
     }
 
-    pub fn highest_available_quality(&self) -> Option<i64> {
+    /// Highest advertised quality that does not exceed `cap`.
+    pub fn highest_quality_within(&self, cap: Option<i64>) -> Option<i64> {
         self.playurl_info
             .as_ref()?
             .playurl
@@ -154,11 +155,14 @@ impl LivePlayInfoData {
             .flat_map(|stream| &stream.format)
             .flat_map(|format| &format.codec)
             .flat_map(|codec| codec.accept_qn.iter().copied())
+            .filter(|quality| cap.is_none_or(|cap| *quality <= cap))
             .max()
     }
 
-    pub fn stream_urls(&self) -> Vec<String> {
-        let highest = self.highest_available_quality();
+    /// URLs for the best quality within `cap`. Never returns a stream above
+    /// the cap; an empty list means nothing within the cap is available.
+    pub fn stream_urls_within(&self, cap: Option<i64>) -> Vec<String> {
+        let highest = self.highest_quality_within(cap);
         let selected = highest
             .map(|quality| self.stream_urls_for_quality(quality))
             .unwrap_or_default();
@@ -171,6 +175,7 @@ impl LivePlayInfoData {
         // `current_qn`. Keep the best URL that the response actually contains
         // instead of returning an empty list.
         self.current_quality()
+            .filter(|quality| cap.is_none_or(|cap| *quality <= cap))
             .map(|quality| self.stream_urls_for_quality(quality))
             .unwrap_or_default()
     }
@@ -304,8 +309,34 @@ mod tests {
             }]}}
         });
         let data: LivePlayInfoData = serde_json::from_value(value).unwrap();
-        assert_eq!(data.highest_available_quality(), Some(20000));
-        assert_eq!(data.stream_urls(), ["https://cdn.example/best?token=1"]);
+        assert_eq!(data.highest_quality_within(None), Some(20000));
+        assert_eq!(
+            data.stream_urls_within(None),
+            ["https://cdn.example/best?token=1"]
+        );
+    }
+
+    #[test]
+    fn live_play_info_never_exceeds_quality_cap() {
+        let value = serde_json::json!({
+            "live_status": 1,
+            "playurl_info": {"playurl": {"stream": [{
+                "protocol_name": "http_stream",
+                "format": [{"format_name": "flv", "codec": [
+                    {"codec_name": "avc", "current_qn": 10000, "accept_qn": [10000, 400, 250],
+                     "base_url": "/source", "url_info": [{"host": "https://cdn", "extra": ""}]},
+                    {"codec_name": "avc", "current_qn": 250, "accept_qn": [10000, 400, 250],
+                     "base_url": "/720", "url_info": [{"host": "https://cdn", "extra": ""}]}
+                ]}]
+            }]}}
+        });
+        let data: LivePlayInfoData = serde_json::from_value(value).unwrap();
+        assert_eq!(data.highest_quality_within(Some(400)), Some(400));
+        assert_eq!(data.stream_urls_within(Some(250)), ["https://cdn/720"]);
+        // 400 is advertised but not returned, and the granted 10000 is above
+        // the cap, so nothing may be selected.
+        assert!(data.stream_urls_within(Some(400)).is_empty());
+        assert!(data.stream_urls_within(Some(150)).is_empty());
     }
 
     #[test]
@@ -324,7 +355,7 @@ mod tests {
             ]}}
         });
         let data: LivePlayInfoData = serde_json::from_value(value).unwrap();
-        assert_eq!(data.stream_urls()[0], "https://flv/live.flv");
+        assert_eq!(data.stream_urls_within(None)[0], "https://flv/live.flv");
     }
 
     #[test]
@@ -341,8 +372,11 @@ mod tests {
             }]}}
         });
         let data: LivePlayInfoData = serde_json::from_value(value).unwrap();
-        assert_eq!(data.highest_available_quality(), Some(10000));
-        assert_eq!(data.stream_urls(), ["https://cdn.example/granted?token=2"]);
+        assert_eq!(data.highest_quality_within(None), Some(10000));
+        assert_eq!(
+            data.stream_urls_within(None),
+            ["https://cdn.example/granted?token=2"]
+        );
     }
 }
 
