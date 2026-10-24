@@ -84,7 +84,7 @@ pub async fn play_video(
     };
 
     let danmaku = api_client.get_video_danmaku(cid).await.unwrap_or_default();
-    let ipc_path = mpv_ipc_path("bilibili-tui-mpv", &cid.to_string());
+    let ipc_path = vod_mpv_ipc_path(cid);
     remove_stale_mpv_ipc(&ipc_path);
     let danmaku_script_path = create_live_danmaku_script()?;
 
@@ -453,6 +453,13 @@ fn mpv_ipc_path(prefix: &str, suffix: &str) -> std::path::PathBuf {
     {
         std::env::temp_dir().join(format!("{prefix}-{}-{suffix}.sock", std::process::id()))
     }
+}
+
+/// Each VOD session gets its own socket so replaying the same CID while an
+/// earlier mpv is still open cannot unlink or hijack that player's socket.
+fn vod_mpv_ipc_path(cid: i64) -> std::path::PathBuf {
+    let sequence = MPV_IPC_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    mpv_ipc_path("bilibili-tui-mpv", &format!("{cid}-{sequence}"))
 }
 
 fn remove_stale_mpv_ipc(path: &std::path::Path) {
@@ -1510,6 +1517,11 @@ fn write_live_diagnostic(_room_id: i64, message: &str) {
 #[cfg(test)]
 mod playlist_tests {
     use super::*;
+
+    #[test]
+    fn replaying_same_cid_uses_distinct_ipc_paths() {
+        assert_ne!(vod_mpv_ipc_path(42), vod_mpv_ipc_path(42));
+    }
 
     fn item(id: i64) -> PlaylistItem {
         PlaylistItem {
