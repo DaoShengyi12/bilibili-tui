@@ -53,6 +53,9 @@ pub struct HistoryPage {
     cover_tx: mpsc::Sender<CoverResult>,
     cached_visible_rows: usize,
     selected_keys: HashSet<HistoryKey>,
+    /// Set when `d` selected the hovered item on its own, so cancelling the
+    /// confirmation returns to browsing instead of leaving it selected.
+    implicit_delete_selection: bool,
     mode: HistoryMode,
     notice: Option<String>,
     generation: u64,
@@ -85,6 +88,7 @@ impl HistoryPage {
             cover_tx: tx,
             cached_visible_rows: Self::INITIAL_VISIBLE_ROWS,
             selected_keys: HashSet::new(),
+            implicit_delete_selection: false,
             mode: HistoryMode::Browse,
             notice: None,
             generation: 0,
@@ -531,10 +535,15 @@ impl Component for HistoryPage {
         }
         if self.mode == HistoryMode::ConfirmDelete {
             if key == KeyCode::Esc || keys.matches_back(key) {
+                if self.implicit_delete_selection {
+                    self.selected_keys.clear();
+                }
+                self.implicit_delete_selection = false;
                 self.sync_selection_mode();
                 return None;
             }
             if keys.matches_confirm(key) {
+                self.implicit_delete_selection = false;
                 self.mode = HistoryMode::Deleting;
                 return Some(AppAction::DeleteHistoryItems(
                     self.selected_keys.iter().cloned().collect(),
@@ -556,6 +565,7 @@ impl Component for HistoryPage {
             return None;
         }
         if key == KeyCode::Char('d') {
+            self.implicit_delete_selection = self.selected_keys.is_empty();
             if self.selected_keys.is_empty() {
                 let Some(key) = self
                     .items
@@ -1037,6 +1047,19 @@ mod tests {
         page.handle_input_with_modifiers(KeyCode::Esc, KeyModifiers::NONE, &keys);
         assert!(page.selected_keys.is_empty());
         assert_eq!(page.mode, HistoryMode::Browse);
+    }
+
+    #[test]
+    fn escape_after_single_delete_prompt_returns_to_browse() {
+        let keys = Keybindings::default();
+        let mut page = history_page();
+        page.handle_input_with_modifiers(KeyCode::Char('d'), KeyModifiers::NONE, &keys);
+        assert_eq!(page.mode, HistoryMode::ConfirmDelete);
+        assert_eq!(page.selected_keys.len(), 1);
+
+        page.handle_input_with_modifiers(KeyCode::Esc, KeyModifiers::NONE, &keys);
+        assert_eq!(page.mode, HistoryMode::Browse);
+        assert!(page.selected_keys.is_empty());
     }
 
     #[test]
