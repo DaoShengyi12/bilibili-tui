@@ -3,29 +3,40 @@ use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
 };
+use ratatui::DefaultTerminal;
 use std::io;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    // Initialize terminal
+    // Initialize terminal; `ratatui::init` installs a panic hook that
+    // restores the terminal, and ours disables mouse capture before it.
     let mut terminal = ratatui::init();
+    install_panic_hook();
+
+    let result = run(&mut terminal).await;
+
+    // Disable mouse capture before restoring, on success and on error alike.
+    let _ = execute!(io::stdout(), DisableMouseCapture);
+    ratatui::restore();
+
+    result
+}
+
+async fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
     terminal.clear()?;
 
     // Must run before anything else reads stdin; see `init_image_picker`.
     bilibili_tui::presentation::tui::init_image_picker();
 
-    // Enable mouse capture
-    execute!(std::io::stdout(), EnableMouseCapture)?;
+    execute!(io::stdout(), EnableMouseCapture)?;
 
-    // Run the application
-    let app = App::new();
-    let result = app.run(&mut terminal).await;
+    App::new().run(terminal).await
+}
 
-    // Disable mouse capture before restoring
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
-
-    // Restore terminal
-    ratatui::restore();
-
-    result
+fn install_panic_hook() {
+    let restore_terminal = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+        restore_terminal(info);
+    }));
 }
