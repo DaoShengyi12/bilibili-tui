@@ -24,6 +24,12 @@ pub struct FavoritesPage {
     pub videos: VideoCardGrid,
     pub page: i32,
     pub total: i64,
+    /// Items received from the API for the active source, including ones
+    /// without a BVID that are not shown. Paging compares this, not the
+    /// card count, with `total`.
+    fetched: usize,
+    /// False once a page came back empty, whatever `total` claims.
+    has_more: bool,
     pub loading: bool,
     pub loading_more: bool,
     pub error: Option<String>,
@@ -45,6 +51,8 @@ impl FavoritesPage {
             videos: VideoCardGrid::new_list(),
             page: 1,
             total: 0,
+            fetched: 0,
+            has_more: true,
             loading: true,
             loading_more: false,
             error: None,
@@ -85,6 +93,7 @@ impl FavoritesPage {
         self.videos.clear();
         self.page = 1;
         self.total = watch_later.count;
+        self.reset_paging();
         self.append_watch_later(watch_later);
         self.loading = false;
         self.error = None;
@@ -94,6 +103,7 @@ impl FavoritesPage {
         self.active_source = source;
         self.page = 1;
         self.total = 0;
+        self.reset_paging();
         self.videos.clear();
         self.loading = true;
         self.loading_more = false;
@@ -103,6 +113,7 @@ impl FavoritesPage {
     pub fn apply_watch_later(&mut self, page: i32, data: WatchLaterData) {
         if page == 1 {
             self.videos.clear();
+            self.reset_paging();
         }
         self.page = page;
         self.total = data.count;
@@ -111,6 +122,7 @@ impl FavoritesPage {
     }
 
     fn append_watch_later(&mut self, data: WatchLaterData) {
+        self.record_page(data.list.len());
         for item in data.list {
             let author = item
                 .owner
@@ -141,6 +153,7 @@ impl FavoritesPage {
     pub fn apply_created(&mut self, page: i32, data: FavoriteResourceData) {
         if page == 1 {
             self.videos.clear();
+            self.reset_paging();
         }
         self.page = page;
         self.total = data
@@ -148,6 +161,10 @@ impl FavoritesPage {
             .as_ref()
             .and_then(|info| info.media_count)
             .unwrap_or_default() as i64;
+        self.record_page(data.medias.len());
+        if data.has_more == Some(false) {
+            self.has_more = false;
+        }
         for item in data.medias {
             let Some(bvid) = item.bvid else { continue };
             let author = item
@@ -180,9 +197,11 @@ impl FavoritesPage {
     pub fn apply_collected(&mut self, page: i32, data: SeasonArchivesData) {
         if page == 1 {
             self.videos.clear();
+            self.reset_paging();
         }
         self.page = data.page.page_num;
         self.total = data.page.total;
+        self.record_page(data.archives.len());
         let author = match &self.active_source {
             FavoriteSource::Collected { title, .. } => title.clone(),
             _ => "合集".to_string(),
@@ -204,6 +223,24 @@ impl FavoritesPage {
             ));
         }
         self.finish_load();
+    }
+
+    fn reset_paging(&mut self) {
+        self.fetched = 0;
+        self.has_more = true;
+    }
+
+    fn record_page(&mut self, items: usize) {
+        self.fetched += items;
+        if items == 0 {
+            self.has_more = false;
+        }
+    }
+
+    /// Whether another page exists. Uses the raw item count so items hidden
+    /// for lacking a BVID do not make every scroll request an empty page.
+    fn can_load_more(&self) -> bool {
+        self.has_more && !self.loading_more && self.fetched < self.total.max(0) as usize
     }
 
     fn finish_load(&mut self) {
@@ -391,10 +428,7 @@ impl Component for FavoritesPage {
 
         if keys.matches_page_down(key) {
             self.videos.move_page_down();
-            if self.videos.is_near_bottom(self.videos.cached_visible_rows)
-                && !self.loading_more
-                && self.videos.cards.len() < self.total as usize
-            {
+            if self.videos.is_near_bottom(self.videos.cached_visible_rows) && self.can_load_more() {
                 self.loading_more = true;
                 return Some(AppAction::LoadMoreFavorites);
             }
@@ -407,10 +441,7 @@ impl Component for FavoritesPage {
 
         if keys.matches_down(key) {
             self.videos.move_down();
-            if self.videos.is_near_bottom(self.videos.cached_visible_rows)
-                && !self.loading_more
-                && self.videos.cards.len() < self.total as usize
-            {
+            if self.videos.is_near_bottom(self.videos.cached_visible_rows) && self.can_load_more() {
                 self.loading_more = true;
                 return Some(AppAction::LoadMoreFavorites);
             }
@@ -444,8 +475,7 @@ impl Component for FavoritesPage {
                 self.focus_sources = false;
                 if self.videos.move_down()
                     && self.videos.is_near_bottom(self.videos.cached_visible_rows)
-                    && !self.loading_more
-                    && self.videos.cards.len() < self.total as usize
+                    && self.can_load_more()
                 {
                     self.loading_more = true;
                     return Some(AppAction::LoadMoreFavorites);
@@ -525,6 +555,35 @@ fn format_duration(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn items_without_bvid_do_not_make_paging_request_empty_pages() {
+        let mut page = FavoritesPage::new(1);
+        page.begin_source_load(FavoriteSource::Created {
+            media_id: 9,
+            title: "f".into(),
+        });
+        let data: FavoriteResourceData = serde_json::from_value(serde_json::json!({
+            "info": {"id": 9, "title": "f", "media_count": 2},
+            "medias": [
+                {"id": 1, "bvid": "BV1", "title": "ok"},
+                {"id": 2, "bvid": null, "title": "失效视频"}
+            ],
+            "has_more": false
+        }))
+        .unwrap();
+        page.apply_created(1, data);
+        assert_eq!(page.videos.cards.len(), 1);
+        assert!(!page.can_load_more(), "both items were received");
+
+        let mut page = FavoritesPage::new(1);
+        page.begin_source_load(FavoriteSource::WatchLater);
+        page.apply_watch_later(
+            1,
+            serde_json::from_value(serde_json::json!({"count": 50, "list": []})).unwrap(),
+        );
+        assert!(!page.can_load_more(), "an empty page ends paging");
+    }
 
     #[test]
     fn favorites_is_a_normal_sidebar_page() {
