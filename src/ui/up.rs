@@ -366,15 +366,17 @@ impl Component for UpPage {
                 AppAction::BackToList
             });
         }
+        if keys.matches_tab_1(key) {
+            self.tab = UpTab::Videos;
+            return Some(AppAction::None);
+        }
+        if keys.matches_tab_2(key) {
+            self.tab = UpTab::Favorites;
+            return Some(AppAction::None);
+        }
+        // Fixed shortcuts give way to keys the user bound for navigation.
         match key {
-            KeyCode::Char('1') => {
-                self.tab = UpTab::Videos;
-                return Some(AppAction::None);
-            }
-            KeyCode::Char('2') => {
-                self.tab = UpTab::Favorites;
-                return Some(AppAction::None);
-            }
+            _ if keys.matches_list_navigation(key) => {}
             KeyCode::Char('o') if self.tab == UpTab::Videos => {
                 self.video_order = if self.video_order == SpaceVideoOrder::Latest {
                     SpaceVideoOrder::Popular
@@ -512,6 +514,24 @@ fn format_duration(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn up_tabs_follow_configured_keys_and_fixed_keys_yield_to_navigation() {
+        let mut page = UpPage::new(1);
+        let keys = Keybindings {
+            tab_2: "f".into(),
+            nav_down: "s".into(),
+            ..Keybindings::default()
+        };
+        page.handle_input(KeyCode::Char('f'), &keys);
+        assert!(page.tab == UpTab::Favorites);
+        page.handle_input(KeyCode::Char('s'), &keys);
+        assert_eq!(
+            page.play_order,
+            PlayOrder::Forward,
+            "s is bound to moving down"
+        );
+    }
 
     #[test]
     fn play_order_cycles_through_shuffle() {

@@ -572,11 +572,13 @@ impl Component for HistoryPage {
             self.invert_loaded_selection();
             return None;
         }
-        if key == KeyCode::Char(' ') {
+        // Fixed shortcuts give way to keys the user bound for navigation.
+        let fixed_shortcut = !keys.matches_list_navigation(key);
+        if fixed_shortcut && key == KeyCode::Char(' ') {
             self.toggle_selected();
             return None;
         }
-        if key == KeyCode::Char('d') {
+        if fixed_shortcut && key == KeyCode::Char('d') {
             self.implicit_delete_selection = self.selected_keys.is_empty();
             if self.selected_keys.is_empty() {
                 let Some(key) = self
@@ -648,7 +650,8 @@ impl Component for HistoryPage {
             }
             return None;
         }
-        if key == KeyCode::Char('u')
+        if fixed_shortcut
+            && key == KeyCode::Char('u')
             && let Some(item) = self.items.get(self.selected)
         {
             return Some(AppAction::OpenUpPage(item.item.author_mid));
@@ -1031,6 +1034,28 @@ mod tests {
                 kid: 2,
             }])
         );
+    }
+
+    #[test]
+    fn configured_navigation_key_wins_over_fixed_history_shortcuts() {
+        let keys = Keybindings {
+            nav_down: "d".into(),
+            play: "Space".into(),
+            ..Keybindings::default()
+        };
+        let mut page = history_page();
+        page.handle_input_with_modifiers(KeyCode::Char('d'), KeyModifiers::NONE, &keys);
+        assert_eq!(
+            page.mode,
+            HistoryMode::Browse,
+            "d moves instead of deleting"
+        );
+        page.handle_input_with_modifiers(KeyCode::Char(' '), KeyModifiers::NONE, &keys);
+        assert!(page.selected_keys.is_empty(), "Space is the play key here");
+
+        let defaults = Keybindings::default();
+        page.handle_input_with_modifiers(KeyCode::Char('d'), KeyModifiers::NONE, &defaults);
+        assert_eq!(page.mode, HistoryMode::ConfirmDelete);
     }
 
     fn left_click(column: u16, row: u16) -> MouseEvent {

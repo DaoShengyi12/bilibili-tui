@@ -321,6 +321,21 @@ impl Keybindings {
         self.matches(&self.toggle_replies, key)
     }
 
+    /// Whether `key` is bound to moving through or acting on a list. Page
+    /// shortcuts that are not configurable (History's Space/`d`/`u`, UP's
+    /// `o`/`s`) yield to these so a user's custom binding always works.
+    pub fn matches_list_navigation(&self, key: KeyCode) -> bool {
+        self.matches_up(key)
+            || self.matches_down(key)
+            || self.matches_left(key)
+            || self.matches_right(key)
+            || self.matches_page_up(key)
+            || self.matches_page_down(key)
+            || self.matches_confirm(key)
+            || self.matches_back(key)
+            || self.matches_play(key)
+    }
+
     pub fn matches_tab_1(&self, key: KeyCode) -> bool {
         self.matches(&self.tab_1, key)
     }
