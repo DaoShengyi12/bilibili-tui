@@ -980,6 +980,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn superseded_video_detail_reloads_when_shown_again() {
+        let (mut app, rx) = app();
+        app.handle_action(AppAction::OpenVideoDetail("BVa".into(), 1))
+            .await;
+        app.handle_action(AppAction::OpenVideoDetail("BVb".into(), 2))
+            .await;
+        // B superseded A's request; the worker reports A as cancelled.
+        rx.try_iter().for_each(drop);
+
+        app.handle_action(AppAction::BackToList).await;
+
+        let Page::VideoDetail(page) = &app.current_page else {
+            panic!("expected video A");
+        };
+        assert_eq!(page.bvid, "BVa");
+        let reload = rx.try_iter().find_map(|command| match command {
+            NetworkCommand::LoadVideoDetail { req_id, bvid, .. } => Some((req_id, bvid)),
+            _ => None,
+        });
+        let (req_id, bvid) = reload.expect("A is requested again");
+        assert_eq!(bvid, "BVa");
+        assert!(app.is_latest_request("video_detail", req_id));
+    }
+
+    #[tokio::test]
+    async fn loaded_page_is_not_requested_again_when_shown() {
+        let (mut app, rx) = app();
+        app.handle_action(AppAction::OpenVideoDetail("BVa".into(), 1))
+            .await;
+        if let Page::VideoDetail(page) = &mut app.current_page {
+            page.loading = false;
+        }
+        app.handle_action(AppAction::OpenUpPage(5)).await;
+        rx.try_iter().for_each(drop);
+
+        app.handle_action(AppAction::BackToList).await;
+
+        assert!(
+            rx.try_iter()
+                .all(|command| !matches!(command, NetworkCommand::LoadVideoDetail { .. }))
+        );
+    }
+
+    #[tokio::test]
     async fn back_from_dynamic_detail_restores_the_list_without_reloading() {
         let (mut app, rx) = app();
         app.sidebar

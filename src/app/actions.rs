@@ -34,6 +34,50 @@ impl App {
         self.navigation_stack.push(previous);
     }
 
+    /// Pages of one kind share a request key, so opening video B before
+    /// video A loaded supersedes A's request and A would stay loading in the
+    /// back stack. When such a page is shown again, request it again.
+    fn resume_restored_page(&mut self) {
+        // Field borrows: the page is read while the tracker issues an ID.
+        let command = match &self.current_page {
+            Page::VideoDetail(page) if page.loading => network::NetworkCommand::LoadVideoDetail {
+                req_id: self.request_tracker.next("video_detail"),
+                bvid: page.bvid.clone(),
+                aid: page.aid,
+                include_related: !self.config.minimal_mode,
+            },
+            Page::DynamicDetail(page) if page.loading => {
+                network::NetworkCommand::LoadDynamicDetail {
+                    req_id: self.request_tracker.next("dynamic_detail"),
+                    dynamic_id: page.dynamic_id.clone(),
+                }
+            }
+            Page::ArticleDetail(page) if page.loading => network::NetworkCommand::LoadArticle {
+                req_id: self.request_tracker.next("article_detail"),
+                cvid: page.cvid,
+            },
+            Page::BangumiDetail(page) if page.loading => {
+                network::NetworkCommand::LoadBangumiDetail {
+                    req_id: self.request_tracker.next("bangumi_detail"),
+                    season_id: page.season_id,
+                }
+            }
+            Page::LiveDetail(page) if page.is_loading() => {
+                network::NetworkCommand::LoadLiveDetail {
+                    req_id: self.request_tracker.next("live_detail"),
+                    room_id: page.room_id(),
+                }
+            }
+            Page::Up(page) if page.loading => network::NetworkCommand::LoadUpPage {
+                req_id: self.request_tracker.next("up_page"),
+                mid: page.mid,
+                order: page.video_order,
+            },
+            _ => return,
+        };
+        self.send_network_command(command);
+    }
+
     /// Sidebar navigation starts a new history. List pages kept in the back
     /// stack move to their tab caches; detail pages are dropped.
     fn leave_navigation_stack(&mut self) {
@@ -436,6 +480,7 @@ impl App {
                     .navigation_stack
                     .pop()
                     .expect("navigation stack checked as non-empty");
+                self.resume_restored_page();
             }
             AppAction::BackToList => {
                 self.auto_return_after_playback = None;
