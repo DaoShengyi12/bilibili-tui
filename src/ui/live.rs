@@ -1,7 +1,6 @@
 //! Live streaming recommendations page with grid layout
 
 use super::{Component, Theme, shortcut_footer};
-use crate::api::client::ApiClient;
 use crate::api::live::LiveRoom;
 use crate::application::AppAction;
 use crate::storage::Keybindings;
@@ -80,34 +79,6 @@ impl LivePage {
         }
     }
 
-    pub async fn load_recommendations(&mut self, api_client: &ApiClient) {
-        if self.loading {
-            return;
-        }
-        self.loading = true;
-        self.error = None;
-
-        match api_client.get_live_recommendations().await {
-            Ok(rooms) => {
-                self.rooms = rooms
-                    .into_iter()
-                    .map(|room| LiveCard {
-                        room,
-                        cover_image: None,
-                    })
-                    .collect();
-                self.loading = false;
-                self.selected_index = 0;
-                self.scroll_offset = 0;
-                self.last_load_time = Some(Instant::now());
-            }
-            Err(e) => {
-                self.error = Some(format!("加载直播推荐失败: {}", e));
-                self.loading = false;
-            }
-        }
-    }
-
     pub fn begin_loading(&mut self) {
         self.loading = true;
         self.loading_more = false;
@@ -162,37 +133,6 @@ impl LivePage {
 
     pub fn apply_live_more_error(&mut self) {
         self.loading_more = false;
-    }
-
-    pub async fn refresh(&mut self, api_client: &ApiClient) {
-        self.rooms.clear();
-        self.selected_index = 0;
-        self.scroll_offset = 0;
-        self.pending_downloads.clear();
-        self.load_recommendations(api_client).await;
-    }
-
-    pub async fn load_more(&mut self, api_client: &ApiClient) {
-        if self.loading_more {
-            return;
-        }
-
-        self.loading_more = true;
-
-        match api_client.get_live_recommendations().await {
-            Ok(rooms) => {
-                for room in rooms {
-                    self.rooms.push(LiveCard {
-                        room,
-                        cover_image: None,
-                    });
-                }
-                self.loading_more = false;
-            }
-            Err(_) => {
-                self.loading_more = false;
-            }
-        }
     }
 
     pub fn is_near_bottom(&self, visible_rows: usize) -> bool {

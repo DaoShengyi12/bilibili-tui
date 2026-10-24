@@ -3,7 +3,6 @@
 use super::video_card::{VideoCard, VideoCardGrid};
 use super::{Component, Theme, shortcut_footer};
 use crate::api::bangumi::SeasonRankItem;
-use crate::api::client::ApiClient;
 use crate::application::AppAction;
 use crate::storage::Keybindings;
 use ratatui::{
@@ -59,15 +58,6 @@ impl BangumiPage {
     pub fn set_error(&mut self, msg: String) {
         self.error_message = Some(msg);
         self.loading = false;
-    }
-
-    pub async fn load_index(&mut self, api_client: &ApiClient) {
-        self.loading = true;
-        self.error_message = None;
-        match api_client.get_bangumi_rank().await {
-            Ok(items) => self.set_index_items(items),
-            Err(e) => self.set_error(format!("加载番剧排行失败: {}", e)),
-        }
     }
 
     /// Get selected index action

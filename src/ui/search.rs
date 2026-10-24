@@ -2,7 +2,6 @@
 
 use super::video_card::{VideoCard, VideoCardGrid};
 use super::{Component, Theme, shortcut_footer};
-use crate::api::client::ApiClient;
 use crate::api::search::{HotwordItem, SearchVideoItem};
 use crate::application::AppAction;
 use crate::storage::Keybindings;
@@ -133,34 +132,6 @@ impl SearchPage {
     pub fn set_hotword_error(&mut self, msg: String) {
         self.hotword_error = Some(msg);
         self.hotword_loading = false;
-    }
-
-    pub async fn load_more(&mut self, api_client: &ApiClient) {
-        if self.loading_more || self.query.is_empty() || self.show_hot_list {
-            return;
-        }
-
-        // Check if we have more results
-        if self.grid.cards.len() >= self.total_results as usize {
-            return;
-        }
-
-        self.loading_more = true;
-        self.page += 1;
-
-        match api_client.search_videos(&self.query, self.page).await {
-            Ok(data) => {
-                let results = data.result.unwrap_or_default();
-                if results.is_empty() {
-                    self.page -= 1;
-                }
-                self.append_results(results);
-            }
-            Err(_) => {
-                self.page -= 1;
-                self.loading_more = false;
-            }
-        }
     }
 
     pub fn poll_cover_results(&mut self) {

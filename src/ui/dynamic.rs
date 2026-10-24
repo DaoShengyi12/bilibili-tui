@@ -2,7 +2,6 @@
 
 use super::video_card::{VideoCard, VideoCardGrid};
 use super::{Component, Theme, shortcut_footer};
-use crate::api::client::ApiClient;
 use crate::api::dynamic::DynamicItem;
 use crate::application::AppAction;
 use crate::storage::Keybindings;
@@ -325,31 +324,6 @@ impl DynamicPage {
         self.error_message = Some(msg);
         self.loading = false;
         self.loading_more = false;
-    }
-
-    pub async fn load_more(&mut self, api_client: &ApiClient) {
-        if self.loading_more || !self.has_more {
-            return;
-        }
-
-        self.loading_more = true;
-
-        let feed_type = self.current_tab.get_feed_type();
-        let host_mid = self.get_selected_up_mid();
-        match api_client
-            .get_dynamic_feed(self.offset.as_deref(), feed_type, host_mid)
-            .await
-        {
-            Ok(data) => {
-                let items = data.items.unwrap_or_default();
-                let offset = data.offset;
-                let has_more = data.has_more.unwrap_or(false);
-                self.append_feed(items, offset, has_more);
-            }
-            Err(_) => {
-                self.loading_more = false;
-            }
-        }
     }
 
     pub fn poll_cover_results(&mut self) {

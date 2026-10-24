@@ -1,7 +1,6 @@
 //! History page with watch history display in a grid layout with cover images
 
 use super::{Component, Theme, shortcut_footer};
-use crate::api::client::ApiClient;
 use crate::api::history::{HistoryCursor, HistoryItem, HistoryKey};
 use crate::application::AppAction;
 use crate::storage::Keybindings;
@@ -97,32 +96,6 @@ impl HistoryPage {
         }
     }
 
-    pub async fn load_history(&mut self, api_client: &ApiClient) {
-        self.loading = true;
-        self.error = None;
-
-        match api_client.get_history(None, None, None).await {
-            Ok(data) => {
-                self.items = data
-                    .list
-                    .into_iter()
-                    .map(|item| HistoryCard {
-                        item,
-                        cover_protocol: None,
-                    })
-                    .collect();
-                self.cursor = Some(data.cursor);
-                self.has_more = !self.items.is_empty();
-                self.loading = false;
-                self.reset_selection_and_downloads();
-            }
-            Err(e) => {
-                self.error = Some(format!("加载历史记录失败: {}", e));
-                self.loading = false;
-            }
-        }
-    }
-
     pub fn is_loading(&self) -> bool {
         self.loading
     }
@@ -195,50 +168,6 @@ impl HistoryPage {
     /// such as when credentials expire between confirmation and dispatch.
     pub fn cancel_deletion(&mut self) {
         self.sync_selection_mode();
-    }
-
-    pub async fn load_more(&mut self, api_client: &ApiClient) {
-        if self.loading || !self.has_more {
-            return;
-        }
-
-        let Some(cursor) = &self.cursor else {
-            return;
-        };
-
-        self.loading = true;
-
-        match api_client
-            .get_history(
-                Some(cursor.max),
-                Some(cursor.view_at),
-                Some(&cursor.business),
-            )
-            .await
-        {
-            Ok(data) => {
-                let new_items: Vec<HistoryCard> = data
-                    .list
-                    .into_iter()
-                    .map(|item| HistoryCard {
-                        item,
-                        cover_protocol: None,
-                    })
-                    .collect();
-
-                if new_items.is_empty() {
-                    self.has_more = false;
-                } else {
-                    self.cursor = Some(data.cursor);
-                    self.items.extend(new_items);
-                }
-                self.loading = false;
-            }
-            Err(e) => {
-                self.error = Some(format!("加载更多失败: {}", e));
-                self.loading = false;
-            }
-        }
     }
 
     fn is_near_bottom(&self, visible_rows: usize) -> bool {

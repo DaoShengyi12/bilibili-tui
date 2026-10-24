@@ -1,7 +1,6 @@
 //! Homepage with video recommendations in a grid layout with cover images
 
 use super::{Component, SearchPage, Theme, shortcut_footer};
-use crate::api::client::ApiClient;
 use crate::api::recommend::HomeFeed;
 use crate::api::recommend::VideoItem;
 use crate::application::AppAction;
@@ -227,26 +226,6 @@ impl HomePage {
         }
     }
 
-    pub async fn load_recommendations(&mut self, api_client: &ApiClient) {
-        self.loading = true;
-        self.error_message = None;
-        self.pending_downloads.clear();
-        self.fresh_idx = 1;
-
-        match api_client.get_recommendations().await {
-            Ok(videos) => {
-                self.videos = videos.into_iter().map(VideoCard::new).collect();
-                self.loading = false;
-                self.selected_index = 0;
-                self.scroll_row = 0;
-            }
-            Err(e) => {
-                self.error_message = Some(format!("加载推荐视频失败: {}", e));
-                self.loading = false;
-            }
-        }
-    }
-
     pub fn begin_loading(&mut self) {
         self.loading = true;
         self.loading_more = false;
@@ -308,28 +287,6 @@ impl HomePage {
     pub fn apply_load_more_error(&mut self) {
         self.fresh_idx -= 1;
         self.loading_more = false;
-    }
-
-    pub async fn load_more(&mut self, api_client: &ApiClient) {
-        if self.loading_more {
-            return;
-        }
-
-        self.loading_more = true;
-        self.fresh_idx += 1;
-
-        match api_client.get_recommendations_paged(self.fresh_idx).await {
-            Ok(videos) => {
-                for video in videos {
-                    self.videos.push(VideoCard::new(video));
-                }
-                self.loading_more = false;
-            }
-            Err(_) => {
-                self.fresh_idx -= 1;
-                self.loading_more = false;
-            }
-        }
     }
 
     pub fn is_near_bottom(&self, visible_rows: usize) -> bool {
