@@ -65,8 +65,49 @@ pub struct DynamicFeedData {
 
 #[cfg(test)]
 mod tests {
-    use super::DynamicFeedData;
+    use super::{DynamicFeedData, DynamicItem};
     use serde::Deserialize;
+
+    #[test]
+    fn video_and_opus_dynamics_comment_on_basic_comment_target() {
+        let video: DynamicItem = serde_json::from_value(serde_json::json!({
+            "id_str": "1262563193572556921",
+            "type": "DYNAMIC_TYPE_AV",
+            "basic": {"comment_type": 1, "comment_id_str": "117488511615141"},
+            "modules": {"module_dynamic": {"major": {"type": "MAJOR_TYPE_ARCHIVE"}}}
+        }))
+        .unwrap();
+        assert_eq!(video.comment_type(), 1);
+        assert_eq!(
+            video.comment_oid("1262563193572556921"),
+            Some(117488511615141)
+        );
+
+        let opus: DynamicItem = serde_json::from_value(serde_json::json!({
+            "id_str": "1262558061062520855",
+            "type": "DYNAMIC_TYPE_DRAW",
+            "basic": {"comment_type": 11, "comment_id_str": "413121832"},
+            "modules": {"module_dynamic": {"major": {"type": "MAJOR_TYPE_OPUS"}}}
+        }))
+        .unwrap();
+        assert_eq!(opus.comment_type(), 11);
+        assert_eq!(opus.comment_oid("1262558061062520855"), Some(413121832));
+    }
+
+    #[test]
+    fn dynamics_without_basic_keep_previous_comment_target() {
+        let forward: DynamicItem = serde_json::from_value(serde_json::json!({
+            "id_str": "1262523297597227011",
+            "type": "DYNAMIC_TYPE_FORWARD",
+            "modules": {"module_dynamic": {"major": null}}
+        }))
+        .unwrap();
+        assert_eq!(forward.comment_type(), 17);
+        assert_eq!(
+            forward.comment_oid("1262523297597227011"),
+            Some(1262523297597227011)
+        );
+    }
 
     #[test]
     fn feed_accepts_string_update_num() {
@@ -173,6 +214,22 @@ pub struct DynamicItem {
     #[serde(rename = "type")]
     pub dynamic_type: Option<String>,
     pub modules: Option<DynamicModules>,
+    #[serde(default)]
+    pub basic: Option<DynamicBasic>,
+}
+
+/// Server-provided comment target. Video dynamics comment on the aid and
+/// opus/draw dynamics on their rid, so the dynamic id is not always the oid.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DynamicBasic {
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub comment_type: Option<i64>,
+    #[serde(
+        default,
+        rename = "comment_id_str",
+        deserialize_with = "deserialize_optional_i64"
+    )]
+    pub comment_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -446,6 +503,15 @@ impl DynamicItem {
     /// Type 17: 动态（纯文字动态&分享） - text dynamics and shares
     /// Type 1: 视频 - videos (MAJOR_TYPE_ARCHIVE)
     pub fn comment_type(&self) -> i32 {
+        if let Some(comment_type) = self
+            .basic
+            .as_ref()
+            .and_then(|basic| basic.comment_type)
+            .and_then(|value| i32::try_from(value).ok())
+            .filter(|value| *value > 0)
+        {
+            return comment_type;
+        }
         if let Some(major_type) = self
             .modules
             .as_ref()
@@ -467,6 +533,14 @@ impl DynamicItem {
     /// For image dynamics (MAJOR_TYPE_DRAW), use the draw.id
     /// For other types, use the dynamic id itself
     pub fn comment_oid(&self, dynamic_id: &str) -> Option<i64> {
+        if let Some(oid) = self
+            .basic
+            .as_ref()
+            .and_then(|basic| basic.comment_id)
+            .filter(|oid| *oid > 0)
+        {
+            return Some(oid);
+        }
         if self.is_draw() {
             // For draw type, use the draw.id as oid
             self.modules
