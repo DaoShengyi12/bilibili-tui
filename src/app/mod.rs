@@ -50,6 +50,11 @@ pub struct App {
     pub config: AppConfig,
     pub keybindings: Keybindings,
     pub pending_home_notice: Option<String>,
+    /// One-line notice drawn over the bottom row until the next key press,
+    /// for failures that have no page of their own (config load/save).
+    pub status_notice: Option<String>,
+    /// Set once the network worker stops accepting commands or sending events.
+    network_worker_lost: std::cell::Cell<bool>,
     pub playback: PlaybackState,
     /// The most recent live danmaku connection. Live pages and players own
     /// it, so it closes once they are gone instead of living as long as the app.
@@ -86,8 +91,15 @@ impl App {
 
         persistence::remove_stale_cookie_exports();
 
-        // Load config and apply saved theme
-        let config = persistence::load_config().unwrap_or_default();
+        // Load config and apply saved theme. An unreadable config was moved
+        // aside by `load_config`; say so instead of silently using defaults.
+        let (config, config_notice) = match persistence::load_config() {
+            Ok(config) => (config, None),
+            Err(error) => (
+                AppConfig::default(),
+                Some(format!("⚠ 配置文件读取失败，已改用默认设置：{error:#}")),
+            ),
+        };
         let (danmaku_config_tx, _) = watch::channel(config.danmaku.clone());
         let keybindings = config.keybindings.clone();
         let configured_theme_id = config.theme.clone();
@@ -120,6 +132,8 @@ impl App {
             keybindings,
             pending_home_notice: used_fallback
                 .then_some("⚠ 旧主题配置无效，请前往设置页重新选择主题".to_string()),
+            status_notice: config_notice,
+            network_worker_lost: std::cell::Cell::new(false),
             playback: PlaybackState::default(),
             live_danmaku_hub: None,
             danmaku_config_tx,
@@ -145,7 +159,16 @@ impl App {
     }
 
     fn send_network_command(&self, command: network::NetworkCommand) {
-        let _ = self.network_command_tx.send(command);
+        if self.network_command_tx.send(command).is_err() {
+            self.network_worker_lost.set(true);
+        }
+    }
+
+    /// Surface a failed save of settings or credentials as a status notice.
+    fn report_save_result(&mut self, what: &str, result: anyhow::Result<()>) {
+        if let Err(error) = result {
+            self.status_notice = Some(format!("⚠ {what}失败：{error:#}"));
+        }
     }
 
     /// The shared danmaku connection for `room_id`, if something still uses it.

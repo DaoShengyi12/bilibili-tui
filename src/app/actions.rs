@@ -127,7 +127,7 @@ impl App {
             }
             AppAction::LoginSuccess(creds) => {
                 // Save credentials
-                let _ = persistence::save_credentials(&creds);
+                self.report_save_result("保存登录信息", persistence::save_credentials(&creds));
                 self.credentials = Some(creds.clone());
                 // Update API client with new cookies
                 {
@@ -664,7 +664,7 @@ impl App {
                 self.current_page = Page::Settings(Box::new(page));
             }
             AppAction::Logout => {
-                let _ = persistence::delete_credentials();
+                self.report_save_result("删除登录信息", persistence::delete_credentials());
                 self.credentials = None;
                 self.api_client.clear_credentials();
                 self.reset_account_state();
@@ -713,13 +713,13 @@ impl App {
             AppAction::SaveKeybindings(new_keybindings) => {
                 self.keybindings = (*new_keybindings).clone();
                 self.config.keybindings = *new_keybindings;
-                let _ = persistence::save_config(&self.config);
+                self.report_save_result("保存设置", persistence::save_config(&self.config));
             }
             AppAction::SaveDanmakuConfig(danmaku) => {
                 self.config.danmaku = *danmaku;
                 self.danmaku_config_tx
                     .send_replace(self.config.danmaku.clone());
-                let _ = persistence::save_config(&self.config);
+                self.report_save_result("保存设置", persistence::save_config(&self.config));
             }
             AppAction::SaveMinimalMode(enabled) => {
                 self.apply_minimal_mode(enabled);
@@ -740,11 +740,11 @@ impl App {
             }
             AppAction::SaveAutoPlay(enabled) => {
                 self.config.auto_play = enabled;
-                let _ = persistence::save_config(&self.config);
+                self.report_save_result("保存设置", persistence::save_config(&self.config));
             }
             AppAction::SaveVideoQuality(quality) => {
                 self.config.video_quality = quality;
-                let _ = persistence::save_config(&self.config);
+                self.report_save_result("保存设置", persistence::save_config(&self.config));
             }
             AppAction::SwitchToLive => {
                 self.sidebar.select(NavItem::Live);
@@ -1259,6 +1259,6 @@ impl App {
 
     fn save_theme_to_config(&mut self) {
         self.config.theme = self.theme_id.clone();
-        if persistence::save_config(&self.config).is_err() {}
+        self.report_save_result("保存主题", persistence::save_config(&self.config));
     }
 }

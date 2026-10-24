@@ -110,6 +110,7 @@ impl App {
                 _ => {}
             }
             self.draw_playback_error(frame, area);
+            self.draw_status_notice(frame, area);
             return;
         }
 
@@ -137,6 +138,38 @@ impl App {
         }
         self.draw_playback_error(frame, area);
         self.draw_playback_starting(frame, area);
+        self.draw_status_notice(frame, area);
+    }
+
+    /// The bottom-row notice for app-level failures. A lost network worker
+    /// stays visible because nothing can load until the app restarts.
+    fn status_notice_text(&self) -> Option<&str> {
+        if self.network_worker_lost.get() {
+            return Some("⚠ 网络线程已停止，无法加载内容；请重启应用");
+        }
+        self.status_notice.as_deref()
+    }
+
+    fn draw_status_notice(&self, frame: &mut Frame, area: Rect) {
+        if self.playback.last_error.is_some()
+            || self.playback.status == crate::domain::playback::PlaybackStatus::Starting
+        {
+            return;
+        }
+        let Some(notice) = self.status_notice_text() else {
+            return;
+        };
+        let bar = Rect {
+            x: area.x,
+            y: area.bottom().saturating_sub(1),
+            width: area.width,
+            height: 1.min(area.height),
+        };
+        let message = Paragraph::new(notice)
+            .style(Style::default().fg(self.theme.warning))
+            .alignment(Alignment::Center);
+        frame.render_widget(Clear, bar);
+        frame.render_widget(message, bar);
     }
 
     fn draw_playback_starting(&self, frame: &mut Frame, area: Rect) {
@@ -203,6 +236,7 @@ impl App {
         // Playback errors remain visible until the user acknowledges them with
         // the next key press; the key still performs its normal action.
         self.playback.last_error = None;
+        self.status_notice = None;
         let keys = &self.keybindings;
         let action = match &mut self.current_page {
             Page::Login(page) => page.handle_input(key, keys),
@@ -404,6 +438,35 @@ mod tests {
     fn select_own_space(app: &mut App) {
         app.sidebar.select(NavItem::MySpace);
         app.current_page = Page::Up(Box::new(UpPage::new_sidebar(1)));
+    }
+
+    #[tokio::test]
+    async fn lost_network_worker_is_reported_and_stays_visible() {
+        let (mut app, rx) = minimal_app();
+        drop(rx);
+        assert!(app.status_notice_text().is_none());
+
+        app.handle_action(AppAction::CancelPendingLoads).await;
+
+        assert!(app.status_notice_text().unwrap().contains("网络线程已停止"));
+        app.handle_input(KeyCode::Char('j'), KeyModifiers::NONE)
+            .await;
+        assert!(app.status_notice_text().is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_save_shows_a_notice_until_the_next_key() {
+        let (mut app, _rx) = minimal_app();
+        app.report_save_result("保存设置", Err(anyhow::anyhow!("permission denied")));
+        assert_eq!(
+            app.status_notice_text(),
+            Some("⚠ 保存设置失败：permission denied")
+        );
+
+        app.handle_input(KeyCode::Char('j'), KeyModifiers::NONE)
+            .await;
+
+        assert!(app.status_notice_text().is_none());
     }
 
     #[tokio::test]

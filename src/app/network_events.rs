@@ -42,8 +42,15 @@ impl App {
     }
 
     pub(super) fn drain_network_events(&mut self) {
-        while let Ok(event) = self.network_event_rx.try_recv() {
-            self.handle_network_event(event);
+        loop {
+            match self.network_event_rx.try_recv() {
+                Ok(event) => self.handle_network_event(event),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.network_worker_lost.set(true);
+                    break;
+                }
+            }
         }
     }
 
