@@ -217,12 +217,12 @@ impl App {
         let keys = &self.keybindings;
         let action = match &mut self.current_page {
             Page::Login(page) => page.handle_input(key, keys),
-            Page::Home(page) => page.handle_input(key, keys),
-            Page::Search(page) => page.handle_input(key, keys),
+            Page::Home(page) => page.handle_input_with_modifiers(key, modifiers, keys),
+            Page::Search(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::Dynamic(page) => page.handle_input_with_modifiers(key, modifiers, keys),
-            Page::DynamicDetail(page) => page.handle_input(key, keys),
+            Page::DynamicDetail(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::ArticleDetail(page) => page.handle_input(key, keys),
-            Page::VideoDetail(page) => page.handle_input(key, keys),
+            Page::VideoDetail(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::History(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::Favorites(page) => page.handle_input(key, keys),
             Page::Live(page) => page.handle_input(key, keys),

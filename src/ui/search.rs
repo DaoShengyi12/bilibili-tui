@@ -425,6 +425,19 @@ impl Component for SearchPage {
         frame.render_widget(help, chunks[2]);
     }
 
+    fn handle_input_with_modifiers(
+        &mut self,
+        key: KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+        keys: &crate::storage::Keybindings,
+    ) -> Option<AppAction> {
+        if self.input_mode && super::text::apply_line_edit(&mut self.query, key, modifiers) {
+            self.show_hot_list = self.hotwords_enabled;
+            return Some(AppAction::None);
+        }
+        self.handle_input(key, keys)
+    }
+
     fn handle_input(
         &mut self,
         key: KeyCode,

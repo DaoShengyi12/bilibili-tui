@@ -548,6 +548,20 @@ impl Component for HomePage {
         }
     }
 
+    fn handle_input_with_modifiers(
+        &mut self,
+        key: KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+        keys: &crate::storage::Keybindings,
+    ) -> Option<AppAction> {
+        if self.selected_source == 0 && self.search.input_mode {
+            return self
+                .search
+                .handle_input_with_modifiers(key, modifiers, keys);
+        }
+        self.handle_input(key, keys)
+    }
+
     fn handle_input(
         &mut self,
         key: KeyCode,
@@ -1033,6 +1047,22 @@ mod tests {
         assert!(page.begin_load_more().is_some());
         page.begin_loading();
         assert!(!page.loading_more);
+    }
+
+    #[test]
+    fn home_search_box_clears_with_ctrl_u() {
+        let mut page = HomePage::new();
+        page.begin_search();
+        let keys = Keybindings::default();
+        for character in "abc".chars() {
+            page.handle_input(KeyCode::Char(character), &keys);
+        }
+        page.handle_input_with_modifiers(
+            KeyCode::Char('u'),
+            crossterm::event::KeyModifiers::CONTROL,
+            &keys,
+        );
+        assert!(page.search.query.is_empty());
     }
 
     #[test]

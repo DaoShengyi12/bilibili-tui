@@ -733,6 +733,19 @@ impl Component for VideoDetailPage {
         frame.render_widget(help, help_chunk);
     }
 
+    fn handle_input_with_modifiers(
+        &mut self,
+        key: KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+        keys: &crate::storage::Keybindings,
+    ) -> Option<AppAction> {
+        if self.input_mode && super::text::apply_line_edit(&mut self.input_buffer, key, modifiers) {
+            self.notice = None;
+            return Some(AppAction::None);
+        }
+        self.handle_input(key, keys)
+    }
+
     fn handle_input(
         &mut self,
         key: KeyCode,
@@ -1086,6 +1099,26 @@ mod comment_loading_tests {
         page.begin_load_more_comments();
         page.apply_more_comments(3, Some(Vec::new()));
         assert!(!page.has_more_comments && !page.loading_more_comments);
+    }
+
+    #[test]
+    fn comment_box_handles_ctrl_shortcuts_instead_of_typing_them() {
+        let mut page = VideoDetailPage::new("BV1test".into(), 1);
+        page.input_mode = true;
+        page.input_buffer = "first second".into();
+        let keys = Keybindings::default();
+        page.handle_input_with_modifiers(
+            KeyCode::Char('w'),
+            crossterm::event::KeyModifiers::CONTROL,
+            &keys,
+        );
+        assert_eq!(page.input_buffer, "first ");
+        page.handle_input_with_modifiers(
+            KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+            &keys,
+        );
+        assert_eq!(page.input_buffer, "first x");
     }
 
     #[test]

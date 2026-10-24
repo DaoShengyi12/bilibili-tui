@@ -440,6 +440,19 @@ impl Component for DynamicDetailPage {
         frame.render_widget(help, help_chunk);
     }
 
+    fn handle_input_with_modifiers(
+        &mut self,
+        key: KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+        keys: &crate::storage::Keybindings,
+    ) -> Option<AppAction> {
+        if self.input_mode && super::text::apply_line_edit(&mut self.input_buffer, key, modifiers) {
+            self.notice = None;
+            return Some(AppAction::None);
+        }
+        self.handle_input(key, keys)
+    }
+
     fn handle_input(
         &mut self,
         key: KeyCode,

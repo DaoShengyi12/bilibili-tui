@@ -1,7 +1,38 @@
 //! Terminal-column aware text helpers. CJK characters and most emoji take two
 //! columns, so `chars().count()` under-measures titles and comments.
 
+use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Apply the readline-style shortcuts of a single-line input: Ctrl+U clears
+/// the line, Ctrl+W deletes the previous word. Other Ctrl/Alt chords are
+/// swallowed so they are not typed as letters. Returns `false` for keys
+/// without such modifiers, which the caller handles as plain input.
+pub fn apply_line_edit(buffer: &mut String, key: KeyCode, modifiers: KeyModifiers) -> bool {
+    let KeyCode::Char(character) = key else {
+        return false;
+    };
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        match character.to_ascii_lowercase() {
+            'u' => buffer.clear(),
+            'w' => delete_previous_word(buffer),
+            _ => {}
+        }
+        return true;
+    }
+    modifiers.contains(KeyModifiers::ALT)
+}
+
+fn delete_previous_word(buffer: &mut String) {
+    let trimmed = buffer.trim_end_matches(char::is_whitespace).len();
+    buffer.truncate(trimmed);
+    let word_start = buffer
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    buffer.truncate(word_start);
+}
 
 /// Number of terminal columns `text` occupies.
 pub fn display_width(text: &str) -> usize {
@@ -75,6 +106,55 @@ pub fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_edit_shortcuts_are_not_typed_as_letters() {
+        let mut buffer = "hello big world  ".to_string();
+        assert!(apply_line_edit(
+            &mut buffer,
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL
+        ));
+        assert_eq!(buffer, "hello big ");
+        assert!(apply_line_edit(
+            &mut buffer,
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL
+        ));
+        assert_eq!(buffer, "hello ");
+        assert!(apply_line_edit(
+            &mut buffer,
+            KeyCode::Char('x'),
+            KeyModifiers::ALT
+        ));
+        assert_eq!(buffer, "hello ");
+        assert!(apply_line_edit(
+            &mut buffer,
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(buffer.is_empty());
+
+        let mut chinese = "中文 评论".to_string();
+        apply_line_edit(&mut chinese, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(chinese, "中文 ");
+
+        assert!(!apply_line_edit(
+            &mut buffer,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        ));
+        assert!(!apply_line_edit(
+            &mut buffer,
+            KeyCode::Char('A'),
+            KeyModifiers::SHIFT
+        ));
+        assert!(!apply_line_edit(
+            &mut buffer,
+            KeyCode::Backspace,
+            KeyModifiers::CONTROL
+        ));
+    }
 
     #[test]
     fn cjk_titles_are_measured_in_columns() {
