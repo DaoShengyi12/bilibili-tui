@@ -417,16 +417,36 @@ impl VideoDetailPage {
             }
         }
 
-        // Calculate scroll and visible items
+        // Start the window at the selected comment. Replies are list items
+        // too, so the comment index alone would scroll past it.
         let visible_count = (inner.height as usize / item_height).max(1);
         let display_items: Vec<ListItem> = all_items
             .into_iter()
-            .skip(self.comment_scroll)
+            .skip(self.selected_comment_item())
             .take(visible_count)
             .collect();
 
         let list = List::new(display_items);
         frame.render_widget(list, inner);
+    }
+
+    /// Index of the selected comment among the rendered list items, which
+    /// include the replies (or loading row) of an expanded comment above it.
+    fn selected_comment_item(&self) -> usize {
+        let expanded_above = self.expanded_comment.is_some_and(|rpid| {
+            self.comments
+                .iter()
+                .take(self.comment_scroll)
+                .any(|comment| comment.rpid == rpid)
+        });
+        let reply_items = if !expanded_above {
+            0
+        } else if self.loading_replies {
+            1
+        } else {
+            self.comment_replies.len()
+        };
+        self.comment_scroll + reply_items
     }
 
     fn render_related(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -1066,6 +1086,19 @@ mod comment_loading_tests {
         page.begin_load_more_comments();
         page.apply_more_comments(3, Some(Vec::new()));
         assert!(!page.has_more_comments && !page.loading_more_comments);
+    }
+
+    #[test]
+    fn selected_comment_stays_first_after_replies_expand_above_it() {
+        let mut page = VideoDetailPage::new("BV1test".into(), 1);
+        page.comments = vec![comment(7, 2), comment(8, 0), comment(9, 0)];
+        assert_eq!(page.toggle_comment_replies(), Some(7));
+        page.apply_comment_replies(7, Some(vec![comment(70, 0), comment(71, 0)]));
+
+        assert_eq!(page.selected_comment_item(), 0);
+        page.comment_scroll = 2;
+        // Items: c7, r70, r71, c8, c9 -> the selected c9 is item 4.
+        assert_eq!(page.selected_comment_item(), 4);
     }
 
     #[test]
