@@ -17,10 +17,15 @@ struct ProxyState {
     audio: Vec<CdnCandidate>,
     video_index: AtomicUsize,
     audio_index: AtomicUsize,
-    prefixes: Mutex<HashMap<usize, CachedPrefix>>,
-    audio_cache: RwLock<Option<CachedPrefix>>,
+    prefixes: Mutex<HashMap<usize, Arc<CachedPrefix>>>,
+    audio_cache: RwLock<Option<Arc<CachedPrefix>>>,
+    /// Cancels the running audio prefetch when a newer one starts.
+    audio_prefetch: std::sync::Mutex<Option<CancellationToken>>,
     cancellation: CancellationToken,
 }
+
+/// Largest audio track kept in memory; longer tracks stream from the CDN.
+const MAX_AUDIO_CACHE: u64 = 64 * 1024 * 1024;
 
 struct CachedPrefix {
     bytes: Vec<u8>,
@@ -52,6 +57,7 @@ impl MediaProxy {
             audio_index: AtomicUsize::new(0),
             prefixes: Mutex::new(HashMap::new()),
             audio_cache: RwLock::new(None),
+            audio_prefetch: std::sync::Mutex::new(None),
             cancellation: CancellationToken::new(),
         });
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
@@ -132,7 +138,16 @@ impl MediaProxy {
     }
 }
 
+/// Download the current audio track into memory. Starting a new prefetch
+/// (after an audio failover) cancels the previous one, so the track is never
+/// downloaded twice at once and an older download cannot undo the failover.
 fn prefetch_audio(state: Arc<ProxyState>) {
+    let token = state.cancellation.child_token();
+    if let Ok(mut running) = state.audio_prefetch.lock()
+        && let Some(previous) = running.replace(token.clone())
+    {
+        previous.cancel();
+    }
     tokio::spawn(async move {
         let download = async {
             let start = state.audio_index.load(Ordering::Acquire);
@@ -161,17 +176,19 @@ fn prefetch_audio(state: Arc<ProxyState>) {
                     bytes.extend_from_slice(&chunk);
                 }
                 if bytes.len() as u64 == total {
-                    state.audio_index.store(index, Ordering::Release);
-                    return Some(CachedPrefix { bytes, total });
+                    return Some((index, CachedPrefix { bytes, total }));
                 }
             }
             None
         };
         tokio::select! {
-            _ = state.cancellation.cancelled() => {}
+            _ = token.cancelled() => {}
             cached = download => {
-                if let Some(cached) = cached {
-                    *state.audio_cache.write().await = Some(cached);
+                if let Some((index, cached)) = cached
+                    && !token.is_cancelled()
+                {
+                    state.audio_index.store(index, Ordering::Release);
+                    *state.audio_cache.write().await = Some(Arc::new(cached));
                 }
             }
         }
@@ -191,7 +208,6 @@ fn cacheable_audio_length_parts(
     headers: &reqwest::header::HeaderMap,
     content_length: Option<u64>,
 ) -> Option<u64> {
-    const MAX_AUDIO_CACHE: u64 = 256 * 1024 * 1024;
     let total = match status {
         reqwest::StatusCode::PARTIAL_CONTENT => headers
             .get(CONTENT_RANGE)
@@ -259,7 +275,7 @@ fn prefetch_backup(state: Arc<ProxyState>) {
                     .prefixes
                     .lock()
                     .await
-                    .insert(next, CachedPrefix { bytes, total });
+                    .insert(next, Arc::new(CachedPrefix { bytes, total }));
             }
         };
         tokio::select! {
@@ -345,46 +361,25 @@ async fn serve(mut socket: TcpStream, state: Arc<ProxyState>) -> Result<()> {
             .await?;
         return Ok(());
     };
-    if route == "/audio"
-        && let Some((start, requested_end)) = range.and_then(parse_range)
-    {
-        let cache = state.audio_cache.read().await;
-        if let Some(cache) = cache.as_ref() {
-            let end = requested_end.unwrap_or_else(|| cache.bytes.len().saturating_sub(1));
-            if end < cache.bytes.len() && start <= end {
-                let body = &cache.bytes[start..=end];
-                let head = format!(
-                    "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nContent-Type: audio/mp4\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nAccept-Ranges: bytes\r\n\r\n",
-                    body.len(),
-                    cache.total
-                );
-                socket.write_all(head.as_bytes()).await?;
-                if method == "GET" {
-                    socket.write_all(body).await?;
-                }
-                return Ok(());
+    if let Some((start, requested_end)) = range.and_then(parse_range) {
+        // Clone the cached prefix out of its lock: socket writes can stall for
+        // as long as mpv takes to read, and must not block prefetch writers.
+        let (cached, content_type) = match route {
+            "/audio" => (state.audio_cache.read().await.clone(), "audio/mp4"),
+            "/video" => (
+                state.prefixes.lock().await.get(&video_index).cloned(),
+                "video/mp4",
+            ),
+            _ => (None, ""),
+        };
+        if let Some(cached) = cached
+            && let Some((head, body)) = cached_range(&cached, start, requested_end, content_type)
+        {
+            socket.write_all(head.as_bytes()).await?;
+            if method == "GET" {
+                socket.write_all(&cached.bytes[body]).await?;
             }
-        }
-    }
-    if route == "/video"
-        && let Some((start, requested_end)) = range.and_then(parse_range)
-    {
-        let prefixes = state.prefixes.lock().await;
-        if let Some(prefix) = prefixes.get(&video_index) {
-            let end = requested_end.unwrap_or_else(|| prefix.bytes.len().saturating_sub(1));
-            if end < prefix.bytes.len() && start <= end {
-                let body = &prefix.bytes[start..=end];
-                let head = format!(
-                    "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nAccept-Ranges: bytes\r\n\r\n",
-                    body.len(),
-                    prefix.total
-                );
-                socket.write_all(head.as_bytes()).await?;
-                if method == "GET" {
-                    socket.write_all(body).await?;
-                }
-                return Ok(());
-            }
+            return Ok(());
         }
     }
     let send = |candidate: &CdnCandidate| {
@@ -399,14 +394,22 @@ async fn serve(mut socket: TcpStream, state: Arc<ProxyState>) -> Result<()> {
         request.send()
     };
     let mut response = match send(&candidate).await {
-        Ok(response) if is_media_response(response.status()) => response,
+        Ok(response) if upstream_outcome(response.status()) != UpstreamOutcome::Failover => {
+            response
+        }
         first => {
             let mut recovered = None;
+            // Only transport errors and server errors say something about the
+            // CDN; 403/404 also happen on healthy hosts (expired signatures).
+            let blame_host = match &first {
+                Err(_) => true,
+                Ok(response) => response.status().is_server_error(),
+            };
             if route == "/audio" {
                 let start = state.audio_index.load(Ordering::Acquire) + 1;
                 for index in start..state.audio.len() {
                     if let Ok(response) = send(&state.audio[index]).await
-                        && is_media_response(response.status())
+                        && upstream_outcome(response.status()) == UpstreamOutcome::Serve
                     {
                         state.audio_index.store(index, Ordering::Release);
                         prefetch_audio(state.clone());
@@ -415,10 +418,12 @@ async fn serve(mut socket: TcpStream, state: Arc<ProxyState>) -> Result<()> {
                     }
                 }
             } else if route == "/video" {
-                record_cdn_result(&candidate.host, true);
+                if blame_host {
+                    record_cdn_result(&candidate.host, true);
+                }
                 for index in (video_index + 1)..state.video.len() {
                     if let Ok(response) = send(&state.video[index]).await
-                        && is_media_response(response.status())
+                        && upstream_outcome(response.status()) == UpstreamOutcome::Serve
                     {
                         state.video_index.store(index, Ordering::Release);
                         prefetch_backup(state.clone());
@@ -427,10 +432,24 @@ async fn serve(mut socket: TcpStream, state: Arc<ProxyState>) -> Result<()> {
                     }
                 }
             }
-            recovered.ok_or_else(|| match first {
-                Err(error) => anyhow!(error).context("CDN proxy upstream request"),
-                Ok(response) => anyhow!("CDN proxy upstream HTTP {}", response.status()),
-            })?
+            match recovered {
+                Some(response) => response,
+                None => {
+                    // Answer mpv instead of resetting the connection, so it
+                    // reports an HTTP error rather than retrying blindly.
+                    let status = match &first {
+                        Ok(response) => response.status().as_u16(),
+                        Err(_) => 502,
+                    };
+                    let _ = socket.write_all(empty_response(status).as_bytes()).await;
+                    return Err(match first {
+                        Err(error) => {
+                            anyhow!(error.without_url()).context("CDN proxy upstream request")
+                        }
+                        Ok(response) => anyhow!("CDN proxy upstream HTTP {}", response.status()),
+                    });
+                }
+            }
         }
     };
     let status = response.status();
@@ -462,11 +481,49 @@ async fn serve(mut socket: TcpStream, state: Arc<ProxyState>) -> Result<()> {
     Ok(())
 }
 
-fn is_media_response(status: reqwest::StatusCode) -> bool {
-    matches!(
-        status,
-        reqwest::StatusCode::OK | reqwest::StatusCode::PARTIAL_CONTENT
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamOutcome {
+    /// Media bytes to stream back.
+    Serve,
+    /// A valid answer to this request, such as 416 for a range past the end.
+    Relay,
+    /// The candidate cannot serve the request; try the next one.
+    Failover,
+}
+
+fn upstream_outcome(status: reqwest::StatusCode) -> UpstreamOutcome {
+    match status {
+        reqwest::StatusCode::OK | reqwest::StatusCode::PARTIAL_CONTENT => UpstreamOutcome::Serve,
+        reqwest::StatusCode::RANGE_NOT_SATISFIABLE => UpstreamOutcome::Relay,
+        _ => UpstreamOutcome::Failover,
+    }
+}
+
+fn empty_response(status: u16) -> String {
+    let reason = reqwest::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|status| status.canonical_reason())
+        .unwrap_or("Bad Gateway");
+    format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+}
+
+/// Response head and body range for a request served from a cached prefix,
+/// or `None` when the requested range is not fully cached.
+fn cached_range(
+    cached: &CachedPrefix,
+    start: usize,
+    requested_end: Option<usize>,
+    content_type: &str,
+) -> Option<(String, std::ops::RangeInclusive<usize>)> {
+    let end = requested_end.unwrap_or_else(|| cached.bytes.len().saturating_sub(1));
+    (end < cached.bytes.len() && start <= end).then(|| {
+        let head = format!(
+            "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nAccept-Ranges: bytes\r\n\r\n",
+            end - start + 1,
+            cached.total
+        );
+        (head, start..=end)
+    })
 }
 
 #[cfg(test)]
@@ -504,6 +561,72 @@ mod tests {
             ),
             None
         );
-        assert!(!is_media_response(reqwest::StatusCode::FORBIDDEN));
+        assert_eq!(
+            cacheable_audio_length_parts(
+                reqwest::StatusCode::OK,
+                &headers,
+                Some(MAX_AUDIO_CACHE + 1)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn range_past_the_end_is_relayed_instead_of_failing_over() {
+        assert_eq!(
+            upstream_outcome(reqwest::StatusCode::RANGE_NOT_SATISFIABLE),
+            UpstreamOutcome::Relay
+        );
+        assert_eq!(
+            upstream_outcome(reqwest::StatusCode::PARTIAL_CONTENT),
+            UpstreamOutcome::Serve
+        );
+        assert_eq!(
+            upstream_outcome(reqwest::StatusCode::FORBIDDEN),
+            UpstreamOutcome::Failover
+        );
+        assert_eq!(
+            empty_response(502),
+            "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn cached_prefix_serves_only_fully_cached_ranges() {
+        let cached = CachedPrefix {
+            bytes: vec![0; 100],
+            total: 1000,
+        };
+        let (head, body) = cached_range(&cached, 10, Some(19), "video/mp4").unwrap();
+        assert_eq!(body, 10..=19);
+        assert!(head.contains("Content-Length: 10\r\n"));
+        assert!(head.contains("Content-Range: bytes 10-19/1000\r\n"));
+        assert_eq!(
+            cached_range(&cached, 0, None, "video/mp4").unwrap().1,
+            0..=99
+        );
+        assert!(cached_range(&cached, 50, Some(100), "video/mp4").is_none());
+        assert!(cached_range(&cached, 20, Some(10), "video/mp4").is_none());
+    }
+
+    #[tokio::test]
+    async fn new_audio_prefetch_cancels_the_running_one() {
+        let state = Arc::new(ProxyState {
+            client: reqwest::Client::new(),
+            video: Vec::new(),
+            audio: Vec::new(),
+            video_index: AtomicUsize::new(0),
+            audio_index: AtomicUsize::new(0),
+            prefixes: Mutex::new(HashMap::new()),
+            audio_cache: RwLock::new(None),
+            audio_prefetch: std::sync::Mutex::new(None),
+            cancellation: CancellationToken::new(),
+        });
+        prefetch_audio(state.clone());
+        let first = state.audio_prefetch.lock().unwrap().clone().unwrap();
+        prefetch_audio(state.clone());
+        assert!(first.is_cancelled());
+        let second = state.audio_prefetch.lock().unwrap().clone().unwrap();
+        assert!(!second.is_cancelled());
     }
 }
