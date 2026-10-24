@@ -8,6 +8,10 @@ use std::io::Read;
 
 /// Header size in bytes
 const HEADER_SIZE: usize = 16;
+/// Compressed bodies wrap plain packets; deeper nesting is not legitimate.
+const MAX_NESTING_DEPTH: usize = 2;
+/// Upper bound for one decompressed body, so a hostile frame cannot exhaust memory.
+const MAX_DECOMPRESSED_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Operation codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +94,13 @@ impl Packet {
 
     /// Decode packets from bytes (may contain multiple packets)
     pub fn decode(data: &[u8]) -> Result<Vec<Packet>> {
+        Self::decode_at_depth(data, 0)
+    }
+
+    fn decode_at_depth(data: &[u8], depth: usize) -> Result<Vec<Packet>> {
+        if depth > MAX_NESTING_DEPTH {
+            return Err(anyhow!("live packet nesting exceeds {MAX_NESTING_DEPTH}"));
+        }
         let mut packets = Vec::new();
         let mut offset = 0;
 
@@ -116,30 +127,33 @@ impl Packet {
                 data[offset + 15],
             ]);
 
+            // A zero or undersized length would never advance `offset`, and a
+            // header longer than its packet would slice out of order.
+            if packet_len < HEADER_SIZE || header_len < HEADER_SIZE || header_len > packet_len {
+                return Err(anyhow!(
+                    "malformed live packet header (packet_len {packet_len}, header_len {header_len})"
+                ));
+            }
             if offset + packet_len > data.len() {
                 break;
             }
 
-            let body = data[offset + header_len..offset + packet_len].to_vec();
+            let body = &data[offset + header_len..offset + packet_len];
 
-            // Handle compressed data
-            let body = match proto_ver {
-                3 => {
-                    // Brotli compressed
-                    decompress_brotli(&body)?
-                }
-                2 => {
-                    // Zlib compressed (legacy)
-                    decompress_zlib(&body)?
-                }
-                _ => body,
+            // Handle compressed data. A corrupt compressed packet is skipped so
+            // the other packets in the frame and the connection survive.
+            let decompressed = match proto_ver {
+                3 => Some(decompress_brotli(body)),
+                2 => Some(decompress_zlib(body)),
+                _ => None,
             };
 
-            // If decompressed, may contain nested packets
-            if proto_ver == 3 || proto_ver == 2 {
-                let nested = Self::decode(&body)?;
-                packets.extend(nested);
+            if let Some(decompressed) = decompressed {
+                if let Ok(body) = decompressed {
+                    packets.extend(Self::decode_at_depth(&body, depth + 1)?);
+                }
             } else {
+                let body = body.to_vec();
                 packets.push(Packet {
                     proto_ver,
                     op_code,
@@ -157,18 +171,23 @@ impl Packet {
 
 /// Decompress brotli data
 fn decompress_brotli(data: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = brotli::Decompressor::new(data, 4096);
-    let mut output = Vec::new();
-    decoder.read_to_end(&mut output)?;
-    Ok(output)
+    read_bounded(brotli::Decompressor::new(data, 4096))
 }
 
 /// Decompress zlib data (legacy)
 fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>> {
     use std::io::Cursor;
-    let mut decoder = flate2::read::ZlibDecoder::new(Cursor::new(data));
+    read_bounded(flate2::read::ZlibDecoder::new(Cursor::new(data)))
+}
+
+fn read_bounded(reader: impl Read) -> Result<Vec<u8>> {
     let mut output = Vec::new();
-    decoder.read_to_end(&mut output)?;
+    reader
+        .take(MAX_DECOMPRESSED_SIZE + 1)
+        .read_to_end(&mut output)?;
+    if output.len() as u64 > MAX_DECOMPRESSED_SIZE {
+        return Err(anyhow!("decompressed live packet exceeds size limit"));
+    }
     Ok(output)
 }
 
@@ -427,4 +446,79 @@ pub struct HistoryDanmakuItem {
     #[serde(default)]
     pub uname_color: String,
     pub timeline: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn raw_packet(packet_len: u32, header_len: u16, proto_ver: u16, body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&packet_len.to_be_bytes());
+        buf.extend_from_slice(&header_len.to_be_bytes());
+        buf.extend_from_slice(&proto_ver.to_be_bytes());
+        buf.extend_from_slice(&(OpCode::Message as u32).to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn zero_length_packet_is_rejected_instead_of_looping() {
+        let data = raw_packet(0, HEADER_SIZE as u16, 0, &[]);
+        assert!(Packet::decode(&data).is_err());
+    }
+
+    #[test]
+    fn header_longer_than_packet_is_rejected_instead_of_panicking() {
+        let data = raw_packet(HEADER_SIZE as u32 + 2, 64, 0, b"{}");
+        assert!(Packet::decode(&data).is_err());
+    }
+
+    #[test]
+    fn corrupt_compressed_packet_is_skipped_and_later_packets_survive() {
+        let mut data = raw_packet(HEADER_SIZE as u32 + 3, HEADER_SIZE as u16, 2, b"bad");
+        data.extend(Packet::new(OpCode::Message, b"{}".to_vec()).encode());
+        let packets = Packet::decode(&data).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].body, b"{}");
+    }
+
+    #[test]
+    fn zlib_packet_unwraps_nested_messages() {
+        let inner = Packet::new(OpCode::Message, b"{\"cmd\":\"X\"}".to_vec()).encode();
+        let body = zlib(&inner);
+        let data = raw_packet(
+            (HEADER_SIZE + body.len()) as u32,
+            HEADER_SIZE as u16,
+            2,
+            &body,
+        );
+        let packets = Packet::decode(&data).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].body, b"{\"cmd\":\"X\"}");
+    }
+
+    #[test]
+    fn excessive_nesting_is_rejected() {
+        let mut data = Packet::new(OpCode::Message, b"{}".to_vec()).encode();
+        for _ in 0..=MAX_NESTING_DEPTH + 1 {
+            let body = zlib(&data);
+            data = raw_packet(
+                (HEADER_SIZE + body.len()) as u32,
+                HEADER_SIZE as u16,
+                2,
+                &body,
+            );
+        }
+        assert!(Packet::decode(&data).is_err());
+    }
 }
