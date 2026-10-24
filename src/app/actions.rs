@@ -788,6 +788,7 @@ impl App {
             }
             AppAction::PlayLive { room_id, title: _ } => {
                 let existing_hub = self.live_danmaku_hub_for(room_id);
+                let live_hub_tx = self.live_hub_tx.clone();
                 let uid = self.login_uid();
                 let api_client = self.api_client.clone();
                 let danmaku_config_rx = self.danmaku_config_tx.subscribe();
@@ -798,13 +799,19 @@ impl App {
                     // live playback still starts when that fails.
                     let danmaku_hub = match existing_hub {
                         Some(hub) => Some(hub),
-                        None => crate::api::LiveDanmakuHub::connect(
-                            std::sync::Arc::clone(&api_client),
-                            room_id,
-                            uid,
-                        )
-                        .await
-                        .ok(),
+                        None => {
+                            let hub = crate::api::LiveDanmakuHub::connect(
+                                std::sync::Arc::clone(&api_client),
+                                room_id,
+                                uid,
+                            )
+                            .await
+                            .ok();
+                            if let Some(hub) = &hub {
+                                let _ = live_hub_tx.send(std::sync::Arc::clone(hub));
+                            }
+                            hub
+                        }
                     };
                     media::play_live(
                         api_client,

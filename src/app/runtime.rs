@@ -264,6 +264,7 @@ impl App {
 
     pub(super) async fn tick(&mut self) {
         self.drain_network_events();
+        self.collect_player_hubs();
         for action in std::mem::take(&mut self.deferred_actions) {
             self.handle_action(action).await;
         }

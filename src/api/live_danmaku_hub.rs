@@ -69,6 +69,20 @@ impl LiveDanmakuHub {
         }))
     }
 
+    /// A hub with no connection behind it, for tests of code that shares hubs.
+    #[cfg(test)]
+    pub(crate) fn detached(room_id: i64) -> Arc<Self> {
+        let (message_tx, _) = broadcast::channel(1);
+        let (shutdown_tx, _) = mpsc::channel(1);
+        Arc::new(Self {
+            room_id,
+            message_tx,
+            connected: Arc::new(AtomicBool::new(false)),
+            last_error: Arc::new(Mutex::new(None)),
+            shutdown_tx,
+        })
+    }
+
     pub fn room_id(&self) -> i64 {
         self.room_id
     }

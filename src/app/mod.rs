@@ -59,6 +59,10 @@ pub struct App {
     /// The most recent live danmaku connection. Live pages and players own
     /// it, so it closes once they are gone instead of living as long as the app.
     pub live_danmaku_hub: Option<Weak<LiveDanmakuHub>>,
+    /// Hubs connected by a live player that had none to share; `tick`
+    /// records them so a live room opened later reuses the connection.
+    live_hub_tx: mpsc::Sender<Arc<LiveDanmakuHub>>,
+    live_hub_rx: mpsc::Receiver<Arc<LiveDanmakuHub>>,
     danmaku_config_tx: watch::Sender<crate::storage::DanmakuConfig>,
     playback_event_tx: mpsc::Sender<PlaybackEvent>,
     playback_event_rx: mpsc::Receiver<PlaybackEvent>,
@@ -88,6 +92,7 @@ impl App {
         let api_client = Arc::new(api_client);
         let bridge = network::start_network_worker(api_client.clone());
         let (playback_event_tx, playback_event_rx) = mpsc::channel();
+        let (live_hub_tx, live_hub_rx) = mpsc::channel();
 
         persistence::remove_stale_cookie_exports();
 
@@ -136,6 +141,8 @@ impl App {
             network_worker_lost: std::cell::Cell::new(false),
             playback: PlaybackState::default(),
             live_danmaku_hub: None,
+            live_hub_tx,
+            live_hub_rx,
             danmaku_config_tx,
             playback_event_tx,
             playback_event_rx,
@@ -177,6 +184,13 @@ impl App {
             .as_ref()
             .and_then(Weak::upgrade)
             .filter(|hub| hub.room_id() == room_id)
+    }
+
+    /// Remember danmaku hubs that players connected on their own.
+    fn collect_player_hubs(&mut self) {
+        while let Ok(hub) = self.live_hub_rx.try_recv() {
+            self.live_danmaku_hub = Some(Arc::downgrade(&hub));
+        }
     }
 
     fn allocate_playback_session(&mut self) -> u64 {
@@ -382,6 +396,23 @@ mod tests {
         app.handle_action(AppAction::NavNext).await;
         assert_eq!(app.sidebar.selected, NavItem::Live);
         assert!(matches!(app.current_page, Page::Live(_)));
+    }
+
+    #[tokio::test]
+    async fn hub_connected_by_a_live_player_is_reused_while_it_plays() {
+        let (mut app, _rx) = minimal_app();
+        let hub = crate::api::LiveDanmakuHub::detached(42);
+        app.live_hub_tx.send(std::sync::Arc::clone(&hub)).unwrap();
+
+        app.collect_player_hubs();
+
+        assert!(app.live_danmaku_hub_for(42).is_some());
+        assert!(app.live_danmaku_hub_for(7).is_none());
+        drop(hub);
+        assert!(
+            app.live_danmaku_hub_for(42).is_none(),
+            "the app does not keep a finished player's hub alive"
+        );
     }
 
     #[tokio::test]
