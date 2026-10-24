@@ -586,7 +586,9 @@ impl Component for HomePage {
                 if self.selected_source == 0 {
                     self.begin_search();
                 } else if let Some(feed) = self.source_feed(self.selected_source)
-                    && feed != self.feed
+                    // An empty feed (e.g. its load was cancelled with Left)
+                    // can be selected again to reload it.
+                    && (feed != self.feed || self.needs_reload())
                 {
                     self.focus_sources = false;
                     return Some(AppAction::SwitchHomeFeed(feed));
@@ -1031,6 +1033,21 @@ mod tests {
         assert!(page.begin_load_more().is_some());
         page.begin_loading();
         assert!(!page.loading_more);
+    }
+
+    #[test]
+    fn feed_whose_load_was_cancelled_can_be_selected_again() {
+        let mut page = HomePage::new();
+        page.focus_sources = false;
+        let keys = Keybindings::default();
+        page.handle_input(KeyCode::Left, &keys);
+        assert!(page.needs_reload());
+
+        let feed = page.feed();
+        assert!(matches!(
+            page.handle_input(KeyCode::Right, &keys),
+            Some(AppAction::SwitchHomeFeed(selected)) if selected == feed
+        ));
     }
 
     #[test]

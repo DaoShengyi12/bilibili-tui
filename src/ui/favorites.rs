@@ -225,6 +225,12 @@ impl FavoritesPage {
         self.finish_load();
     }
 
+    /// Nothing is shown or loading, e.g. after Left cancelled the load; the
+    /// active source can then be selected again to reload it.
+    fn needs_reload(&self) -> bool {
+        !self.loading && self.videos.cards.is_empty()
+    }
+
     fn reset_paging(&mut self) {
         self.fetched = 0;
         self.has_more = true;
@@ -404,7 +410,7 @@ impl Component for FavoritesPage {
         if keys.matches_right(key) {
             if self.focus_sources
                 && let Some(source) = sources.get(self.selected_source)
-                && *source != self.active_source
+                && (*source != self.active_source || self.needs_reload())
             {
                 self.focus_sources = false;
                 return Some(AppAction::SelectFavoriteSource(source.clone()));
@@ -640,5 +646,20 @@ mod tests {
         ));
         assert!(page.focus_sources);
         assert!(!page.loading);
+    }
+
+    #[test]
+    fn source_whose_load_was_cancelled_can_be_selected_again() {
+        let mut page = FavoritesPage::new(1);
+        page.begin_source_load(FavoriteSource::WatchLater);
+        page.focus_sources = false;
+        let keys = Keybindings::default();
+        page.handle_input(KeyCode::Left, &keys);
+        assert!(page.videos.cards.is_empty());
+
+        assert!(matches!(
+            page.handle_input(KeyCode::Right, &keys),
+            Some(AppAction::SelectFavoriteSource(FavoriteSource::WatchLater))
+        ));
     }
 }

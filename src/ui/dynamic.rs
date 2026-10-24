@@ -97,6 +97,11 @@ impl DynamicPage {
         self.loading_up_list = false;
     }
 
+    /// Nothing is shown or loading, so selecting the current UP reloads it.
+    fn needs_reload(&self) -> bool {
+        !self.loading && !self.loading_up_list && self.grid.cards.is_empty()
+    }
+
     pub fn select_up(&mut self, index: usize) {
         if index <= self.up_list.len() {
             self.selected_up_index = index;
@@ -538,6 +543,10 @@ impl Component for DynamicPage {
                 }
             } else if keys.matches_right(key) || keys.matches_confirm(key) {
                 self.focus_up_list = false;
+                // Reload a feed whose load was cancelled with Left.
+                if self.needs_reload() {
+                    return Some(AppAction::SelectUpMaster(self.selected_up_index));
+                }
             }
             return Some(AppAction::None);
         }
@@ -647,7 +656,7 @@ impl Component for DynamicPage {
                         + event.row.saturating_sub(panes[0].y + 1) as usize;
                     if row <= self.up_list.len() {
                         self.focus_up_list = true;
-                        if row != self.selected_up_index {
+                        if row != self.selected_up_index || self.needs_reload() {
                             return Some(AppAction::SelectUpMaster(row));
                         }
                     }
