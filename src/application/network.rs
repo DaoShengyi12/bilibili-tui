@@ -1279,23 +1279,7 @@ fn failed(req_id: u64, target: &'static str, error: anyhow::Error) -> NetworkEve
     }
 }
 
-pub(crate) fn redact_url_queries(message: &str) -> String {
-    let mut output = String::with_capacity(message.len());
-    let mut chars = message.chars().peekable();
-    while let Some(ch) = chars.next() {
-        output.push(ch);
-        if ch == '?' {
-            output.push_str("<redacted>");
-            while chars
-                .peek()
-                .is_some_and(|next| !next.is_whitespace() && !matches!(next, '"' | '\''))
-            {
-                chars.next();
-            }
-        }
-    }
-    output
-}
+pub(crate) use crate::api::redact::redact_url_queries;
 
 #[cfg(test)]
 mod tests {

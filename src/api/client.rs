@@ -211,7 +211,8 @@ impl ApiClient {
                     continue;
                 }
                 Err(error) => {
-                    return Err(error).with_context(|| format!("request failed for {safe_url}"));
+                    return Err(error.without_url())
+                        .with_context(|| format!("request failed for {safe_url}"));
                 }
             };
             let status = resp.status();
@@ -219,7 +220,7 @@ impl ApiClient {
                 Ok(body) => body,
                 Err(_) if attempt == 0 => continue,
                 Err(error) => {
-                    return Err(error)
+                    return Err(error.without_url())
                         .with_context(|| format!("failed to read response body from {safe_url}"));
                 }
             };

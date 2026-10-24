@@ -738,7 +738,7 @@ pub async fn play_playlist(
             },
             Err(error) => PlaybackEvent::Failed {
                 session_id,
-                error: format!("播放列表失败: {error:#}"),
+                error: crate::api::redact::redact_url_queries(&format!("播放列表失败: {error:#}")),
             },
         };
         let _ = playback_event_tx.send(event);
@@ -820,6 +820,7 @@ fn log_skipped_playlist_items(failures: &[String]) {
 }
 
 fn write_playback_diagnostic(message: &str) {
+    let message = crate::api::redact::redact_url_queries(message);
     let Some(mut dir) = dirs::config_dir() else {
         return;
     };
@@ -1193,7 +1194,7 @@ pub async fn play_bangumi_episode(
             },
             Err(error) => PlaybackEvent::Failed {
                 session_id,
-                error: format!("番剧播放器失败: {error}"),
+                error: crate::api::redact::redact_url_queries(&format!("番剧播放器失败: {error}")),
             },
         };
         let _ = playback_event_tx.send(event);
@@ -1496,6 +1497,7 @@ fn live_retry_delay(attempt: usize) -> Duration {
 }
 
 fn write_live_diagnostic(_room_id: i64, message: &str) {
+    let message = crate::api::redact::redact_url_queries(message);
     let Some(mut dir) = dirs::config_dir() else {
         return;
     };
