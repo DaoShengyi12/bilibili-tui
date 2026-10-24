@@ -105,6 +105,8 @@ pub struct Keybindings {
     pub play: String,
     pub open_settings: String,
     pub search_focus: String,
+    /// Stop the running player from any page.
+    pub stop_playback: String,
 
     // Comments
     pub comment: String,
@@ -146,6 +148,7 @@ impl Default for Keybindings {
             play: "p".to_string(),
             open_settings: "s".to_string(),
             search_focus: "/".to_string(),
+            stop_playback: "x".to_string(),
 
             // Comments
             comment: "c".to_string(),
@@ -306,6 +309,10 @@ impl Keybindings {
         self.matches(&self.search_focus, key) || key == KeyCode::Char('i')
     }
 
+    pub fn matches_stop_playback(&self, key: KeyCode) -> bool {
+        self.matches(&self.stop_playback, key)
+    }
+
     pub fn matches_section_prev(&self, key: KeyCode) -> bool {
         self.matches(&self.section_prev, key)
     }
@@ -439,6 +446,8 @@ impl Keybindings {
             // Dynamic page
             23 => self.up_prev = new_key,
             24 => self.up_next = new_key,
+            // Playback
+            25 => self.stop_playback = new_key,
             _ => {}
         }
     }
@@ -873,5 +882,15 @@ mod config_tests {
         } else {
             assert_eq!(font, "Noto Sans CJK SC");
         }
+    }
+
+    #[test]
+    fn stop_playback_key_defaults_for_old_configs_and_is_editable() {
+        let keys: Keybindings = serde_json::from_value(serde_json::json!({"quit": "Q"})).unwrap();
+        assert_eq!(keys.stop_playback, "x");
+        assert!(keys.matches_stop_playback(KeyCode::Char('x')));
+        let mut keys = keys;
+        keys.update_by_index(25, "X".to_string());
+        assert_eq!(keys.stop_playback, "X");
     }
 }

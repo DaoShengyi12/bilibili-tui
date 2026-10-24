@@ -661,10 +661,28 @@ impl ApiClient {
         if let Some(result) = payload.get("result") {
             payload = result;
         }
+        // The v1 endpoint puts the access flags next to the streams; v2 puts
+        // them on `result` around `video_info`.
+        let outer = payload;
         if let Some(video_info) = payload.get("video_info") {
             payload = video_info;
         }
-        serde_json::from_value(payload.clone()).context("invalid bangumi playurl response")
+        let mut data: super::cdn::PlayUrlData =
+            serde_json::from_value(payload.clone()).context("invalid bangumi playurl response")?;
+        data.is_preview |= Self::pgc_flag(outer, "is_preview")
+            || outer
+                .pointer("/play_check/play_detail")
+                .and_then(serde_json::Value::as_str)
+                == Some("PLAY_PREVIEW");
+        data.is_drm |= Self::pgc_flag(outer, "is_drm");
+        Ok(data)
+    }
+
+    fn pgc_flag(value: &serde_json::Value, name: &str) -> bool {
+        value
+            .get(name)
+            .cloned()
+            .is_some_and(|flag| super::serde_util::lenient_flag(flag).unwrap_or(false))
     }
 
     pub async fn get_video_danmaku(&self, cid: i64) -> Result<Vec<super::danmaku::VideoDanmaku>> {
@@ -1676,7 +1694,45 @@ mod live_contract_tests {
             }
         });
         let playurl = ApiClient::parse_bangumi_play_url(&value).unwrap();
-        assert_eq!(playurl.dash.video[0].id, 80);
+        assert_eq!(playurl.dash.unwrap().video[0].id, 80);
+        assert!(!playurl.is_preview);
+        assert!(!playurl.is_drm);
+    }
+
+    #[test]
+    fn bangumi_v2_preview_and_drm_flags_are_read_around_video_info() {
+        let value = serde_json::json!({
+            "code": 0,
+            "result": {
+                "is_drm": 1,
+                "play_check": {"play_detail": "PLAY_PREVIEW"},
+                "video_info": {
+                    "quality": 32,
+                    "dash": null,
+                    "durl": [{"order": 1, "length": 180000, "url": "https://a/p.mp4"}]
+                }
+            }
+        });
+        let playurl = ApiClient::parse_bangumi_play_url(&value).unwrap();
+        assert!(playurl.is_preview);
+        assert!(playurl.is_drm);
+        assert!(playurl.dash.is_none());
+        assert_eq!(playurl.durl[0].length, 180000);
+    }
+
+    #[test]
+    fn bangumi_v1_preview_flag_sits_next_to_the_streams() {
+        let value = serde_json::json!({
+            "code": 0,
+            "result": {
+                "is_preview": 1,
+                "quality": 16,
+                "durl": [{"order": 1, "length": 1000, "url": "https://a/p.mp4", "backup_url": null}]
+            }
+        });
+        let playurl = ApiClient::parse_bangumi_play_url(&value).unwrap();
+        assert!(playurl.is_preview);
+        assert!(playurl.durl[0].backup_url.is_empty());
     }
 
     #[tokio::test]

@@ -158,8 +158,15 @@ pub enum AppAction {
     PlayBangumiEpisode {
         ep_id: i64,
         season_id: i64,
+        /// Season `type`, reported as the heartbeat `sub_type`.
+        season_type: i32,
+        aid: i64,
+        cid: i64,
+        bvid: String,
         title: String,
     },
+    /// Stop the running player
+    StopPlayback,
     /// No action
     None,
 }

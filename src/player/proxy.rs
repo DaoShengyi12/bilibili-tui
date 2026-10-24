@@ -1,7 +1,9 @@
-use crate::api::cdn::{CdnCandidate, RankedStreams, record_cdn_result};
+use crate::api::cdn::{CdnCandidate, PlayUrlData, RankedStreams, record_cdn_result};
 use anyhow::{Result, anyhow};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE, REFERER, USER_AGENT};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,10 +13,21 @@ use tokio_util::sync::CancellationToken;
 
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
 
+/// Fetches a new playurl response for the stream a proxy serves.
+pub type Refresher =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<PlayUrlData>> + Send>> + Send + Sync>;
+
+/// Shortest time between two playurl refreshes of one proxy.
+const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 struct ProxyState {
     client: reqwest::Client,
-    video: Vec<CdnCandidate>,
-    audio: Vec<CdnCandidate>,
+    /// Replaced as a whole when expired signatures are refreshed; indices
+    /// keep naming the same host across refreshes.
+    streams: std::sync::RwLock<Arc<RankedStreams>>,
+    refresher: Option<Refresher>,
+    /// When the last refresh started; held while a refresh runs.
+    last_refresh: Mutex<Option<std::time::Instant>>,
     video_index: AtomicUsize,
     audio_index: AtomicUsize,
     prefixes: Mutex<HashMap<usize, Arc<CachedPrefix>>>,
@@ -32,18 +45,66 @@ struct CachedPrefix {
     total: u64,
 }
 
+impl ProxyState {
+    fn streams(&self) -> Arc<RankedStreams> {
+        match self.streams.read() {
+            Ok(streams) => streams.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn video(&self, index: usize) -> Option<CdnCandidate> {
+        self.streams().video.get(index).cloned()
+    }
+
+    fn audio(&self, index: usize) -> Option<CdnCandidate> {
+        self.streams().audio.get(index).cloned()
+    }
+
+    fn video_len(&self) -> usize {
+        self.streams().video.len()
+    }
+
+    /// Replace expired signatures with ones from a new playurl response.
+    /// Returns whether the candidates may now succeed: a refresh that
+    /// another request finished moments ago counts as success.
+    async fn refresh(&self) -> bool {
+        let Some(refresher) = &self.refresher else {
+            return false;
+        };
+        let mut last = self.last_refresh.lock().await;
+        if last.is_some_and(|at| at.elapsed() < REFRESH_INTERVAL) {
+            return true;
+        }
+        *last = Some(std::time::Instant::now());
+        let Ok(data) = refresher().await else {
+            return false;
+        };
+        let Ok(refreshed) = crate::api::cdn::refreshed_streams(&self.streams(), &data) else {
+            return false;
+        };
+        match self.streams.write() {
+            Ok(mut streams) => *streams = Arc::new(refreshed),
+            Err(poisoned) => *poisoned.into_inner() = Arc::new(refreshed),
+        }
+        true
+    }
+}
+
 pub struct MediaProxy {
     state: Arc<ProxyState>,
     pub video_url: String,
-    pub audio_url: String,
+    /// `None` when the stream has no separate audio track.
+    pub audio_url: Option<String>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl MediaProxy {
-    pub async fn start(streams: RankedStreams) -> Result<Self> {
-        if streams.video.is_empty() || streams.audio.is_empty() {
+    pub async fn start(streams: RankedStreams, refresher: Option<Refresher>) -> Result<Self> {
+        if streams.video.is_empty() {
             return Err(anyhow!("CDN 候选地址为空"));
         }
+        let has_audio = !streams.audio.is_empty();
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let state = Arc::new(ProxyState {
@@ -51,8 +112,9 @@ impl MediaProxy {
                 .connect_timeout(std::time::Duration::from_secs(3))
                 .read_timeout(std::time::Duration::from_secs(15))
                 .build()?,
-            video: streams.video,
-            audio: streams.audio,
+            streams: std::sync::RwLock::new(Arc::new(streams)),
+            refresher,
+            last_refresh: Mutex::new(None),
             video_index: AtomicUsize::new(0),
             audio_index: AtomicUsize::new(0),
             prefixes: Mutex::new(HashMap::new()),
@@ -80,11 +142,13 @@ impl MediaProxy {
             }
         });
         prefetch_backup(state.clone());
-        prefetch_audio(state.clone());
+        if has_audio {
+            prefetch_audio(state.clone());
+        }
         Ok(Self {
             state,
             video_url: format!("http://{address}/video?generation=0"),
-            audio_url: format!("http://{address}/audio"),
+            audio_url: has_audio.then(|| format!("http://{address}/audio")),
             shutdown: Some(shutdown_tx),
         })
     }
@@ -95,7 +159,7 @@ impl MediaProxy {
     }
 
     pub fn video_cdn(&self, index: usize) -> Option<(usize, String)> {
-        (index < self.state.video.len()).then(|| {
+        (index < self.state.video_len()).then(|| {
             let base = self.video_url.split('?').next().unwrap_or(&self.video_url);
             (index, format!("{base}?generation={index}"))
         })
@@ -103,7 +167,7 @@ impl MediaProxy {
 
     pub fn commit_video_cdn(&mut self, next: usize) -> bool {
         let current = self.state.video_index.load(Ordering::Acquire);
-        if next <= current || next >= self.state.video.len() {
+        if next <= current || next >= self.state.video_len() {
             return false;
         }
         self.state.video_index.store(next, Ordering::Release);
@@ -117,7 +181,7 @@ impl MediaProxy {
 
     pub fn record_current_corruption(&self) {
         let index = self.state.video_index.load(Ordering::Acquire);
-        if let Some(candidate) = self.state.video.get(index) {
+        if let Some(candidate) = self.state.video(index) {
             record_cdn_result(&candidate.host, true);
         }
     }
@@ -132,7 +196,7 @@ impl MediaProxy {
 
     pub fn record_success(&self) {
         let index = self.state.video_index.load(Ordering::Relaxed);
-        if let Some(candidate) = self.state.video.get(index) {
+        if let Some(candidate) = self.state.video(index) {
             record_cdn_result(&candidate.host, false);
         }
     }
@@ -151,8 +215,8 @@ fn prefetch_audio(state: Arc<ProxyState>) {
     tokio::spawn(async move {
         let download = async {
             let start = state.audio_index.load(Ordering::Acquire);
-            for index in start..state.audio.len() {
-                let candidate = &state.audio[index];
+            let audio = state.streams().audio.clone();
+            for (index, candidate) in audio.iter().enumerate().skip(start) {
                 let Ok(mut response) = state
                     .client
                     .get(&candidate.url)
@@ -231,7 +295,7 @@ impl Drop for MediaProxy {
 
 fn prefetch_backup(state: Arc<ProxyState>) {
     let next = state.video_index.load(Ordering::Relaxed) + 1;
-    let Some(candidate) = state.video.get(next).cloned() else {
+    let Some(candidate) = state.video(next) else {
         return;
     };
     tokio::spawn(async move {
@@ -344,16 +408,10 @@ async fn serve(mut socket: TcpStream, state: Arc<ProxyState>) -> Result<()> {
     let video_index = generation(path)
         .unwrap_or(0)
         .max(state.video_index.load(Ordering::Acquire));
-    let candidate = if route == "/video" {
-        let index = video_index;
-        state.video.get(index).cloned()
-    } else if route == "/audio" {
-        state
-            .audio
-            .get(state.audio_index.load(Ordering::Acquire))
-            .cloned()
-    } else {
-        None
+    let candidate = match route {
+        "/video" => state.video(video_index),
+        "/audio" => state.audio(state.audio_index.load(Ordering::Acquire)),
+        _ => None,
     };
     let Some(candidate) = candidate else {
         socket
@@ -407,8 +465,9 @@ async fn serve(mut socket: TcpStream, state: Arc<ProxyState>) -> Result<()> {
             };
             if route == "/audio" {
                 let start = state.audio_index.load(Ordering::Acquire) + 1;
-                for index in start..state.audio.len() {
-                    if let Ok(response) = send(&state.audio[index]).await
+                let audio = state.streams().audio.clone();
+                for (index, candidate) in audio.iter().enumerate().skip(start) {
+                    if let Ok(response) = send(candidate).await
                         && upstream_outcome(response.status()) == UpstreamOutcome::Serve
                     {
                         state.audio_index.store(index, Ordering::Release);
@@ -421,8 +480,9 @@ async fn serve(mut socket: TcpStream, state: Arc<ProxyState>) -> Result<()> {
                 if blame_host {
                     record_cdn_result(&candidate.host, true);
                 }
-                for index in (video_index + 1)..state.video.len() {
-                    if let Ok(response) = send(&state.video[index]).await
+                let video = state.streams().video.clone();
+                for (index, candidate) in video.iter().enumerate().skip(video_index + 1) {
+                    if let Ok(response) = send(candidate).await
                         && upstream_outcome(response.status()) == UpstreamOutcome::Serve
                     {
                         state.video_index.store(index, Ordering::Release);
@@ -430,6 +490,21 @@ async fn serve(mut socket: TcpStream, state: Arc<ProxyState>) -> Result<()> {
                         recovered = Some(response);
                         break;
                     }
+                }
+            }
+            // Every host refusing the request means the signatures expired,
+            // typically after a long pause: fetch new ones and retry the
+            // host that was serving.
+            if recovered.is_none() && !blame_host && state.refresh().await {
+                let retry = match route {
+                    "/video" => state.video(state.video_index.load(Ordering::Acquire)),
+                    _ => state.audio(state.audio_index.load(Ordering::Acquire)),
+                };
+                if let Some(retry) = retry
+                    && let Ok(response) = send(&retry).await
+                    && upstream_outcome(response.status()) != UpstreamOutcome::Failover
+                {
+                    recovered = Some(response);
                 }
             }
             match recovered {
@@ -609,12 +684,82 @@ mod tests {
         assert!(cached_range(&cached, 20, Some(10), "video/mp4").is_none());
     }
 
+    fn empty_streams() -> RankedStreams {
+        RankedStreams {
+            video: Vec::new(),
+            audio: Vec::new(),
+            identity: crate::api::cdn::StreamIdentity::Durl { quality: 80 },
+        }
+    }
+
+    /// An upstream that serves only URLs carrying `sig=new`, like a CDN
+    /// after the old signatures expired.
+    async fn expiring_upstream() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 4096];
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let response = if request.lines().next().unwrap_or("").contains("sig=new") {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh"
+                    } else {
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn expired_signatures_are_refreshed_and_the_request_retried() {
+        let upstream = expiring_upstream().await;
+        let old = format!("http://{upstream}/v.flv?sig=old");
+        let streams = RankedStreams {
+            video: vec![CdnCandidate {
+                url: old,
+                host: "127.0.0.1".to_string(),
+                score: 1.0,
+            }],
+            ..empty_streams()
+        };
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let counter = refreshes.clone();
+        let refresher: Refresher = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let data = serde_json::json!({
+                "quality": 80,
+                "durl": [{"order": 1, "url": format!("http://{upstream}/v.flv?sig=new")}]
+            });
+            Box::pin(async move { Ok(serde_json::from_value(data)?) })
+        });
+        let proxy = MediaProxy::start(streams, Some(refresher)).await.unwrap();
+        assert!(proxy.audio_url.is_none());
+
+        let body = reqwest::get(&proxy.video_url)
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert_eq!(body, "fresh");
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn new_audio_prefetch_cancels_the_running_one() {
         let state = Arc::new(ProxyState {
             client: reqwest::Client::new(),
-            video: Vec::new(),
-            audio: Vec::new(),
+            streams: std::sync::RwLock::new(Arc::new(empty_streams())),
+            refresher: None,
+            last_refresh: Mutex::new(None),
             video_index: AtomicUsize::new(0),
             audio_index: AtomicUsize::new(0),
             prefixes: Mutex::new(HashMap::new()),

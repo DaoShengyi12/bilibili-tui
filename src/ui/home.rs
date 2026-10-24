@@ -253,6 +253,11 @@ impl HomePage {
     }
 
     /// True while the first page or a further page is being requested.
+    /// Whether the search box receives typed keys.
+    pub fn search_input_active(&self) -> bool {
+        self.selected_source == 0 && self.search.input_mode
+    }
+
     pub fn is_loading(&self) -> bool {
         self.loading || self.loading_more
     }
@@ -511,7 +516,7 @@ impl Component for HomePage {
         modifiers: crossterm::event::KeyModifiers,
         keys: &crate::storage::Keybindings,
     ) -> Option<AppAction> {
-        if self.selected_source == 0 && self.search.input_mode {
+        if self.search_input_active() {
             return self
                 .search
                 .handle_input_with_modifiers(key, modifiers, keys);
@@ -527,7 +532,7 @@ impl Component for HomePage {
         // Search input has priority: when the search box is focused, every
         // character (including `i` / `/` which are also `search_focus` shortcuts)
         // must be inserted as text, not as a shortcut.
-        if self.selected_source == 0 && self.search.input_mode {
+        if self.search_input_active() {
             return self.search.handle_input(key, keys);
         }
         if keys.matches_quit(key) {

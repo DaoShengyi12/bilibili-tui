@@ -167,6 +167,13 @@ pub struct SeasonResult {
     pub is_finish: Option<i32>,
     #[serde(rename = "index_show")]
     pub index_show: Option<String>,
+    /// 1 anime, 2 movie, 3 documentary, 4 guochuang, 5 TV series, 7 variety.
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "super::serde_util::null_as_default"
+    )]
+    pub season_type: i32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,6 +204,8 @@ pub struct BangumiEpisode {
     pub aid: i64,
     #[serde(default)]
     pub badge: String,
+    #[serde(default, deserialize_with = "super::serde_util::null_as_default")]
+    pub bvid: String,
     pub cid: i64,
     #[serde(default)]
     pub cover: String,

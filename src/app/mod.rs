@@ -68,6 +68,8 @@ pub struct App {
     playback_event_rx: mpsc::Receiver<PlaybackEvent>,
     auto_return_after_playback: Option<(u64, String)>,
     next_playback_session_id: u64,
+    /// Stops the player of the current session.
+    player_stop: Option<tokio_util::sync::CancellationToken>,
     /// Actions produced while handling network events, which cannot await;
     /// `tick` runs them.
     deferred_actions: Vec<crate::application::AppAction>,
@@ -148,6 +150,7 @@ impl App {
             playback_event_rx,
             auto_return_after_playback: None,
             next_playback_session_id: 1,
+            player_stop: None,
             deferred_actions: Vec::new(),
             cached_home: None,
             cached_bangumi: None,

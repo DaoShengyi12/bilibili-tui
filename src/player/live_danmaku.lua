@@ -18,6 +18,25 @@ overlay.z = 20
 local refresh_timer = nil
 local fps_probe_timer = nil
 
+-- Danmaku move on a clock that stops while playback is paused, buffering or
+-- seeking, so comments stay with the video frame they belong to.
+local idle_since = nil
+local idle_total = 0
+
+local function clock()
+    return (idle_since or mp.get_time()) - idle_total
+end
+
+local function set_idle(idle)
+    local now = mp.get_time()
+    if idle and idle_since == nil then
+        idle_since = now
+    elseif not idle and idle_since ~= nil then
+        idle_total = idle_total + now - idle_since
+        idle_since = nil
+    end
+end
+
 local function clamp(value, low, high)
     return math.max(low, math.min(high, value))
 end
@@ -106,7 +125,7 @@ local function render()
         return
     end
 
-    local now = mp.get_time()
+    local now = clock()
     local font_size, lane_height, top, lanes = schedule(width, height, now)
     local alpha = math.floor((1.0 - config.opacity) * 255 + 0.5)
     local lines, remaining = {}, {}
@@ -171,6 +190,18 @@ local function on_config(payload)
     if not config.enabled then active, pending = {}, {} end
     render()
 end
+
+-- Comments on screen belong to the old position after a seek or a new file.
+local function clear_danmaku()
+    active, pending, lane_ready = {}, {}, {}
+    render()
+end
+
+mp.observe_property("core-idle", "bool", function(_, idle)
+    set_idle(idle == true)
+end)
+mp.register_event("seek", clear_danmaku)
+mp.register_event("start-file", clear_danmaku)
 
 mp.register_script_message("danmaku", on_danmaku)
 mp.register_script_message("danmaku-batch", on_danmaku_batch)

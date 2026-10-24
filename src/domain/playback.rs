@@ -56,6 +56,12 @@ pub enum PlaybackEvent {
         session_id: u64,
         error: String,
     },
+    /// Something the user should know while playback continues, such as a
+    /// preview-only stream.
+    Notice {
+        session_id: u64,
+        message: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -98,7 +104,8 @@ impl PlaybackState {
             PlaybackEvent::Started { session_id }
             | PlaybackEvent::ItemChanged { session_id, .. }
             | PlaybackEvent::Finished { session_id, .. }
-            | PlaybackEvent::Failed { session_id, .. } => *session_id,
+            | PlaybackEvent::Failed { session_id, .. }
+            | PlaybackEvent::Notice { session_id, .. } => *session_id,
         };
         if self.session_id != Some(session_id) {
             return false;
@@ -129,8 +136,26 @@ impl PlaybackState {
                 self.last_error = Some(error.clone());
                 self.session_id = None;
             }
+            PlaybackEvent::Notice { .. } => {}
         }
         true
+    }
+
+    /// Whether a player is starting or running for the current session.
+    pub fn is_active(&self) -> bool {
+        self.session_id.is_some()
+            && matches!(
+                self.status,
+                PlaybackStatus::Starting | PlaybackStatus::Playing
+            )
+    }
+
+    /// Forget the current session after its player was told to stop, so its
+    /// late exit events are ignored.
+    pub fn stop(&mut self) {
+        self.session_id = None;
+        self.status = PlaybackStatus::Idle;
+        self.last_error = None;
     }
 
     pub fn play_from(&mut self, index: usize) -> bool {
@@ -271,5 +296,30 @@ mod tests {
         assert!(state.advance());
         assert_eq!(state.current_index, Some(1));
         assert!(!state.advance());
+    }
+
+    #[test]
+    fn notices_keep_the_session_playing() {
+        let mut state = PlaybackState::default();
+        state.begin_starting(4);
+        assert!(state.apply_event(&PlaybackEvent::Notice {
+            session_id: 4,
+            message: "试看".into(),
+        }));
+        assert!(state.is_active());
+        assert!(!state.apply_event(&PlaybackEvent::Notice {
+            session_id: 3,
+            message: "试看".into(),
+        }));
+    }
+
+    #[test]
+    fn stopped_session_ignores_its_late_events() {
+        let mut state = PlaybackState::default();
+        state.begin_starting(4);
+        state.stop();
+        assert!(!state.is_active());
+        assert!(!state.apply_event(&PlaybackEvent::Started { session_id: 4 }));
+        assert_eq!(state.status, PlaybackStatus::Idle);
     }
 }

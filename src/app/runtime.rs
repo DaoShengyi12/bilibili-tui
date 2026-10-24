@@ -41,6 +41,18 @@ impl App {
         Ok(())
     }
 
+    /// Whether the page sends every key to a text field or key capture.
+    fn current_page_captures_keys(&self) -> bool {
+        match &self.current_page {
+            Page::Home(page) => page.search_input_active(),
+            Page::Search(page) => page.input_mode,
+            Page::VideoDetail(page) => page.input_mode,
+            Page::DynamicDetail(page) => page.input_mode,
+            Page::Settings(page) => page.is_capturing_input(),
+            _ => false,
+        }
+    }
+
     fn current_page_uses_full_area(&self) -> bool {
         match &self.current_page {
             Page::Login(_)
@@ -215,6 +227,15 @@ impl App {
         self.playback.last_error = None;
         self.status_notice = None;
         let keys = &self.keybindings;
+        // Stopping works from every page, but only while a player runs and
+        // no text field or key capture would receive the key instead.
+        if self.playback.is_active()
+            && keys.matches_stop_playback(key)
+            && !self.current_page_captures_keys()
+        {
+            self.stop_playback();
+            return;
+        }
         let action = match &mut self.current_page {
             Page::Login(page) => page.handle_input(key, keys),
             Page::Home(page) => page.handle_input_with_modifiers(key, modifiers, keys),
@@ -301,6 +322,9 @@ impl App {
                     {
                         self.auto_return_after_playback = None;
                     }
+                }
+                crate::domain::playback::PlaybackEvent::Notice { message, .. } if accepted => {
+                    self.status_notice = Some(message);
                 }
                 crate::domain::playback::PlaybackEvent::Failed { session_id, .. }
                     if accepted
@@ -424,6 +448,71 @@ mod tests {
     fn select_own_space(app: &mut App) {
         app.sidebar.select(NavItem::MySpace);
         app.current_page = Page::Up(Box::new(UpPage::new_sidebar(1)));
+    }
+
+    fn app_with_active_player() -> (App, tokio_util::sync::CancellationToken) {
+        let (mut app, _rx) = minimal_app();
+        app.keybindings = crate::storage::Keybindings::default();
+        let stop = tokio_util::sync::CancellationToken::new();
+        app.player_stop = Some(stop.clone());
+        app.playback.begin_starting(3);
+        (app, stop)
+    }
+
+    #[tokio::test]
+    async fn stop_key_stops_the_running_player_and_ignores_its_exit() {
+        let (mut app, stop) = app_with_active_player();
+
+        app.handle_input(KeyCode::Char('x'), KeyModifiers::NONE)
+            .await;
+
+        assert!(stop.is_cancelled());
+        assert!(!app.playback.is_active());
+        assert!(
+            !app.playback
+                .apply_event(&crate::domain::playback::PlaybackEvent::Failed {
+                    session_id: 3,
+                    error: "MPV exited".into(),
+                })
+        );
+        assert!(app.playback.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_key_is_typed_into_a_focused_search_box() {
+        let (mut app, stop) = app_with_active_player();
+        let mut page = crate::presentation::tui::SearchPage::new();
+        page.input_mode = true;
+        app.current_page = Page::Search(page);
+
+        app.handle_input(KeyCode::Char('x'), KeyModifiers::NONE)
+            .await;
+
+        assert!(!stop.is_cancelled());
+        assert!(app.playback.is_active());
+        assert!(matches!(&app.current_page, Page::Search(page) if page.query == "x"));
+    }
+
+    #[tokio::test]
+    async fn starting_a_player_stops_the_previous_one() {
+        let (mut app, _rx) = minimal_app();
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        for session_id in [1, 2] {
+            let control_tx = control_tx.clone();
+            app.start_playback(session_id, "test", move |control| {
+                let _ = control_tx.send(control.stop.clone());
+                async move {
+                    control.stop.cancelled().await;
+                    Ok(())
+                }
+            });
+        }
+        let first = control_rx.recv().unwrap();
+        let second = control_rx.recv().unwrap();
+
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        assert_eq!(app.playback.session_id, Some(2));
     }
 
     #[tokio::test]

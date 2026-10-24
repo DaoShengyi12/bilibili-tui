@@ -12,6 +12,20 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// Read a flag sent as a bool, a number, a numeric string or `null`.
+/// Pair with `#[serde(default)]`.
+pub fn lenient_flag<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(value) => value,
+        serde_json::Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        serde_json::Value::String(value) => !matches!(value.trim(), "" | "0" | "false"),
+        _ => false,
+    })
+}
+
 /// Decode a list item by item, skipping entries that no longer match `T`.
 ///
 /// A missing or `null` list is empty. A list whose every entry fails is an
@@ -48,6 +62,27 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn lenient_flag_accepts_bools_numbers_strings_and_null() {
+        #[derive(Deserialize)]
+        struct Flag {
+            #[serde(default, deserialize_with = "lenient_flag")]
+            value: bool,
+        }
+        let parse = |value: serde_json::Value| {
+            serde_json::from_value::<Flag>(json!({ "value": value }))
+                .unwrap()
+                .value
+        };
+        assert!(parse(json!(true)));
+        assert!(parse(json!(1)));
+        assert!(parse(json!("1")));
+        assert!(!parse(json!(0)));
+        assert!(!parse(json!("0")));
+        assert!(!parse(json!(null)));
+        assert!(!serde_json::from_value::<Flag>(json!({})).unwrap().value);
+    }
 
     #[derive(Debug, Deserialize, PartialEq)]
     struct Item {

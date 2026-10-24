@@ -186,9 +186,9 @@ impl App {
                 bvid,
                 aid,
                 cid,
-                duration,
+                duration: _,
             } => {
-                self.start_video_playback(bvid, aid, cid, duration, None);
+                self.start_video_playback(bvid, aid, cid, None);
             }
             AppAction::PlayVideoWithPages {
                 bvid,
@@ -198,8 +198,8 @@ impl App {
             } => {
                 // Play only the selected episode
                 if let Some(page) = pages.get(current_index) {
-                    let (cid, duration, page_num) = (page.cid, page.duration, page.page);
-                    self.start_video_playback(bvid.clone(), aid, cid, duration, Some(page_num));
+                    let (cid, page_num) = (page.cid, page.page);
+                    self.start_video_playback(bvid.clone(), aid, cid, Some(page_num));
                     // Update current page index in video detail page
                     if let Page::VideoDetail(detail_page) = &mut self.current_page
                         && detail_page.bvid == bvid
@@ -836,10 +836,10 @@ impl App {
                 let live_hub_tx = self.live_hub_tx.clone();
                 let uid = self.login_uid();
                 let api_client = self.api_client.clone();
-                let danmaku_config_rx = self.danmaku_config_tx.subscribe();
                 let video_quality = self.config.video_quality;
+                let playback_event_tx = self.playback_event_tx.clone();
                 let session_id = self.allocate_playback_session();
-                self.start_playback(session_id, "启动直播失败", async move {
+                self.start_playback(session_id, "启动直播失败", move |control| async move {
                     // Without a shared hub, the player connects its own;
                     // live playback still starts when that fails.
                     let danmaku_hub = match existing_hub {
@@ -862,8 +862,10 @@ impl App {
                         api_client,
                         room_id,
                         danmaku_hub,
-                        danmaku_config_rx,
+                        control,
                         video_quality,
+                        playback_event_tx,
+                        session_id,
                     )
                     .await
                 });
@@ -900,26 +902,49 @@ impl App {
             }
             AppAction::PlayBangumiEpisode {
                 ep_id,
-                season_id: _,
+                season_id,
+                season_type,
+                aid,
+                cid,
+                bvid,
                 title: _,
             } => {
+                let request = media::VodRequest {
+                    watch: crate::api::heartbeat::WatchTarget {
+                        aid,
+                        cid,
+                        bvid,
+                        pgc: Some(crate::api::heartbeat::PgcWatch {
+                            ep_id,
+                            season_id,
+                            season_type,
+                        }),
+                    },
+                    page: None,
+                };
                 let session_id = self.allocate_playback_session();
                 let api_client = self.api_client.clone();
                 let credentials = self.credentials.clone();
                 let video_quality = self.config.video_quality;
                 let playback_event_tx = self.playback_event_tx.clone();
-                self.start_playback(session_id, "启动番剧播放器失败", async move {
-                    media::play_bangumi_episode(
-                        api_client,
-                        ep_id,
-                        credentials.as_ref(),
-                        video_quality,
-                        playback_event_tx,
-                        session_id,
-                    )
-                    .await
-                });
+                self.start_playback(
+                    session_id,
+                    "启动番剧播放器失败",
+                    move |control| async move {
+                        media::play_bangumi_episode(
+                            api_client,
+                            request,
+                            credentials.as_ref(),
+                            video_quality,
+                            control,
+                            playback_event_tx,
+                            session_id,
+                        )
+                        .await
+                    },
+                );
             }
+            AppAction::StopPlayback => self.stop_playback(),
             AppAction::None => {}
         }
     }
@@ -939,7 +964,7 @@ impl App {
         let credentials = self.credentials.clone();
         let video_quality = self.config.video_quality;
         let playback_event_tx = self.playback_event_tx.clone();
-        self.start_playback(session_id, "启动播放列表失败", async move {
+        self.start_playback(session_id, "启动播放列表失败", move |control| async move {
             media::play_playlist(
                 api_client,
                 items,
@@ -947,6 +972,7 @@ impl App {
                 start_index,
                 credentials.as_ref(),
                 video_quality,
+                control,
                 playback_event_tx,
                 session_id,
             )
@@ -954,31 +980,28 @@ impl App {
         });
     }
 
-    fn start_video_playback(
-        &mut self,
-        bvid: String,
-        aid: i64,
-        cid: i64,
-        duration: i64,
-        page_num: Option<i32>,
-    ) {
+    fn start_video_playback(&mut self, bvid: String, aid: i64, cid: i64, page_num: Option<i32>) {
+        let request = media::VodRequest {
+            watch: crate::api::heartbeat::WatchTarget {
+                aid,
+                cid,
+                bvid,
+                pgc: None,
+            },
+            page: page_num,
+        };
         let session_id = self.allocate_playback_session();
         let api_client = self.api_client.clone();
         let credentials = self.credentials.clone();
-        let danmaku = self.config.danmaku.clone();
         let video_quality = self.config.video_quality;
         let playback_event_tx = self.playback_event_tx.clone();
-        self.start_playback(session_id, "启动播放器失败", async move {
+        self.start_playback(session_id, "启动播放器失败", move |control| async move {
             media::play_video(
                 api_client,
-                &bvid,
-                aid,
-                cid,
-                duration,
-                page_num,
+                request,
                 credentials.as_ref(),
-                danmaku,
                 video_quality,
+                control,
                 playback_event_tx,
                 session_id,
             )
@@ -989,22 +1012,51 @@ impl App {
     /// Starts a player in the background so the UI keeps handling keys
     /// while stream URLs are fetched and mpv launches. The outcome arrives
     /// as `PlaybackEvent::Started` or `PlaybackEvent::Failed`.
-    fn start_playback<F>(&mut self, session_id: u64, error_context: &'static str, start: F)
-    where
+    ///
+    /// Only one player runs at a time: starting one stops the previous.
+    pub(super) fn start_playback<S, F>(
+        &mut self,
+        session_id: u64,
+        error_context: &'static str,
+        start: S,
+    ) where
+        S: FnOnce(media::PlayerControl) -> F,
         F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     {
+        if let Some(previous) = self.player_stop.take() {
+            previous.cancel();
+        }
+        let stop = tokio_util::sync::CancellationToken::new();
+        self.player_stop = Some(stop.clone());
         self.playback.begin_starting(session_id);
+        let start = start(media::PlayerControl {
+            stop: stop.clone(),
+            danmaku_config: self.danmaku_config_tx.subscribe(),
+        });
         let playback_event_tx = self.playback_event_tx.clone();
         tokio::spawn(async move {
-            let event = match start.await {
-                Ok(()) => PlaybackEvent::Started { session_id },
-                Err(error) => PlaybackEvent::Failed {
-                    session_id,
-                    error: format!("{error_context}: {error:#}"),
+            let event = tokio::select! {
+                // Dropping the setup kills an mpv it already spawned.
+                _ = stop.cancelled() => return,
+                result = start => match result {
+                    Ok(()) => PlaybackEvent::Started { session_id },
+                    Err(error) => PlaybackEvent::Failed {
+                        session_id,
+                        error: format!("{error_context}: {error:#}"),
+                    },
                 },
             };
             let _ = playback_event_tx.send(event);
         });
+    }
+
+    /// Stop the running player, if any. Its exit events are ignored.
+    pub(super) fn stop_playback(&mut self) {
+        if let Some(stop) = self.player_stop.take() {
+            stop.cancel();
+        }
+        self.playback.stop();
+        self.auto_return_after_playback = None;
     }
 
     fn login_uid(&self) -> i64 {

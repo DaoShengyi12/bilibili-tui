@@ -22,7 +22,32 @@ const PROBE_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlayUrlData {
-    pub dash: Dash,
+    /// The `qn` the server actually returned; `durl` streams carry no other
+    /// quality marker.
+    #[serde(default, deserialize_with = "super::serde_util::null_as_default")]
+    pub quality: i64,
+    #[serde(default)]
+    pub dash: Option<Dash>,
+    /// Progressive FLV/MP4 segments, returned instead of `dash` for some
+    /// old uploads and PGC previews.
+    #[serde(default, deserialize_with = "super::serde_util::null_as_default")]
+    pub durl: Vec<DurlSegment>,
+    #[serde(default, deserialize_with = "super::serde_util::lenient_flag")]
+    pub is_preview: bool,
+    #[serde(default, deserialize_with = "super::serde_util::lenient_flag")]
+    pub is_drm: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DurlSegment {
+    #[serde(default)]
+    pub order: i64,
+    /// Segment duration in milliseconds.
+    #[serde(default)]
+    pub length: i64,
+    pub url: String,
+    #[serde(default, deserialize_with = "super::serde_util::null_as_default")]
+    pub backup_url: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,6 +98,40 @@ impl DashStream {
             .flatten()
             .chain(self.backup_url_camel.iter().flatten())
     }
+
+    fn source(&self) -> Result<StreamSource<'_>> {
+        Ok(StreamSource {
+            primary: self
+                .primary_url()
+                .ok_or_else(|| anyhow!("CDN 流缺少主地址"))?,
+            backups: self.backup_urls().map(String::as_str).collect(),
+            bandwidth: self.bandwidth,
+        })
+    }
+}
+
+impl DurlSegment {
+    fn source(&self) -> StreamSource<'_> {
+        StreamSource {
+            primary: &self.url,
+            backups: self.backup_url.iter().map(String::as_str).collect(),
+            bandwidth: 0,
+        }
+    }
+}
+
+/// The signed URLs of one media stream, whichever format it came from.
+struct StreamSource<'a> {
+    primary: &'a str,
+    backups: Vec<&'a str>,
+    /// Bits per second; 0 when the API does not say.
+    bandwidth: i64,
+}
+
+impl StreamSource<'_> {
+    fn urls(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.primary).chain(self.backups.iter().copied())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -82,10 +141,35 @@ pub struct CdnCandidate {
     pub score: f64,
 }
 
+/// Which stream of a playurl response was chosen, so a later response for
+/// the same video can be mapped onto the same bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamIdentity {
+    Dash {
+        video_id: i64,
+        video_codec: i64,
+        audio_id: Option<i64>,
+    },
+    Durl {
+        quality: i64,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct RankedStreams {
     pub video: Vec<CdnCandidate>,
+    /// Empty when the video has no separate audio track (silent DASH, `durl`).
     pub audio: Vec<CdnCandidate>,
+    pub identity: StreamIdentity,
+}
+
+/// What the player opens for one playurl response.
+#[derive(Debug, Clone)]
+pub enum PlaybackStreams {
+    /// Ranked CDN candidates served through the local proxy.
+    Proxied(RankedStreams),
+    /// Several progressive segments, played back to back.
+    Segments(Vec<DurlSegment>),
 }
 
 #[derive(Clone, Copy)]
@@ -524,7 +608,7 @@ async fn probe(client: &reqwest::Client, url: String) -> (String, Option<ProbeSc
 }
 
 async fn rank_urls(
-    stream: &DashStream,
+    stream: &StreamSource<'_>,
     kind: StreamKind,
     region: Option<catalog::Region>,
     catalog_hosts: &[String],
@@ -532,15 +616,8 @@ async fn rank_urls(
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(800))
         .build()?;
-    let mut urls = Vec::with_capacity(
-        1 + stream.backup_url.as_ref().map_or(0, Vec::len)
-            + stream.backup_url_camel.as_ref().map_or(0, Vec::len),
-    );
-    let primary = stream
-        .primary_url()
-        .ok_or_else(|| anyhow!("CDN 流缺少主地址"))?;
-    urls.push(primary.to_string());
-    urls.extend(stream.backup_urls().cloned());
+    let primary = stream.primary;
+    let mut urls: Vec<String> = stream.urls().map(ToOwned::to_owned).collect();
     // Bilibili UPOS signatures belong to the media path/query and can be used
     // with another UPOS edge. Preserve every signed component and replace only
     // the host so a few trusted catalog nodes participate in media probing.
@@ -627,45 +704,187 @@ fn speed_score(ratio: f64) -> f64 {
 pub async fn rank_streams(
     data: &PlayUrlData,
     quality: crate::storage::VideoQuality,
-) -> Result<RankedStreams> {
-    let video = select_video_stream(data, quality)?;
-    let mut audio = data.dash.audio.iter().collect::<Vec<_>>();
-    if let Some(dolby) = &data.dash.dolby {
-        audio.extend(dolby.audio.iter().flatten());
+) -> Result<PlaybackStreams> {
+    if data.is_drm {
+        return Err(anyhow!("该内容受 DRM 保护，mpv 无法播放"));
     }
-    if let Some(flac) = &data.dash.flac
-        && let Some(stream) = &flac.audio
-    {
-        audio.push(stream);
-    }
-    let audio = audio
-        .into_iter()
-        .max_by_key(|stream| stream.bandwidth)
-        .ok_or_else(|| anyhow!("播放地址没有音频流"))?;
+    let segments: Vec<DurlSegment>;
+    let (video, audio, identity) = match &data.dash {
+        Some(dash) => {
+            let video = select_video_stream(dash, quality)?;
+            let audio = select_audio_stream(dash);
+            let identity = StreamIdentity::Dash {
+                video_id: video.id,
+                video_codec: video.codecid,
+                audio_id: audio.map(|stream| stream.id),
+            };
+            (
+                video.source()?,
+                audio.map(DashStream::source).transpose()?,
+                identity,
+            )
+        }
+        None => {
+            segments = select_durl_segments(data, quality)?;
+            if segments.len() > 1 {
+                return Ok(PlaybackStreams::Segments(segments));
+            }
+            (
+                segments[0].source(),
+                None,
+                StreamIdentity::Durl {
+                    quality: data.quality,
+                },
+            )
+        }
+    };
     let region_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(800))
         .build()?;
     let (region, catalog_hosts) = catalog::regional_hosts(&region_client).await;
+    let rank_audio = async {
+        match &audio {
+            Some(audio) => rank_urls(audio, StreamKind::Audio, region, &catalog_hosts).await,
+            None => Ok(Vec::new()),
+        }
+    };
     let (video, audio) = tokio::join!(
-        rank_urls(video, StreamKind::Video, region, &catalog_hosts),
-        rank_urls(audio, StreamKind::Audio, region, &catalog_hosts)
+        rank_urls(&video, StreamKind::Video, region, &catalog_hosts),
+        rank_audio
     );
-    Ok(RankedStreams {
+    Ok(PlaybackStreams::Proxied(RankedStreams {
         video: video?,
         audio: audio?,
+        identity,
+    }))
+}
+
+/// Candidates for the stream `previous` played, taken from a new playurl
+/// response after the old signatures expired. Hosts keep their order and
+/// index, so a proxy generation still names the same host; hosts the new
+/// response does not list get the new signature on the old host.
+pub fn refreshed_streams(previous: &RankedStreams, data: &PlayUrlData) -> Result<RankedStreams> {
+    let (video, audio) = match (previous.identity, &data.dash) {
+        (
+            StreamIdentity::Dash {
+                video_id,
+                video_codec,
+                audio_id,
+            },
+            Some(dash),
+        ) => {
+            let video = dash
+                .video
+                .iter()
+                .find(|stream| stream.id == video_id && stream.codecid == video_codec)
+                .ok_or_else(|| anyhow!("刷新后的播放地址缺少原视频流"))?;
+            let audio = match audio_id {
+                Some(audio_id) => Some(
+                    audio_streams(dash)
+                        .find(|stream| stream.id == audio_id)
+                        .ok_or_else(|| anyhow!("刷新后的播放地址缺少原音频流"))?
+                        .source()?,
+                ),
+                None => None,
+            };
+            (video.source()?, audio)
+        }
+        (StreamIdentity::Durl { quality }, None) if data.quality == quality => {
+            match data.durl.as_slice() {
+                [segment] => (segment.source(), None),
+                _ => return Err(anyhow!("刷新后的播放地址分段数不同")),
+            }
+        }
+        _ => return Err(anyhow!("刷新后的播放地址格式不同")),
+    };
+    Ok(RankedStreams {
+        video: refresh_candidates(&previous.video, &video),
+        audio: match &audio {
+            Some(audio) => refresh_candidates(&previous.audio, audio),
+            None => Vec::new(),
+        },
+        identity: previous.identity,
     })
 }
 
-fn select_video_stream(
-    data: &PlayUrlData,
-    quality: crate::storage::VideoQuality,
-) -> Result<&DashStream> {
-    data.dash
-        .video
+fn refresh_candidates(previous: &[CdnCandidate], source: &StreamSource) -> Vec<CdnCandidate> {
+    let template = reqwest::Url::parse(source.primary).ok();
+    let mut refreshed: Vec<CdnCandidate> = previous
+        .iter()
+        .map(|old| {
+            let url = source
+                .urls()
+                .find(|url| host(url).as_deref() == Some(old.host.as_str()))
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    let mut url = template.clone()?;
+                    url.set_host(Some(&old.host)).ok()?;
+                    Some(url.to_string())
+                })
+                .unwrap_or_else(|| old.url.clone());
+            CdnCandidate {
+                url,
+                host: old.host.clone(),
+                score: old.score,
+            }
+        })
+        .collect();
+    for url in source.urls() {
+        if let Some(host) = host(url)
+            && !refreshed.iter().any(|candidate| candidate.host == host)
+        {
+            refreshed.push(CdnCandidate {
+                url: url.to_owned(),
+                host,
+                score: 0.0,
+            });
+        }
+    }
+    refreshed
+}
+
+fn select_video_stream(dash: &Dash, quality: crate::storage::VideoQuality) -> Result<&DashStream> {
+    dash.video
         .iter()
         .filter(|stream| stream.id <= quality.qn())
         .max_by_key(|stream| (stream.id, stream.bandwidth))
         .ok_or_else(|| anyhow!("播放地址没有符合画质上限的视频流"))
+}
+
+fn audio_streams(dash: &Dash) -> impl Iterator<Item = &DashStream> {
+    dash.audio
+        .iter()
+        .chain(
+            dash.dolby
+                .iter()
+                .flat_map(|dolby| dolby.audio.iter().flatten()),
+        )
+        .chain(dash.flac.iter().filter_map(|flac| flac.audio.as_ref()))
+}
+
+/// The best audio track, or `None` for a video without sound.
+fn select_audio_stream(dash: &Dash) -> Option<&DashStream> {
+    audio_streams(dash).max_by_key(|stream| stream.bandwidth)
+}
+
+/// The `durl` segments in playback order. `durl` has a single quality, so
+/// the response is rejected when it exceeds the cap or does not say which
+/// quality it is.
+fn select_durl_segments(
+    data: &PlayUrlData,
+    quality: crate::storage::VideoQuality,
+) -> Result<Vec<DurlSegment>> {
+    if data.durl.is_empty() {
+        return Err(anyhow!("播放地址没有视频流"));
+    }
+    let within_cap = quality == crate::storage::VideoQuality::Best
+        || (data.quality > 0 && data.quality <= quality.qn());
+    if !within_cap {
+        return Err(anyhow!("播放地址没有符合画质上限的视频流"));
+    }
+    let mut segments = data.durl.clone();
+    segments.sort_by_key(|segment| segment.order);
+    Ok(segments)
 }
 
 #[cfg(test)]
@@ -683,11 +902,12 @@ mod tests {
             }
         });
         let data: PlayUrlData = serde_json::from_value(value).unwrap();
+        let dash = data.dash.unwrap();
         assert_eq!(
-            data.dash.video[0].backup_url_camel.as_ref().map(Vec::len),
+            dash.video[0].backup_url_camel.as_ref().map(Vec::len),
             Some(1)
         );
-        assert_eq!(data.dash.audio[0].base_url.as_deref(), Some("https://a/a"));
+        assert_eq!(dash.audio[0].base_url.as_deref(), Some("https://a/a"));
     }
 
     #[test]
@@ -705,6 +925,7 @@ mod tests {
             }
         }))
         .unwrap();
+        let data = data.dash.unwrap();
 
         assert_eq!(
             select_video_stream(&data, crate::storage::VideoQuality::Best)
@@ -725,6 +946,160 @@ mod tests {
             64
         );
         assert!(select_video_stream(&data, crate::storage::VideoQuality::Q360p).is_err());
+    }
+
+    fn durl_data(quality: i64, orders: &[i64]) -> PlayUrlData {
+        serde_json::from_value(serde_json::json!({
+            "quality": quality,
+            "dash": null,
+            "durl": orders
+                .iter()
+                .map(|order| serde_json::json!({
+                    "order": order,
+                    "length": 1000,
+                    "url": format!("https://a.bilivideo.com/{order}.flv"),
+                    "backup_url": null
+                }))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn durl_response_without_dash_deserializes() {
+        let data = durl_data(64, &[1]);
+        assert!(data.dash.is_none());
+        assert_eq!(data.durl.len(), 1);
+        assert!(!data.is_preview);
+        let data: PlayUrlData =
+            serde_json::from_value(serde_json::json!({"is_preview": "1", "durl": null})).unwrap();
+        assert!(data.is_preview);
+        assert!(data.durl.is_empty());
+    }
+
+    #[test]
+    fn durl_segments_play_in_order_and_respect_the_quality_cap() {
+        use crate::storage::VideoQuality;
+        let data = durl_data(80, &[2, 1, 3]);
+        let orders: Vec<i64> = select_durl_segments(&data, VideoQuality::Q1080p)
+            .unwrap()
+            .iter()
+            .map(|segment| segment.order)
+            .collect();
+        assert_eq!(orders, [1, 2, 3]);
+        assert!(select_durl_segments(&data, VideoQuality::Q720p).is_err());
+        // Without a reported quality only an uncapped setting may play it.
+        let unknown = durl_data(0, &[1]);
+        assert!(select_durl_segments(&unknown, VideoQuality::Q1080p).is_err());
+        assert!(select_durl_segments(&unknown, VideoQuality::Best).is_ok());
+        assert!(select_durl_segments(&durl_data(80, &[]), VideoQuality::Best).is_err());
+    }
+
+    #[tokio::test]
+    async fn drm_streams_are_rejected_before_probing() {
+        let mut data = durl_data(80, &[1]);
+        data.is_drm = true;
+        let error = rank_streams(&data, crate::storage::VideoQuality::Best)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("DRM"));
+    }
+
+    #[tokio::test]
+    async fn multi_segment_durl_is_returned_without_probing() {
+        let streams = rank_streams(&durl_data(80, &[2, 1]), crate::storage::VideoQuality::Best)
+            .await
+            .unwrap();
+        let PlaybackStreams::Segments(segments) = streams else {
+            panic!("expected segments");
+        };
+        assert_eq!(segments[0].order, 1);
+    }
+
+    fn candidate(url: &str) -> CdnCandidate {
+        CdnCandidate {
+            url: url.to_string(),
+            host: host(url).unwrap(),
+            score: 1.0,
+        }
+    }
+
+    fn dash_data(video_url: &str, backup: &str, audio_url: &str) -> PlayUrlData {
+        serde_json::from_value(serde_json::json!({
+            "dash": {
+                "video": [
+                    {"id": 80, "codecid": 12, "bandwidth": 1, "baseUrl": "https://x.bilivideo.com/other"},
+                    {"id": 80, "codecid": 7, "bandwidth": 2, "baseUrl": video_url, "backupUrl": [backup]}
+                ],
+                "audio": [{"id": 30280, "bandwidth": 1, "baseUrl": audio_url}]
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn refreshed_streams_keep_host_order_and_index() {
+        let previous = RankedStreams {
+            video: vec![
+                candidate("https://b.bilivideo.com/v?sig=old"),
+                candidate("https://c.bilivideo.com/v?sig=old"),
+                candidate("https://a.bilivideo.com/v?sig=old"),
+            ],
+            audio: vec![candidate("https://a.bilivideo.com/a?sig=old")],
+            identity: StreamIdentity::Dash {
+                video_id: 80,
+                video_codec: 7,
+                audio_id: Some(30280),
+            },
+        };
+        let data = dash_data(
+            "https://a.bilivideo.com/v?sig=new",
+            "https://d.bilivideo.com/v?sig=new",
+            "https://a.bilivideo.com/a?sig=new",
+        );
+
+        let refreshed = refreshed_streams(&previous, &data).unwrap();
+
+        let urls: Vec<&str> = refreshed.video.iter().map(|c| c.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                // Not in the new response: the new signature on the old host.
+                "https://b.bilivideo.com/v?sig=new",
+                "https://c.bilivideo.com/v?sig=new",
+                "https://a.bilivideo.com/v?sig=new",
+                "https://d.bilivideo.com/v?sig=new",
+            ]
+        );
+        assert_eq!(refreshed.audio[0].url, "https://a.bilivideo.com/a?sig=new");
+        assert_eq!(refreshed.identity, previous.identity);
+    }
+
+    #[test]
+    fn refresh_rejects_a_response_without_the_original_stream() {
+        let previous = RankedStreams {
+            video: vec![candidate("https://a.bilivideo.com/v?sig=old")],
+            audio: Vec::new(),
+            identity: StreamIdentity::Dash {
+                video_id: 116,
+                video_codec: 7,
+                audio_id: None,
+            },
+        };
+        let data = dash_data(
+            "https://a.bilivideo.com/v",
+            "https://b.bilivideo.com/v",
+            "https://a.bilivideo.com/a",
+        );
+        assert!(refreshed_streams(&previous, &data).is_err());
+
+        let durl = RankedStreams {
+            identity: StreamIdentity::Durl { quality: 80 },
+            ..previous
+        };
+        assert!(refreshed_streams(&durl, &durl_data(64, &[1])).is_err());
+        assert!(refreshed_streams(&durl, &durl_data(80, &[1])).is_ok());
+        assert!(refreshed_streams(&durl, &durl_data(80, &[1, 2])).is_err());
     }
 
     #[test]

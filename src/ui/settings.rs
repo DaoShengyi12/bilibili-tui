@@ -129,6 +129,11 @@ impl SettingsPage {
         })
     }
 
+    /// Whether keys go to a keybinding capture or a danmaku value editor.
+    pub fn is_capturing_input(&self) -> bool {
+        self.editing_keybind || self.editing_danmaku
+    }
+
     fn keybind_labels(&self) -> Vec<(&'static str, &str)> {
         vec![
             // Global actions
@@ -162,6 +167,8 @@ impl SettingsPage {
             // Dynamic page
             ("上一UP", &self.keybindings.up_prev),
             ("下一UP", &self.keybindings.up_next),
+            // Playback; must stay in step with `Keybindings::update_by_index`.
+            ("停止播放", &self.keybindings.stop_playback),
         ]
     }
 }
