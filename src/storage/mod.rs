@@ -663,6 +663,50 @@ pub fn export_cookies_for_ytdlp(credentials: &Credentials) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Remove cookie exports left behind by earlier processes that exited without
+/// cleaning up (crash, SIGKILL). Exports owned by live processes are kept.
+pub fn remove_stale_cookie_exports() {
+    let Ok(dir) = get_config_dir() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let current_pid = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if is_stale_cookie_export(name, current_pid, process_is_alive) {
+            let _ = remove_cookie_export(&entry.path());
+        }
+    }
+}
+
+fn is_stale_cookie_export(name: &str, current_pid: u32, is_alive: impl Fn(u32) -> bool) -> bool {
+    let Some(pid) = name
+        .strip_prefix("cookies-")
+        .and_then(|rest| rest.strip_suffix(".txt"))
+        .and_then(|rest| rest.split_once('-'))
+        .filter(|(_, sequence)| sequence.parse::<u64>().is_ok())
+        .and_then(|(pid, _)| pid.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    pid != current_pid && !is_alive(pid)
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let proc_root = std::path::Path::new("/proc");
+    if proc_root.is_dir() {
+        proc_root.join(pid.to_string()).exists()
+    } else {
+        // Without procfs the owner cannot be checked; keep the file.
+        true
+    }
+}
+
 /// Remove a temporary cookie export. This is safe to call on error paths and
 /// succeeds when the file has already been removed.
 pub fn remove_cookie_export(path: &std::path::Path) -> Result<()> {
@@ -676,6 +720,17 @@ pub fn remove_cookie_export(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    #[test]
+    fn cookie_exports_of_dead_processes_are_stale() {
+        let alive = |pid: u32| pid == 200;
+        assert!(is_stale_cookie_export("cookies-100-1.txt", 300, alive));
+        assert!(!is_stale_cookie_export("cookies-200-1.txt", 300, alive));
+        assert!(!is_stale_cookie_export("cookies-300-4.txt", 300, alive));
+        assert!(!is_stale_cookie_export("credentials.json", 300, alive));
+        assert!(!is_stale_cookie_export("cookies-100.txt", 300, alive));
+        assert!(!is_stale_cookie_export("cookies-x-1.txt", 300, alive));
+    }
 
     #[test]
     fn legacy_config_receives_default_danmaku_settings() {

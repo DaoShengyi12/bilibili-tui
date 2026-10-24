@@ -98,6 +98,8 @@ impl App {
         let bridge = network::start_network_worker(api_client.clone());
         let (playback_event_tx, playback_event_rx) = mpsc::channel();
 
+        persistence::remove_stale_cookie_exports();
+
         // Load config and apply saved theme
         let config = persistence::load_config().unwrap_or_default();
         let (danmaku_config_tx, _) = watch::channel(config.danmaku.clone());

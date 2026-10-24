@@ -87,22 +87,23 @@ pub async fn play_video(
     let ipc_path = vod_mpv_ipc_path(cid);
     remove_stale_mpv_ipc(&ipc_path);
     let danmaku_script_path = create_live_danmaku_script()?;
+    let mut session_files = SessionFiles::new(vec![ipc_path.clone(), danmaku_script_path.clone()]);
 
     let mut cmd = Command::new("mpv");
+    cmd.kill_on_drop(true);
 
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
 
-    let cookie_path_to_clean = if let Some(creds) = credentials {
+    // Cookies are only needed by yt-dlp; the proxy path passes `--ytdl=no`.
+    if let (Some(creds), None) = (credentials, &media_proxy) {
         let cookie_path = crate::storage::export_cookies_for_ytdlp(creds)?;
         cmd.arg(format!(
             "--ytdl-raw-options=cookies={}",
             cookie_path.display()
         ));
-        Some(cookie_path)
-    } else {
-        None
-    };
+        session_files.push(cookie_path);
+    }
 
     cmd.arg("--force-window=immediate");
     configure_vod_buffering(&mut cmd);
@@ -124,16 +125,7 @@ pub async fn play_video(
         cmd.arg(&webpage_url);
     }
 
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            if let Some(path) = &cookie_path_to_clean {
-                let _ = crate::storage::remove_cookie_export(path);
-            }
-            let _ = std::fs::remove_file(&danmaku_script_path);
-            return Err(error.into());
-        }
-    };
+    let mut child = cmd.spawn()?;
     let stderr = child
         .stderr
         .take()
@@ -297,12 +289,7 @@ pub async fn play_video(
             }
         }
 
-        // Cleanup cookie file
-        if let Some(path) = cookie_path_to_clean {
-            let _ = crate::storage::remove_cookie_export(&path);
-        }
-        let _ = tokio::fs::remove_file(&ipc_path).await;
-        let _ = tokio::fs::remove_file(&danmaku_script_path).await;
+        drop(session_files);
         let event = match exit_error {
             Some(error) => PlaybackEvent::Failed { session_id, error },
             None => PlaybackEvent::Finished {
@@ -452,6 +439,29 @@ fn mpv_ipc_path(prefix: &str, suffix: &str) -> std::path::PathBuf {
     #[cfg(not(windows))]
     {
         std::env::temp_dir().join(format!("{prefix}-{}-{suffix}.sock", std::process::id()))
+    }
+}
+
+/// Temporary files owned by one player session. They are removed when the
+/// guard drops, including when the session task is dropped at app exit or an
+/// early return aborts setup.
+struct SessionFiles(Vec<std::path::PathBuf>);
+
+impl SessionFiles {
+    fn new(paths: Vec<std::path::PathBuf>) -> Self {
+        Self(paths)
+    }
+
+    fn push(&mut self, path: std::path::PathBuf) {
+        self.0.push(path);
+    }
+}
+
+impl Drop for SessionFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -674,6 +684,7 @@ pub async fn play_playlist(
     log_skipped_playlist_items(&skipped);
 
     let mut cmd = Command::new("mpv");
+    cmd.kill_on_drop(true);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
     cmd.arg("--idle=yes");
@@ -1129,19 +1140,20 @@ pub async fn play_bangumi_episode(
     };
 
     let mut cmd = Command::new("mpv");
+    cmd.kill_on_drop(true);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
 
-    let cookie_path_to_clean = if let Some(creds) = credentials {
+    // Cookies are only needed by yt-dlp; the proxy path passes `--ytdl=no`.
+    let mut session_files = SessionFiles::new(Vec::new());
+    if let (Some(creds), None) = (credentials, &media_proxy) {
         let cookie_path = crate::storage::export_cookies_for_ytdlp(creds)?;
         cmd.arg(format!(
             "--ytdl-raw-options=cookies={}",
             cookie_path.display()
         ));
-        Some(cookie_path)
-    } else {
-        None
-    };
+        session_files.push(cookie_path);
+    }
 
     cmd.arg("--force-window=immediate");
     cmd.arg("--script-opts-append=double_video_fps=yes");
@@ -1156,23 +1168,12 @@ pub async fn play_bangumi_episode(
         cmd.arg(&video_url);
     }
 
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            if let Some(path) = &cookie_path_to_clean {
-                let _ = crate::storage::remove_cookie_export(path);
-            }
-            return Err(error.into());
-        }
-    };
+    let mut child = cmd.spawn()?;
 
     tokio::spawn(async move {
         let status = child.wait().await;
 
-        // Cleanup cookie file
-        if let Some(path) = cookie_path_to_clean {
-            let _ = crate::storage::remove_cookie_export(&path);
-        }
+        drop(session_files);
         drop(media_proxy);
         let event = match status {
             Ok(status) if status.success() => PlaybackEvent::Finished {
@@ -1421,6 +1422,7 @@ fn spawn_live_mpv(
     danmaku_script_path: &std::path::Path,
 ) -> Result<tokio::process::Child> {
     let mut cmd = Command::new("mpv");
+    cmd.kill_on_drop(true);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
     configure_live_mpv(&mut cmd, ipc_path);
@@ -1517,6 +1519,19 @@ fn write_live_diagnostic(_room_id: i64, message: &str) {
 #[cfg(test)]
 mod playlist_tests {
     use super::*;
+
+    #[test]
+    fn session_files_are_removed_when_guard_drops() {
+        let path = std::env::temp_dir().join(format!(
+            "bilibili-tui-session-files-test-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"x").unwrap();
+        let mut files = SessionFiles::new(Vec::new());
+        files.push(path.clone());
+        drop(files);
+        assert!(!path.exists());
+    }
 
     #[test]
     fn replaying_same_cid_uses_distinct_ipc_paths() {
