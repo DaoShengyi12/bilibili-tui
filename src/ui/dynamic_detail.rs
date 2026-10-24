@@ -254,6 +254,28 @@ impl DynamicDetailPage {
         lines
     }
 
+    /// Move the selected comment and scroll so its first line is at the top.
+    /// Selection and scroll used to advance independently (comment index vs.
+    /// line index), so Enter could like a comment that was not on screen.
+    fn move_comment_selection(&mut self, delta: isize) {
+        if self.comments.is_empty() {
+            self.selected_comment = 0;
+            self.comment_scroll = 0;
+            return;
+        }
+        let last = self.comments.len() - 1;
+        self.selected_comment = self.selected_comment.saturating_add_signed(delta).min(last);
+        self.comment_scroll = self.comment_start_line(self.selected_comment);
+    }
+
+    fn comment_start_line(&self, index: usize) -> usize {
+        self.get_comment_lines()
+            .iter()
+            .take(index)
+            .map(Vec::len)
+            .sum()
+    }
+
     fn get_comment_lines(&self) -> Vec<Vec<String>> {
         let mut comment_blocks = Vec::new();
 
@@ -537,25 +559,11 @@ impl Component for DynamicDetailPage {
             return Some(AppAction::LoadMoreComments);
         }
         if keys.matches_down(key) {
-            // Scroll down and track selected comment
-            if self.selected_comment + 1 < self.comments.len() {
-                self.selected_comment += 1;
-            }
-            let comment_blocks = self.get_comment_lines();
-            let total_lines: usize = comment_blocks.iter().map(|b| b.len()).sum();
-            if self.comment_scroll + 1 < total_lines {
-                self.comment_scroll += 1;
-            }
+            self.move_comment_selection(1);
             return Some(AppAction::None);
         }
         if keys.matches_up(key) {
-            // Scroll up
-            if self.selected_comment > 0 {
-                self.selected_comment -= 1;
-            }
-            if self.comment_scroll > 0 {
-                self.comment_scroll -= 1;
-            }
+            self.move_comment_selection(-1);
             return Some(AppAction::None);
         }
         if keys.matches_confirm(key) {
@@ -586,25 +594,11 @@ impl Component for DynamicDetailPage {
 
         match event.kind {
             MouseEventKind::ScrollDown => {
-                // Scroll down comments
-                if self.selected_comment + 1 < self.comments.len() {
-                    self.selected_comment += 1;
-                }
-                let comment_blocks = self.get_comment_lines();
-                let total_lines: usize = comment_blocks.iter().map(|b| b.len()).sum();
-                if self.comment_scroll + 1 < total_lines {
-                    self.comment_scroll += 1;
-                }
+                self.move_comment_selection(1);
                 None
             }
             MouseEventKind::ScrollUp => {
-                // Scroll up comments
-                if self.selected_comment > 0 {
-                    self.selected_comment -= 1;
-                }
-                if self.comment_scroll > 0 {
-                    self.comment_scroll -= 1;
-                }
+                self.move_comment_selection(-1);
                 None
             }
             _ => None,
@@ -714,20 +708,33 @@ impl DynamicDetailPage {
 
     fn draw_comments(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let comment_blocks = self.get_comment_lines();
+        let has_comments = !self.comments.is_empty();
 
-        // Flatten all comment blocks into a single vector of lines
+        // Flatten all comment blocks, marking the selected comment's lines so
+        // the like target is visible.
         let mut all_lines = Vec::new();
-        for block in comment_blocks {
-            all_lines.extend(block);
+        for (index, block) in comment_blocks.into_iter().enumerate() {
+            let selected = has_comments && index == self.selected_comment;
+            for (line_index, line) in block.into_iter().enumerate() {
+                all_lines.push((selected, line_index == 0, line));
+            }
         }
 
         let visible_height = area.height.saturating_sub(2) as usize;
+        let selected_style = Style::default().fg(theme.fg_accent);
 
         let display_lines: Vec<Line> = all_lines
             .iter()
             .skip(self.comment_scroll)
             .take(visible_height)
-            .map(|line| Line::from(line.as_str()))
+            .map(
+                |(selected, is_header, line)| match (*selected, *is_header) {
+                    (true, true) => Line::from(format!("▶{line}"))
+                        .style(selected_style.add_modifier(Modifier::BOLD)),
+                    (true, false) => Line::from(line.as_str()).style(selected_style),
+                    _ => Line::from(line.as_str()),
+                },
+            )
             .collect();
 
         let comments = Paragraph::new(display_lines)
@@ -774,4 +781,44 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     }
 
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page_with_comments(messages: &[&str]) -> DynamicDetailPage {
+        let mut page = DynamicDetailPage::new("1".to_string());
+        page.comments = messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                serde_json::from_value(serde_json::json!({
+                    "rpid": index as i64 + 1,
+                    "oid": 1, "mid": 1, "parent": 0,
+                    "content": {"message": message}
+                }))
+                .expect("comment fixture")
+            })
+            .collect();
+        page
+    }
+
+    #[test]
+    fn moving_selection_scrolls_to_the_selected_comment() {
+        let mut page = page_with_comments(&["first", "second", "third"]);
+        let keys = Keybindings::default();
+
+        page.handle_input(KeyCode::Down, &keys);
+        page.handle_input(KeyCode::Down, &keys);
+        assert_eq!(page.selected_comment, 2);
+        assert_eq!(page.comment_scroll, page.comment_start_line(2));
+
+        page.handle_input(KeyCode::Down, &keys);
+        assert_eq!(page.selected_comment, 2);
+
+        page.handle_input(KeyCode::Up, &keys);
+        assert_eq!(page.selected_comment, 1);
+        assert_eq!(page.comment_scroll, page.comment_start_line(1));
+    }
 }
