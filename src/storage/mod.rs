@@ -205,9 +205,10 @@ impl Keybindings {
         }
     }
 
-    /// Convert a KeyCode to its string representation
-    pub fn keycode_to_string(key: KeyCode) -> String {
-        match key {
+    /// Convert a KeyCode to its string representation, or `None` for keys
+    /// that `parse_keycode` cannot read back (media keys, modifiers, ...).
+    pub fn keycode_to_string(key: KeyCode) -> Option<String> {
+        Some(match key {
             KeyCode::Enter => "Enter".to_string(),
             KeyCode::Esc => "Esc".to_string(),
             KeyCode::Tab => "Tab".to_string(),
@@ -226,8 +227,8 @@ impl Keybindings {
             KeyCode::F(n) => format!("F{}", n),
             KeyCode::Char(' ') => "Space".to_string(),
             KeyCode::Char(c) => c.to_string(),
-            _ => "Unknown".to_string(),
-        }
+            _ => return None,
+        })
     }
 
     /// Check if a key matches the configured keybinding (including arrow key alternatives)

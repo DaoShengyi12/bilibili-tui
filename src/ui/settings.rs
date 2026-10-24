@@ -51,6 +51,8 @@ pub struct SettingsPage {
     pub auto_play: bool,
     pub minimal_mode: bool,
     pub minimal_mode_error: Option<String>,
+    /// Result of the last key capture: an unsupported key or a shared key.
+    keybind_notice: Option<String>,
     pub video_quality: VideoQuality,
     section_index: usize,
     pub editing_keybind: bool,
@@ -89,6 +91,7 @@ impl SettingsPage {
             auto_play,
             minimal_mode: false,
             minimal_mode_error: None,
+            keybind_notice: None,
             video_quality,
             section_index: 0,
             editing_keybind: false,
@@ -102,6 +105,28 @@ impl SettingsPage {
     pub fn with_minimal_mode(mut self, enabled: bool) -> Self {
         self.minimal_mode = enabled;
         self
+    }
+
+    /// Warn when `key` is already bound to other actions. Several defaults
+    /// share keys on purpose (e.g. `r` refreshes lists and toggles replies),
+    /// so this informs rather than rejects.
+    fn shared_key_notice(&self, index: usize, key: KeyCode) -> Option<String> {
+        let labels = self.keybind_labels();
+        let shared: Vec<&str> = labels
+            .iter()
+            .enumerate()
+            .filter(|(other, (_, binding))| {
+                *other != index && crate::storage::Keybindings::parse_keycode(binding) == Some(key)
+            })
+            .map(|(_, (label, _))| *label)
+            .collect();
+        let (label, _) = labels.get(index)?;
+        (!shared.is_empty()).then(|| {
+            format!(
+                "⚠ 「{label}」与「{}」使用同一按键，请确认不会冲突",
+                shared.join("」「")
+            )
+        })
     }
 
     fn keybind_labels(&self) -> Vec<(&'static str, &str)> {
@@ -264,12 +289,20 @@ impl Component for SettingsPage {
         keys: &crate::storage::Keybindings,
     ) -> Option<AppAction> {
         // Handle keybind editing mode - any key pressed becomes the new binding
+        if !self.editing_keybind {
+            self.keybind_notice = None;
+        }
         if self.editing_keybind {
             if key == KeyCode::Esc {
                 self.editing_keybind = false;
                 return Some(AppAction::None);
             }
-            let new_key = crate::storage::Keybindings::keycode_to_string(key);
+            let Some(new_key) = crate::storage::Keybindings::keycode_to_string(key) else {
+                // Stay in capture mode; saving would write an unreadable key.
+                self.keybind_notice = Some("该按键无法保存，请换一个（Esc 取消）".to_string());
+                return Some(AppAction::None);
+            };
+            self.keybind_notice = self.shared_key_notice(self.selected_keybind_index, key);
             self.keybindings
                 .update_by_index(self.selected_keybind_index, new_key);
             self.editing_keybind = false;
@@ -832,7 +865,11 @@ impl SettingsPage {
 
         let chunks = Layout::vertical([
             Constraint::Min(5),
-            Constraint::Length(if self.editing_keybind { 3 } else { 0 }),
+            Constraint::Length(if self.editing_keybind || self.keybind_notice.is_some() {
+                3
+            } else {
+                0
+            }),
         ])
         .split(inner);
 
@@ -883,9 +920,20 @@ impl SettingsPage {
         frame.render_widget(List::new(items), chunks[0]);
         if self.editing_keybind {
             let label = labels[self.selected_keybind_index].0;
+            let prompt = self
+                .keybind_notice
+                .clone()
+                .unwrap_or_else(|| format!("正在设置「{label}」：请按新的快捷键"));
             frame.render_widget(
-                Paragraph::new(format!("正在设置「{label}」：请按新的快捷键"))
+                Paragraph::new(prompt)
                     .block(Block::default().borders(Borders::ALL).title(" 快捷键输入 ")),
+                chunks[1],
+            );
+        } else if let Some(notice) = &self.keybind_notice {
+            frame.render_widget(
+                Paragraph::new(notice.as_str())
+                    .style(Style::default().fg(theme.warning))
+                    .block(Block::default().borders(Borders::ALL).title(" 快捷键 ")),
                 chunks[1],
             );
         }
@@ -992,6 +1040,41 @@ mod tests {
         page.handle_input(KeyCode::Esc, &keys);
         assert!(!page.editing_keybind);
         assert_eq!(page.keybindings.quit, original);
+    }
+
+    #[test]
+    fn unrepresentable_key_is_not_saved_and_capture_continues() {
+        let keys = Keybindings::default();
+        let mut page = SettingsPage {
+            current_section: SettingsSection::Keybindings,
+            editing_keybind: true,
+            ..SettingsPage::default()
+        };
+        let original = page.keybindings.quit.clone();
+        let action = page.handle_input(KeyCode::CapsLock, &keys);
+        assert!(matches!(action, Some(AppAction::None)));
+        assert!(page.editing_keybind);
+        assert_eq!(page.keybindings.quit, original);
+        assert!(page.keybind_notice.is_some());
+    }
+
+    #[test]
+    fn binding_a_key_used_elsewhere_saves_with_a_warning() {
+        let keys = Keybindings::default();
+        let mut page = SettingsPage {
+            current_section: SettingsSection::Keybindings,
+            editing_keybind: true,
+            selected_keybind_index: 0,
+            ..SettingsPage::default()
+        };
+        // `j` is the default nav_down key.
+        let action = page.handle_input(KeyCode::Char('j'), &keys);
+        assert!(matches!(action, Some(AppAction::SaveKeybindings(_))));
+        assert_eq!(page.keybindings.quit, "j");
+        assert!(page.keybind_notice.as_deref().unwrap().contains("同一按键"));
+
+        page.handle_input(KeyCode::Down, &keys);
+        assert!(page.keybind_notice.is_none(), "the next key clears it");
     }
 
     #[test]
