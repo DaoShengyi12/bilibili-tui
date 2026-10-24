@@ -929,16 +929,8 @@ impl HomePage {
         let views = card.video.format_views();
         let duration = card.video.format_duration();
 
-        let max_title_len = (info_area.width as usize).saturating_sub(2);
-        let display_title: String = if title.chars().count() > max_title_len {
-            title
-                .chars()
-                .take(max_title_len.saturating_sub(3))
-                .collect::<String>()
-                + "..."
-        } else {
-            title.to_string()
-        };
+        let max_title_width = (info_area.width as usize).saturating_sub(2);
+        let display_title = super::text::truncate_to_width(title, max_title_width, "...");
 
         // Multi-styled info text
         let title_style = if is_selected {

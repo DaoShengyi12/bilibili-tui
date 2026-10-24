@@ -134,16 +134,8 @@ impl VideoCard {
 
         // Video info with improved hierarchy
         let info_area = card_chunks[1];
-        let max_title_len = (info_area.width as usize).saturating_sub(2);
-        let display_title: String = if self.title.chars().count() > max_title_len {
-            self.title
-                .chars()
-                .take(max_title_len.saturating_sub(2))
-                .collect::<String>()
-                + "…"
-        } else {
-            self.title.clone()
-        };
+        let max_title_width = (info_area.width as usize).saturating_sub(2);
+        let display_title = super::text::truncate_to_width(&self.title, max_title_width, "…");
 
         // Title styling - selected items get primary color and bold
         let title_style = if is_selected {

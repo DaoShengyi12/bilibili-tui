@@ -12,6 +12,7 @@ mod login;
 mod search;
 mod settings;
 mod sidebar;
+pub mod text;
 pub mod theme;
 mod up;
 mod video_card;

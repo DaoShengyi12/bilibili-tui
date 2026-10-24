@@ -869,7 +869,7 @@ impl SettingsPage {
                 let prefix = if is_selected { "▶ " } else { "  " };
                 ListItem::new(Line::from(vec![
                     Span::styled(prefix, style),
-                    Span::styled(format!("{:<12}", label), style),
+                    Span::styled(super::text::pad_to_width(label, 12), style),
                     Span::styled(
                         format!("[{}]", key),
                         Style::default()

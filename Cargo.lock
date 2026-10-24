@@ -267,6 +267,7 @@ dependencies = [
  "tokio-util",
  "tui-big-text",
  "tui-qrcode",
+ "unicode-width",
 ]
 
 [[package]]

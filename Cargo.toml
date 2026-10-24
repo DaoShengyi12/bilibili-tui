@@ -33,6 +33,7 @@ tokio-util = { version = "0.7.18", features = ["rt"] }
 tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
 tui-big-text = "0.8.4"
 tui-qrcode = { version = "0.2.4", default-features = false }
+unicode-width = "0.2.2"
 
 [profile.release]
 lto = true

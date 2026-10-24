@@ -1,5 +1,6 @@
 //! Dynamic detail page for viewing image/text dynamics
 
+use super::text::wrap_to_width;
 use super::{Component, Theme, footer_notice, shortcut_footer};
 use crate::api::comment::CommentItem;
 use crate::api::dynamic::DynamicItem;
@@ -48,6 +49,11 @@ pub struct DynamicDetailPage {
     /// Transient message shown in the footer until the next key press.
     pub notice: Option<String>,
     pub selected_comment: usize,
+    /// Inner widths of the detail and comment panes from the last frame.
+    /// Lines are wrapped to them so that one string is one screen row and
+    /// scroll positions computed from line counts match the screen.
+    content_width: std::cell::Cell<usize>,
+    comment_width: std::cell::Cell<usize>,
 }
 
 impl DynamicDetailPage {
@@ -63,6 +69,8 @@ impl DynamicDetailPage {
             error_message: None,
             comment_page: 1,
             content_scroll: 0,
+            content_width: std::cell::Cell::new(60),
+            comment_width: std::cell::Cell::new(80),
             comment_scroll: 0,
             has_more_comments: true,
             loading_more_comments: false,
@@ -186,7 +194,8 @@ impl DynamicDetailPage {
             {
                 lines.push("📝 动态内容:".to_string());
                 lines.push(String::new());
-                for line in wrap_text(text, 60) {
+                let width = self.content_width.get().saturating_sub(2);
+                for line in wrap_to_width(text, width) {
                     lines.push(format!("  {}", line));
                 }
                 lines.push(String::new());
@@ -234,17 +243,22 @@ impl DynamicDetailPage {
                 .and_then(|l| l.current_level)
                 .unwrap_or(0);
 
-            block.push(format!(
-                "💬 {} [Lv.{}]  👍 {}  {}",
-                comment.author_name(),
-                level,
-                comment.format_like(),
-                comment.format_time()
+            let width = self.comment_width.get();
+            // The selected comment's header gets a one-column marker.
+            block.extend(wrap_to_width(
+                &format!(
+                    "💬 {} [Lv.{}]  👍 {}  {}",
+                    comment.author_name(),
+                    level,
+                    comment.format_like(),
+                    comment.format_time()
+                ),
+                width.saturating_sub(1),
             ));
 
             // Comment content
             let message = comment.message();
-            for line in wrap_text(message, 80) {
+            for line in wrap_to_width(message, width.saturating_sub(3)) {
                 block.push(format!("   {}", line));
             }
 
@@ -256,7 +270,7 @@ impl DynamicDetailPage {
             // Add separator except for last comment
             if idx < self.comments.len() - 1 {
                 block.push(String::new());
-                block.push("─".repeat(80));
+                block.push("─".repeat(width));
             }
             block.push(String::new());
 
@@ -622,6 +636,8 @@ impl DynamicDetailPage {
     }
 
     fn draw_details(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.content_width
+            .set(area.width.saturating_sub(2) as usize);
         let content_lines = self.get_content_lines();
         let visible_height = area.height.saturating_sub(2) as usize;
 
@@ -640,12 +656,13 @@ impl DynamicDetailPage {
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(theme.border_focused))
                     .title(" 动态详情 "),
-            )
-            .wrap(Wrap { trim: false });
+            );
         frame.render_widget(content, area);
     }
 
     fn draw_comments(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.comment_width
+            .set(area.width.saturating_sub(2) as usize);
         let comment_blocks = self.get_comment_lines();
         let has_comments = !self.comments.is_empty();
 
@@ -684,42 +701,9 @@ impl DynamicDetailPage {
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(theme.border_focused))
                     .title(format!(" 评论 ({}) ", self.comments.len())),
-            )
-            .wrap(Wrap { trim: false });
+            );
         frame.render_widget(comments, area);
     }
-}
-
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current_line = String::new();
-    let mut current_width = 0;
-
-    for word in text.split_whitespace() {
-        let word_width = word.chars().count();
-        if current_width + word_width + 1 > width && !current_line.is_empty() {
-            lines.push(current_line.clone());
-            current_line.clear();
-            current_width = 0;
-        }
-
-        if !current_line.is_empty() {
-            current_line.push(' ');
-            current_width += 1;
-        }
-        current_line.push_str(word);
-        current_width += word_width;
-    }
-
-    if !current_line.is_empty() {
-        lines.push(current_line);
-    }
-
-    if lines.is_empty() {
-        lines.push(text.to_string());
-    }
-
-    lines
 }
 
 #[cfg(test)]
@@ -741,6 +725,24 @@ mod tests {
             })
             .collect();
         page
+    }
+
+    #[test]
+    fn comment_lines_fit_the_pane_so_scroll_matches_screen_rows() {
+        let page = page_with_comments(&[
+            "这是一条没有空格而且非常非常长的中文评论，用来检查换行是否按照终端列宽计算",
+            "second",
+        ]);
+        page.comment_width.set(20);
+        let blocks = page.get_comment_lines();
+        for line in blocks.iter().flatten() {
+            assert!(
+                crate::ui::text::display_width(line) <= 20,
+                "{line:?} is wider than the pane"
+            );
+        }
+        assert!(blocks[0].iter().any(|line| line == &"─".repeat(20)));
+        assert_eq!(page.comment_start_line(1), blocks[0].len());
     }
 
     #[test]
