@@ -172,10 +172,18 @@ impl HistoryPage {
             self.items.extend(new_items);
         }
         self.loading = false;
+        self.error = None;
     }
 
+    /// A failure with nothing loaded replaces the grid; a failure while
+    /// loading more keeps the loaded items visible and reports a notice, so
+    /// keys never act on a hidden grid.
     pub fn apply_load_more_error(&mut self, msg: String) {
-        self.error = Some(msg);
+        if self.items.is_empty() {
+            self.error = Some(msg);
+        } else {
+            self.notice = Some(msg);
+        }
         self.loading = false;
     }
 
@@ -1047,6 +1055,23 @@ mod tests {
         page.handle_input_with_modifiers(KeyCode::Esc, KeyModifiers::NONE, &keys);
         assert!(page.selected_keys.is_empty());
         assert_eq!(page.mode, HistoryMode::Browse);
+    }
+
+    #[test]
+    fn load_more_failure_keeps_loaded_items_visible() {
+        let mut page = history_page();
+        page.apply_load_more_error("加载更多失败: timeout".to_string());
+        assert!(page.error.is_none());
+        assert_eq!(page.notice.as_deref(), Some("加载更多失败: timeout"));
+        assert_eq!(page.items.len(), 3);
+        assert!(!page.loading);
+    }
+
+    #[test]
+    fn initial_load_failure_shows_page_error() {
+        let mut page = HistoryPage::new();
+        page.apply_load_more_error("加载历史记录失败: timeout".to_string());
+        assert_eq!(page.error.as_deref(), Some("加载历史记录失败: timeout"));
     }
 
     #[test]
