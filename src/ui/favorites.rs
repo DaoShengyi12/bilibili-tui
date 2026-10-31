@@ -1,4 +1,4 @@
-use super::{Component, Theme, VideoCard, VideoCardGrid, shortcut_footer};
+use super::{Component, Theme, VideoCard, VideoCardGrid};
 use crate::api::favorite::{
     CollectedFolder, FavoriteFolder, FavoriteResourceData, FavoriteSource, SeasonArchivesData,
     WatchLaterData,
@@ -366,27 +366,15 @@ impl Component for FavoritesPage {
             self.videos.render(frame, right[1], theme);
         }
         frame.render_widget(
-            Paragraph::new(shortcut_footer(
+            Paragraph::new(super::hint_footer(
                 theme,
                 [
-                    (
-                        format!("{}/{}", keys.nav_up, keys.nav_down),
-                        "选择".into(),
-                        theme.fg_accent,
-                    ),
-                    (
-                        format!("{}/{}", keys.page_up, keys.page_down),
-                        "翻页".into(),
-                        theme.fg_accent,
-                    ),
+                    (keys.confirm.clone(), "打开".into(), theme.success),
                     (
                         format!("{}/{}", keys.nav_left, keys.nav_right),
-                        "收藏/视频".into(),
+                        "收藏夹/视频".into(),
                         theme.fg_accent,
                     ),
-                    (keys.confirm.clone(), "打开".into(), theme.success),
-                    (keys.nav_next_page.clone(), "下一页面".into(), theme.info),
-                    (keys.nav_prev_page.clone(), "上一页面".into(), theme.info),
                 ],
             ))
             .alignment(Alignment::Center),
@@ -406,7 +394,13 @@ impl Component for FavoritesPage {
         }
         let sources = self.sources();
         // Pane switching has priority over loading and list navigation.
-        if keys.matches_left(key) {
+        // In the grid, Left moves until the first column, then opens the
+        // folder list; Esc opens it from anywhere.
+        if !self.focus_sources && keys.matches_left(key) && !self.videos.at_first_column() {
+            self.videos.move_left();
+            return Some(AppAction::None);
+        }
+        if (keys.matches_left(key) || keys.matches_back(key)) && !self.focus_sources {
             self.focus_sources = true;
             if self.loading || self.loading_more {
                 self.loading = false;
@@ -415,7 +409,11 @@ impl Component for FavoritesPage {
             }
             return Some(AppAction::None);
         }
-        if keys.matches_right(key) {
+        if keys.matches_right(key) && !self.focus_sources {
+            self.videos.move_right();
+            return Some(AppAction::None);
+        }
+        if keys.matches_right(key) || (self.focus_sources && keys.matches_confirm(key)) {
             if self.focus_sources
                 && let Some(source) = sources.get(self.selected_source)
                 && (*source != self.active_source || self.needs_reload())
@@ -431,18 +429,29 @@ impl Component for FavoritesPage {
                 self.selected_source += 1;
             } else if keys.matches_up(key) && self.selected_source > 0 {
                 self.selected_source -= 1;
-            } else if keys.matches_confirm(key)
-                && let Some(source) = sources.get(self.selected_source)
-                && *source != self.active_source
-            {
-                return Some(AppAction::SelectFavoriteSource(source.clone()));
+            } else if keys.matches_jump_top(key) {
+                self.selected_source = 0;
+            } else if keys.matches_jump_bottom(key) {
+                self.selected_source = sources.len().saturating_sub(1);
+            }
+            return Some(AppAction::None);
+        }
+        if keys.matches_jump_top(key) {
+            self.videos.move_first();
+            return Some(AppAction::None);
+        }
+        if keys.matches_jump_bottom(key) || keys.matches_load_more(key) {
+            self.videos.move_last();
+            if self.can_load_more() {
+                self.loading_more = true;
+                return Some(AppAction::LoadMoreFavorites);
             }
             return Some(AppAction::None);
         }
 
         if keys.matches_page_down(key) {
             self.videos.move_page_down();
-            if self.videos.is_near_bottom(self.videos.cached_visible_rows) && self.can_load_more() {
+            if self.videos.is_near_bottom() && self.can_load_more() {
                 self.loading_more = true;
                 return Some(AppAction::LoadMoreFavorites);
             }
@@ -455,7 +464,7 @@ impl Component for FavoritesPage {
 
         if keys.matches_down(key) {
             self.videos.move_down();
-            if self.videos.is_near_bottom(self.videos.cached_visible_rows) && self.can_load_more() {
+            if self.videos.is_near_bottom() && self.can_load_more() {
                 self.loading_more = true;
                 return Some(AppAction::LoadMoreFavorites);
             }
@@ -487,10 +496,7 @@ impl Component for FavoritesPage {
         match event.kind {
             MouseEventKind::ScrollDown if panes[1].contains(position) => {
                 self.focus_sources = false;
-                if self.videos.move_down()
-                    && self.videos.is_near_bottom(self.videos.cached_visible_rows)
-                    && self.can_load_more()
-                {
+                if self.videos.move_down() && self.videos.is_near_bottom() && self.can_load_more() {
                     self.loading_more = true;
                     return Some(AppAction::LoadMoreFavorites);
                 }

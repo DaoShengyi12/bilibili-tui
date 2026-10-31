@@ -134,6 +134,12 @@ pub struct Keybindings {
     pub live_quality: String,
     /// Cycle forward/reverse/shuffle for "play all".
     pub play_order: String,
+    /// Jump to the first item of the focused list or the top of a text.
+    /// Home always works as well.
+    pub jump_top: String,
+    /// Jump to the last loaded item or the bottom of a text. End always
+    /// works as well.
+    pub jump_bottom: String,
 }
 
 impl Default for Keybindings {
@@ -190,6 +196,8 @@ impl Default for Keybindings {
             send_danmaku: "d".to_string(),
             live_quality: "v".to_string(),
             play_order: "s".to_string(),
+            jump_top: "g".to_string(),
+            jump_bottom: "G".to_string(),
         }
     }
 }
@@ -410,6 +418,14 @@ impl Keybindings {
         self.matches(&self.play_order, key)
     }
 
+    pub fn matches_jump_top(&self, key: KeyCode) -> bool {
+        self.matches(&self.jump_top, key) || key == KeyCode::Home
+    }
+
+    pub fn matches_jump_bottom(&self, key: KeyCode) -> bool {
+        self.matches(&self.jump_bottom, key) || key == KeyCode::End
+    }
+
     /// Whether `key` is bound to moving through or acting on a list. Page
     /// shortcuts that are not configurable (History's Space/`d`/`u`, UP's
     /// `o`/`s`) yield to these so a user's custom binding always works.
@@ -423,6 +439,32 @@ impl Keybindings {
             || self.matches_confirm(key)
             || self.matches_back(key)
             || self.matches_play(key)
+            || self.matches_jump_top(key)
+            || self.matches_jump_bottom(key)
+    }
+
+    /// Whether `key` switches the theme and nothing else, so the app can
+    /// handle it on every page without stealing a page's own shortcut.
+    pub fn is_dedicated_theme_key(&self, key: KeyCode) -> bool {
+        // Keys some matchers accept besides the configured binding.
+        let implicit = matches!(
+            key,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Char('i' | '[' | ']')
+        );
+        self.matches_next_theme(key)
+            && !implicit
+            && self
+                .bindings()
+                .iter()
+                .filter(|binding| Self::parse_keycode(binding) == Some(key))
+                .count()
+                == 1
     }
 
     pub fn matches_tab_1(&self, key: KeyCode) -> bool {
@@ -462,7 +504,7 @@ impl Keybindings {
         Self::LABELS.into_iter().zip(self.bindings()).collect()
     }
 
-    const LABELS: [&'static str; 38] = [
+    const LABELS: [&'static str; 40] = [
         "退出",
         "确认",
         "返回",
@@ -501,9 +543,11 @@ impl Keybindings {
         "发送弹幕",
         "直播画质",
         "播放顺序",
+        "跳到开头",
+        "跳到末尾",
     ];
 
-    fn bindings(&self) -> [&str; 38] {
+    fn bindings(&self) -> [&str; 40] {
         [
             &self.quit,
             &self.confirm,
@@ -543,10 +587,12 @@ impl Keybindings {
             &self.send_danmaku,
             &self.live_quality,
             &self.play_order,
+            &self.jump_top,
+            &self.jump_bottom,
         ]
     }
 
-    fn bindings_mut(&mut self) -> [&mut String; 38] {
+    fn bindings_mut(&mut self) -> [&mut String; 40] {
         [
             &mut self.quit,
             &mut self.confirm,
@@ -586,7 +632,17 @@ impl Keybindings {
             &mut self.send_danmaku,
             &mut self.live_quality,
             &mut self.play_order,
+            &mut self.jump_top,
+            &mut self.jump_bottom,
         ]
+    }
+
+    /// The default key of the binding at `index` in `get_all_labels`.
+    pub fn default_binding(index: usize) -> Option<String> {
+        Self::default()
+            .bindings()
+            .get(index)
+            .map(|binding| binding.to_string())
     }
 
     /// Update a keybinding by its index in `get_all_labels`.
@@ -648,6 +704,8 @@ pub struct AppConfig {
     /// default instead of rejecting the whole config.
     #[serde(deserialize_with = "deserialize_video_quality_lenient")]
     pub video_quality: VideoQuality,
+    /// Draw Nerd Font glyphs; off falls back to text labels.
+    pub nerd_font_icons: bool,
 }
 
 fn deserialize_video_quality_lenient<'de, D>(deserializer: D) -> Result<VideoQuality, D::Error>
@@ -667,6 +725,7 @@ impl Default for AppConfig {
             auto_play: true,
             minimal_mode: false,
             video_quality: VideoQuality::default(),
+            nerd_font_icons: true,
         }
     }
 }
@@ -1046,12 +1105,26 @@ mod config_tests {
         let labels = keys.get_all_labels();
         assert_eq!(labels.len(), Keybindings::LABELS.len());
         assert_eq!(labels[25], ("停止播放", "x"));
+        assert_eq!(labels[37], ("播放顺序", "s"));
         let last = labels.len() - 1;
-        assert_eq!(labels[last], ("播放顺序", "s"));
+        assert_eq!(labels[last], ("跳到末尾", "G"));
         let mut keys = keys;
-        keys.update_by_index(last, "S".into());
+        keys.update_by_index(37, "S".into());
         assert_eq!(keys.play_order, "S");
+        keys.update_by_index(last, "E".into());
+        assert_eq!(keys.jump_bottom, "E");
         keys.update_by_index(last + 1, "Z".into());
-        assert_eq!(keys.play_order, "S", "out-of-range index changes nothing");
+        assert_eq!(keys.jump_bottom, "E", "out-of-range index changes nothing");
+    }
+
+    #[test]
+    fn theme_key_is_global_only_while_nothing_else_uses_it() {
+        let mut keys = Keybindings::default();
+        assert!(keys.is_dedicated_theme_key(KeyCode::Char('t')));
+        assert!(!keys.is_dedicated_theme_key(KeyCode::Char('T')));
+        keys.next_theme = "s".into(); // also "设置" and "播放顺序"
+        assert!(!keys.is_dedicated_theme_key(KeyCode::Char('s')));
+        keys.next_theme = "i".into(); // always opens search
+        assert!(!keys.is_dedicated_theme_key(KeyCode::Char('i')));
     }
 }

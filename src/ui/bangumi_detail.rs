@@ -1,6 +1,6 @@
 //! Bangumi detail page showing season info and episode list
 
-use super::{Component, Theme, shortcut_footer};
+use super::{Component, Theme};
 use crate::api::bangumi::{BangumiEpisode, SeasonResult};
 use crate::application::AppAction;
 use crate::storage::Keybindings;
@@ -128,6 +128,14 @@ impl BangumiDetailPage {
         }
     }
 
+    /// Select `index`, clamped to the episode list.
+    fn select_episode(&mut self, index: usize) {
+        if let Some(last) = self.flat_episodes.len().checked_sub(1) {
+            self.selected_episode = index.min(last);
+            self.update_scroll();
+        }
+    }
+
     fn update_scroll(&mut self) {
         let visible = 12usize;
         if self.selected_episode < self.episode_scroll {
@@ -143,7 +151,7 @@ impl BangumiDetailPage {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border_subtle))
             .title(Span::styled(
-                " 📺 番剧信息 ",
+                " 番剧信息 ",
                 Style::default().fg(theme.bilibili_pink),
             ));
 
@@ -175,7 +183,7 @@ impl BangumiDetailPage {
             let mut stats_spans = Vec::new();
             if let Some(ref rating) = season.rating {
                 stats_spans.push(Span::styled(
-                    format!("⭐ {:.1}分", rating.score),
+                    format!("{} {:.1}分", super::icons::STAR, rating.score),
                     Style::default().fg(theme.warning),
                 ));
                 stats_spans.push(Span::styled(" · ", Style::default().fg(theme.fg_muted)));
@@ -368,16 +376,10 @@ impl Component for BangumiDetailPage {
         self.render_episodes(frame, chunks[1], theme);
 
         // Help
-        let help = Paragraph::new(shortcut_footer(
+        let help = Paragraph::new(super::hint_footer(
             theme,
             [
-                (
-                    format!("{}/{}", keys.nav_up, keys.nav_down),
-                    "滚动".into(),
-                    theme.fg_accent,
-                ),
                 (keys.confirm.clone(), "播放".into(), theme.success),
-                (keys.stop_playback.clone(), "停止播放".into(), theme.warning),
                 (keys.back.clone(), "返回".into(), theme.info),
             ],
         ))
@@ -386,11 +388,8 @@ impl Component for BangumiDetailPage {
     }
 
     fn handle_input(&mut self, key: KeyCode, keys: &Keybindings) -> Option<AppAction> {
-        // Global keybindings
-        if keys.matches_quit(key) {
-            return Some(AppAction::Quit);
-        }
-        if keys.matches_back(key) {
+        // `q` leaves a detail page like Esc, as on the other detail pages.
+        if keys.matches_quit(key) || keys.matches_back(key) {
             return Some(AppAction::BackToList);
         }
         if keys.matches_nav_next(key) {
@@ -416,6 +415,23 @@ impl Component for BangumiDetailPage {
         }
         if keys.matches_up(key) {
             self.move_up();
+            return Some(AppAction::None);
+        }
+        let page = usize::from(self.episode_list_area.get().height).max(1);
+        if keys.matches_page_down(key) {
+            self.select_episode(self.selected_episode.saturating_add(page));
+            return Some(AppAction::None);
+        }
+        if keys.matches_page_up(key) {
+            self.select_episode(self.selected_episode.saturating_sub(page));
+            return Some(AppAction::None);
+        }
+        if keys.matches_jump_top(key) {
+            self.select_episode(0);
+            return Some(AppAction::None);
+        }
+        if keys.matches_jump_bottom(key) {
+            self.select_episode(usize::MAX);
             return Some(AppAction::None);
         }
         if keys.matches_play(key) || keys.matches_confirm(key) {

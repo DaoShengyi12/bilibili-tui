@@ -19,6 +19,8 @@ pub enum AppAction {
     SwitchHomeFeed(HomeFeed),
     /// Switch to login page
     SwitchToLogin,
+    /// Leave the login page for the page selected in the sidebar.
+    CloseLogin,
     /// Switch to settings page
     SwitchToSettings,
     /// Switch to history page
@@ -100,12 +102,12 @@ pub enum AppAction {
         season_id: i64,
         ep_id: i64,
     },
-    /// Load more comments in video detail page
-    LoadMoreComments,
-    /// Toggle comment replies expansion
-    ToggleCommentReplies,
-    /// Switch comments between hot and newest first and reload them.
-    ToggleCommentSort,
+    /// Something a comment panel asked for: loading, a reply thread or a
+    /// like. `Compose` requests are handled by the page itself.
+    Comment(
+        crate::presentation::tui::CommentTarget,
+        crate::presentation::tui::PanelRequest,
+    ),
     /// Switch dynamic tab
     SwitchDynamicTab(DynamicTab),
     /// Select UP master (0 = all, 1+ = specific UP)
@@ -121,21 +123,19 @@ pub enum AppAction {
     /// Save the auto-play-on-video-open preference.
     SaveAutoPlay(bool),
     SaveMinimalMode(bool),
+    /// Switch between Nerd Font icons and text labels.
+    SaveNerdFontIcons(bool),
     SaveVideoQuality(VideoQuality),
     /// Logout and return to login page
     Logout,
-    /// Like or unlike a comment (oid, rpid, comment_type)
-    LikeComment {
-        oid: i64,
-        rpid: i64,
-        comment_type: i32,
-    },
-    /// Add a comment (oid, comment_type, message, optional root rpid for replies)
+    /// Post a comment, or a reply when `root` is set; `parent` is the
+    /// comment replied to inside the thread.
     AddComment {
         oid: i64,
         comment_type: i32,
         message: String,
         root: Option<i64>,
+        parent: Option<i64>,
     },
     /// Switch to live page
     SwitchToLive,

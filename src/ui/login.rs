@@ -90,7 +90,7 @@ impl LoginPage {
 
             frame.render_widget(qr_widget, qr_area);
         } else {
-            let error = Paragraph::new("❌ 二维码生成失败")
+            let error = Paragraph::new("二维码生成失败")
                 .style(Style::default().fg(theme.error))
                 .alignment(Alignment::Center)
                 .block(block);
@@ -162,14 +162,14 @@ impl LoginPage {
 
     fn status_text(&self, theme: &Theme, keys: &Keybindings) -> (String, Color) {
         match self.poll_status {
-            QrcodePollStatus::Waiting => ("⏳ 等待扫描二维码...".into(), theme.warning),
-            QrcodePollStatus::Scanned => ("📱 已扫描，请在手机上确认登录".into(), theme.info),
-            QrcodePollStatus::Success => ("✅ 登录成功！".into(), theme.success),
+            QrcodePollStatus::Waiting => ("等待扫描二维码...".into(), theme.warning),
+            QrcodePollStatus::Scanned => ("已扫描，请在手机上确认登录".into(), theme.info),
+            QrcodePollStatus::Success => ("登录成功！".into(), theme.success),
             QrcodePollStatus::Expired => (
-                format!("❌ 二维码已过期，请按 {} 刷新", keys.refresh),
+                format!("二维码已过期，请按 {} 刷新", keys.refresh),
                 theme.error,
             ),
-            QrcodePollStatus::Unknown(_) => ("❓ 未知状态".into(), theme.fg_secondary),
+            QrcodePollStatus::Unknown(_) => ("未知状态".into(), theme.fg_secondary),
         }
     }
 }
@@ -244,7 +244,7 @@ impl Component for LoginPage {
             ));
 
         if let Some(error) = &self.error_message {
-            let error_widget = Paragraph::new(format!("❌ {}", error))
+            let error_widget = Paragraph::new(error.to_string())
                 .style(Style::default().fg(theme.error))
                 .alignment(Alignment::Center)
                 .block(qr_block);
@@ -261,7 +261,7 @@ impl Component for LoginPage {
             Self::render_character_qrcode(frame, qr_columns[0], &url, theme);
             self.render_image_qrcode(frame, qr_columns[1], theme);
         } else {
-            let loading = Paragraph::new("⏳ 加载中...")
+            let loading = Paragraph::new("加载中...")
                 .style(
                     Style::default()
                         .fg(theme.warning)
@@ -313,8 +313,10 @@ impl Component for LoginPage {
         if keys.matches_quit(key) {
             return Some(AppAction::Quit);
         }
+        // Back to wherever the login started: the sidebar still selects
+        // that page (Settings, or a page whose login prompt opened this).
         if keys.matches_back(key) {
-            return Some(AppAction::SwitchToSettings);
+            return Some(AppAction::CloseLogin);
         }
         if keys.matches_refresh(key) {
             // Request refresh - will be handled by App
@@ -371,12 +373,12 @@ mod tests {
     }
 
     #[test]
-    fn back_leaves_the_login_page_for_settings() {
+    fn back_leaves_the_login_page_for_the_sidebar_page() {
         let mut page = waiting_page();
         let keys = Keybindings::default();
         assert!(matches!(
             page.handle_input(KeyCode::Esc, &keys),
-            Some(AppAction::SwitchToSettings)
+            Some(AppAction::CloseLogin)
         ));
     }
 }

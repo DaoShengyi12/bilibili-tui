@@ -171,6 +171,7 @@ impl App {
                 self.current_page = Page::Login(LoginPage::new());
                 self.init_current_page().await;
             }
+            AppAction::CloseLogin => self.switch_to_nav_page().await,
             AppAction::LoginSuccess(creds) => {
                 // Save credentials
                 self.report_save_result("保存登录信息", persistence::save_credentials(&creds));
@@ -610,45 +611,7 @@ impl App {
                     self.send_network_command(network::NetworkCommand::LoadHistoryInit { req_id });
                 }
             }
-            AppAction::LoadMoreComments => {
-                if let Page::VideoDetail(page) = &mut self.current_page
-                    && let Some((sort, offset)) = page.begin_load_more_comments()
-                {
-                    let aid = page.aid;
-                    self.request_video_comments(aid, sort, Some(offset));
-                } else if let Page::DynamicDetail(page) = &mut self.current_page
-                    && let Some(request) = page.begin_load_more_comments()
-                {
-                    let dynamic_id = page.dynamic_id.clone();
-                    self.request_dynamic_comments(dynamic_id, request);
-                }
-            }
-            AppAction::ToggleCommentSort => {
-                if let Page::VideoDetail(page) = &mut self.current_page
-                    && let Some(sort) = page.begin_comment_sort_toggle()
-                {
-                    let aid = page.aid;
-                    self.request_video_comments(aid, sort, None);
-                } else if let Page::DynamicDetail(page) = &mut self.current_page
-                    && let Some(request) = page.begin_comment_sort_toggle()
-                {
-                    let dynamic_id = page.dynamic_id.clone();
-                    self.request_dynamic_comments(dynamic_id, request);
-                }
-            }
-            AppAction::ToggleCommentReplies => {
-                if let Page::VideoDetail(page) = &mut self.current_page
-                    && let Some(root) = page.toggle_comment_replies()
-                {
-                    let aid = page.aid;
-                    let req_id = self.next_request_id("comment_replies");
-                    self.send_network_command(network::NetworkCommand::LoadCommentReplies {
-                        req_id,
-                        aid,
-                        root,
-                    });
-                }
-            }
+            AppAction::Comment(target, request) => self.handle_comment_request(target, request),
             AppAction::SwitchDynamicTab(tab) => {
                 if self.credentials.is_none() {
                     self.apply_login_required_hint();
@@ -672,6 +635,10 @@ impl App {
             AppAction::NextTheme => {
                 self.theme_id = Theme::next_theme_id(&self.theme_id);
                 self.theme = Theme::load_or_default(&self.theme_id).0;
+                // The theme key now works on Settings too; keep its mark right.
+                if let Page::Settings(page) = &mut self.current_page {
+                    page.current_theme_id = self.theme_id.clone();
+                }
                 self.save_theme_to_config();
             }
             AppAction::SetTheme(theme_id) => {
@@ -702,33 +669,12 @@ impl App {
                 self.current_page = Page::Home(HomePage::new());
                 self.init_current_page().await;
             }
-            AppAction::LikeComment {
-                oid,
-                rpid,
-                comment_type,
-            } => {
-                if self.credentials.is_none() {
-                    self.apply_login_required_hint();
-                    return;
-                }
-                // Toggle like - if already liked, unlike
-                let is_liked = match &self.current_page {
-                    Page::VideoDetail(page) => page.liked_comments.contains(&rpid),
-                    Page::DynamicDetail(page) => page.liked_comments.contains(&rpid),
-                    _ => return,
-                };
-                self.send_network_command(network::NetworkCommand::LikeComment {
-                    oid,
-                    rpid,
-                    comment_type,
-                    like: !is_liked,
-                });
-            }
             AppAction::AddComment {
                 oid,
                 comment_type,
                 message,
                 root,
+                parent,
             } => {
                 if self.credentials.is_none() {
                     self.restore_comment_draft(oid, message, Self::login_required_message());
@@ -739,6 +685,7 @@ impl App {
                     comment_type,
                     message,
                     root,
+                    parent,
                 });
             }
             AppAction::SaveKeybindings(new_keybindings) => {
@@ -768,6 +715,11 @@ impl App {
                     };
                     self.init_current_page().await;
                 }
+            }
+            AppAction::SaveNerdFontIcons(enabled) => {
+                crate::ui::icons::set_nerd_font(enabled);
+                self.config.nerd_font_icons = enabled;
+                self.report_save_result("保存设置", persistence::save_config(&self.config));
             }
             AppAction::SaveAutoPlay(enabled) => {
                 self.config.auto_play = enabled;
@@ -1125,35 +1077,47 @@ impl App {
         });
     }
 
-    pub(super) fn request_video_comments(
+    /// Send what a comment panel asked for to the network.
+    pub(super) fn handle_comment_request(
         &mut self,
-        aid: i64,
-        sort: crate::api::comment::CommentSort,
-        offset: Option<String>,
+        target: crate::presentation::tui::CommentTarget,
+        request: crate::presentation::tui::PanelRequest,
     ) {
-        let req_id = self.next_request_id("video_comments");
-        self.send_network_command(network::NetworkCommand::LoadVideoComments {
-            req_id,
-            aid,
-            sort,
-            offset,
-        });
-    }
-
-    pub(super) fn request_dynamic_comments(
-        &mut self,
-        dynamic_id: String,
-        request: crate::presentation::tui::CommentRequest,
-    ) {
-        let req_id = self.next_request_id("dynamic_comments");
-        self.send_network_command(network::NetworkCommand::LoadDynamicComments {
-            req_id,
-            dynamic_id,
-            oid: request.oid,
-            comment_type: request.comment_type,
-            sort: request.sort,
-            offset: request.offset,
-        });
+        use crate::presentation::tui::PanelRequest;
+        match request {
+            PanelRequest::Comments { sort, offset } => {
+                let req_id = self.next_request_id("comments");
+                self.send_network_command(network::NetworkCommand::LoadComments {
+                    req_id,
+                    target,
+                    sort,
+                    offset,
+                });
+            }
+            PanelRequest::Replies { root, page } => {
+                let req_id = self.next_request_id("comment_replies");
+                self.send_network_command(network::NetworkCommand::LoadCommentReplies {
+                    req_id,
+                    target,
+                    root,
+                    page,
+                });
+            }
+            PanelRequest::Like { rpid, like } => {
+                if self.credentials.is_none() {
+                    self.apply_login_required_hint();
+                    return;
+                }
+                self.send_network_command(network::NetworkCommand::LikeComment {
+                    oid: target.oid,
+                    rpid,
+                    comment_type: target.comment_type,
+                    like,
+                });
+            }
+            // Pages open their own reply box.
+            PanelRequest::Compose { .. } => {}
+        }
     }
 
     fn login_uid(&self) -> i64 {

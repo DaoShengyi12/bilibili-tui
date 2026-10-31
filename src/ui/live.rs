@@ -1,6 +1,6 @@
 //! Live streaming recommendations page with grid layout
 
-use super::{Component, Theme, shortcut_footer};
+use super::{Component, Theme};
 use crate::api::live::LiveRoom;
 use crate::application::AppAction;
 use crate::storage::Keybindings;
@@ -271,7 +271,7 @@ impl Component for LivePage {
             .split(area);
 
         // Header
-        let header = Paragraph::new("📺 关注直播优先 · B站推荐")
+        let header = Paragraph::new("关注直播优先 · B站推荐")
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -294,7 +294,7 @@ impl Component for LivePage {
 
         // Content area
         if self.loading && self.rooms.is_empty() {
-            let loading = Paragraph::new("⏳ 加载中...")
+            let loading = Paragraph::new("加载中...")
                 .style(
                     Style::default()
                         .fg(theme.warning)
@@ -306,7 +306,7 @@ impl Component for LivePage {
         }
 
         if let Some(ref err) = self.error {
-            let error = Paragraph::new(format!("❌ 加载失败: {}", err))
+            let error = Paragraph::new(format!("加载失败: {}", err))
                 .style(Style::default().fg(theme.error))
                 .alignment(Alignment::Center);
             frame.render_widget(error, chunks[1]);
@@ -325,26 +325,11 @@ impl Component for LivePage {
         self.render_grid(frame, chunks[1], theme);
 
         // Footer with hints
-        let hints = Paragraph::new(shortcut_footer(
+        let hints = Paragraph::new(super::hint_footer(
             theme,
             [
-                (
-                    format!("{}/↑↓←→", keys.get_nav_keys_display()),
-                    "导航".into(),
-                    theme.fg_accent,
-                ),
-                (
-                    format!("{}/{}", keys.page_up, keys.page_down),
-                    "翻页".into(),
-                    theme.fg_accent,
-                ),
-                (
-                    format!("{}/{}", keys.confirm, keys.play),
-                    "进入".into(),
-                    theme.success,
-                ),
+                (keys.confirm.clone(), "进入".into(), theme.success),
                 (keys.refresh.clone(), "刷新".into(), theme.info),
-                (keys.next_theme.clone(), "切换主题".into(), theme.info),
             ],
         ))
         .alignment(Alignment::Center);
@@ -394,10 +379,25 @@ impl Component for LivePage {
             }
             return Some(AppAction::None);
         }
+        if keys.matches_jump_top(key) {
+            self.selected_index = 0;
+            self.update_scroll(self.cached_visible_rows);
+            return Some(AppAction::None);
+        }
+        if keys.matches_jump_bottom(key) || keys.matches_load_more(key) {
+            self.selected_index = self.rooms.len() - 1;
+            self.update_scroll(self.cached_visible_rows);
+            if !self.loading_more {
+                return Some(AppAction::LoadMoreLive);
+            }
+            return Some(AppAction::None);
+        }
         if keys.matches_down(key) {
-            let new_idx = self.selected_index + self.columns;
-            if new_idx < self.rooms.len() {
-                self.selected_index = new_idx;
+            // From the row above a short last row, land on the last card.
+            let columns = self.columns.max(1);
+            let last = self.rooms.len() - 1;
+            if self.selected_index / columns < last / columns {
+                self.selected_index = (self.selected_index + columns).min(last);
                 self.update_scroll(self.cached_visible_rows);
             }
             // Check for pagination
@@ -566,7 +566,7 @@ impl LivePage {
             let image = StatefulImage::new();
             frame.render_stateful_widget(image, chunks[0], protocol);
         } else {
-            let placeholder = Paragraph::new("🎬")
+            let placeholder = Paragraph::new("")
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(theme.fg_muted));
             frame.render_widget(placeholder, chunks[0]);
@@ -584,9 +584,13 @@ impl LivePage {
 
         // Format online count
         let online_text = if room.online >= 10000 {
-            format!("👁 {:.1}万", room.online as f64 / 10000.0)
+            format!(
+                "{} {:.1}万",
+                super::icons::VIEWERS,
+                room.online as f64 / 10000.0
+            )
         } else {
-            format!("👁 {}", room.online)
+            format!("{} {}", super::icons::VIEWERS, room.online)
         };
 
         let info_lines = vec![

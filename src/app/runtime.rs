@@ -28,9 +28,12 @@ impl App {
 
             if event::poll(std::time::Duration::from_millis(100))? {
                 match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // Repeats come from holding a key down; they move
+                    // through lists like presses.
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
                         self.handle_input(key.code, key.modifiers).await;
                     }
+                    Event::Paste(text) => self.handle_paste(&text).await,
                     // Terminals report one wheel event per notch, so each
                     // event scrolls one step.
                     Event::Mouse(mouse) => {
@@ -66,6 +69,20 @@ impl App {
         }
     }
 
+    /// Whether a text field has focus, so it receives pastes and every
+    /// Ctrl/Alt chord.
+    fn current_page_text_field_active(&self) -> bool {
+        match &self.current_page {
+            Page::Home(page) => page.search_input_active(),
+            Page::Search(page) => page.input_mode,
+            Page::VideoDetail(page) => page.input_mode,
+            Page::DynamicDetail(page) => page.input_mode,
+            Page::ArticleDetail(page) => page.input_mode,
+            Page::LiveDetail(page) => page.input_mode,
+            _ => false,
+        }
+    }
+
     /// Whether the page sends every key to a text field or key capture.
     fn current_page_captures_keys(&self) -> bool {
         match &self.current_page {
@@ -73,6 +90,7 @@ impl App {
             Page::Search(page) => page.input_mode,
             Page::VideoDetail(page) => page.input_mode,
             Page::DynamicDetail(page) => page.input_mode,
+            Page::ArticleDetail(page) => page.input_mode,
             Page::Settings(page) => page.is_capturing_input(),
             Page::LiveDetail(page) => page.captures_keys(),
             _ => false,
@@ -126,6 +144,7 @@ impl App {
             }
             self.draw_playback_error(frame, area);
             self.draw_status_notice(frame, area);
+            self.draw_help(frame, area);
             self.draw_login_prompt(frame, area);
             return;
         }
@@ -155,7 +174,16 @@ impl App {
         self.draw_playback_error(frame, area);
         self.draw_playback_starting(frame, area);
         self.draw_status_notice(frame, area);
+        self.draw_help(frame, area);
         self.draw_login_prompt(frame, area);
+    }
+
+    fn draw_help(&mut self, frame: &mut Frame, area: Rect) {
+        if self.show_help {
+            let groups = crate::ui::help_for(&self.current_page, &self.keybindings);
+            self.help_scroll =
+                crate::ui::render_help(frame, area, &groups, &self.theme, self.help_scroll);
+        }
     }
 
     fn draw_login_prompt(&self, frame: &mut Frame, area: Rect) {
@@ -213,7 +241,7 @@ impl App {
     /// stays visible because nothing can load until the app restarts.
     fn status_notice_text(&self) -> Option<&str> {
         if self.network_worker_lost.get() {
-            return Some("⚠ 网络线程已停止，无法加载内容；请重启应用");
+            return Some("网络线程已停止，无法加载内容；请重启应用");
         }
         self.status_notice.as_deref()
     }
@@ -252,7 +280,7 @@ impl App {
             width: area.width,
             height: 1.min(area.height),
         };
-        let message = Paragraph::new("⏳ 正在启动播放器...")
+        let message = Paragraph::new("正在启动播放器...")
             .style(Style::default().fg(self.theme.warning))
             .alignment(Alignment::Center);
         frame.render_widget(Clear, bar);
@@ -305,6 +333,25 @@ impl App {
         // the next key press; the key still performs its normal action.
         self.playback.last_error = None;
         self.status_notice = None;
+        let (key, modifiers) = strip_alt_gr(key, modifiers);
+        if is_ctrl_c(key, modifiers) {
+            self.handle_interrupt().await;
+            return;
+        }
+        let Some((key, modifiers)) = self.resolve_chord(key, modifiers) else {
+            return;
+        };
+        if self.show_help {
+            if !self.scroll_help(key) {
+                self.show_help = false;
+            }
+            return;
+        }
+        if is_help_key(key, modifiers) && !self.current_page_captures_keys() {
+            self.show_help = true;
+            self.help_scroll = 0;
+            return;
+        }
         if self.login_prompt.is_some() {
             if self.keybindings.matches_confirm(key) {
                 self.login_prompt = None;
@@ -315,23 +362,39 @@ impl App {
             }
             return;
         }
-        let keys = &self.keybindings;
         // Stopping works from every page, but only while a player runs and
         // no text field or key capture would receive the key instead.
         if self.playback.is_active()
-            && keys.matches_stop_playback(key)
+            && self.keybindings.matches_stop_playback(key)
             && !self.current_page_captures_keys()
         {
             self.stop_playback();
             return;
         }
-        let action = match &mut self.current_page {
+        // The theme key works on every page unless a page binds it too.
+        if !self.current_page_captures_keys() && self.keybindings.is_dedicated_theme_key(key) {
+            self.handle_action(crate::application::AppAction::NextTheme)
+                .await;
+            return;
+        }
+        if let Some(action) = self.send_key_to_page(key, modifiers) {
+            self.handle_action(action).await;
+        }
+    }
+
+    fn send_key_to_page(
+        &mut self,
+        key: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<crate::application::AppAction> {
+        let keys = &self.keybindings;
+        match &mut self.current_page {
             Page::Login(page) => page.handle_input(key, keys),
             Page::Home(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::Search(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::Dynamic(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::DynamicDetail(page) => page.handle_input_with_modifiers(key, modifiers, keys),
-            Page::ArticleDetail(page) => page.handle_input(key, keys),
+            Page::ArticleDetail(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::VideoDetail(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::History(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::Favorites(page) => page.handle_input(key, keys),
@@ -341,9 +404,104 @@ impl App {
             Page::Bangumi(page) => page.handle_input(key, keys),
             Page::BangumiDetail(page) => page.handle_input(key, keys),
             Page::Up(page) => page.handle_input(key, keys),
-        };
+        }
+    }
 
-        if let Some(action) = action {
+    /// Ctrl+C leaves a focused text field the way Esc does, so a copy
+    /// reflex does not throw away a draft; anywhere else it quits.
+    async fn handle_interrupt(&mut self) {
+        if self.show_help || self.login_prompt.is_some() {
+            self.show_help = false;
+            self.login_prompt = None;
+            return;
+        }
+        if self.current_page_text_field_active() {
+            if let Some(action) = self.send_key_to_page(KeyCode::Esc, KeyModifiers::NONE) {
+                self.handle_action(action).await;
+            }
+            return;
+        }
+        self.handle_action(crate::application::AppAction::Quit)
+            .await;
+    }
+
+    /// Decide what a key held with Ctrl or Alt means. Text fields get every
+    /// chord for their readline shortcuts. Elsewhere a few chords alias list
+    /// keys (Ctrl+N/P, Ctrl+D/U, Ctrl+F/B), History keeps Ctrl+A/Ctrl+R, and
+    /// every other chord is dropped instead of acting as its bare letter.
+    fn resolve_chord(
+        &self,
+        key: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<(KeyCode, KeyModifiers)> {
+        if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            return Some((key, modifiers));
+        }
+        if self.current_page_text_field_active() && !self.show_help {
+            return Some((key, modifiers));
+        }
+        if matches!(&self.current_page, Page::Settings(page) if page.is_capturing_input()) {
+            return None;
+        }
+        if matches!(&self.current_page, Page::History(_))
+            && modifiers == KeyModifiers::CONTROL
+            && matches!(key, KeyCode::Char('a' | 'r'))
+            && !self.show_help
+            && self.login_prompt.is_none()
+        {
+            return Some((key, modifiers));
+        }
+        chord_alias(key, modifiers, &self.keybindings).map(|key| (key, KeyModifiers::NONE))
+    }
+
+    /// Move the shortcut list for scroll keys; returns `false` for keys
+    /// that should close it.
+    fn scroll_help(&mut self, key: KeyCode) -> bool {
+        const PAGE: u16 = 10;
+        let keys = &self.keybindings;
+        self.help_scroll = if keys.matches_down(key) {
+            self.help_scroll.saturating_add(1)
+        } else if keys.matches_up(key) {
+            self.help_scroll.saturating_sub(1)
+        } else if keys.matches_page_down(key) || key == KeyCode::Char(' ') {
+            self.help_scroll.saturating_add(PAGE)
+        } else if keys.matches_page_up(key) {
+            self.help_scroll.saturating_sub(PAGE)
+        } else if keys.matches_jump_top(key) {
+            0
+        } else if keys.matches_jump_bottom(key) {
+            u16::MAX
+        } else {
+            return false;
+        };
+        true
+    }
+
+    /// Bracketed paste: the text goes into the focused text field as one
+    /// line. On Home and Search a paste starts a search. Anywhere else it
+    /// is dropped, so pasted letters never run as shortcuts.
+    async fn handle_paste(&mut self, text: &str) {
+        if self.show_help || self.login_prompt.is_some() {
+            return;
+        }
+        self.playback.last_error = None;
+        self.status_notice = None;
+        match &mut self.current_page {
+            Page::Home(page) if !page.search_input_active() => page.begin_search(),
+            Page::Search(page) if !page.input_mode => page.focus_input(),
+            _ => {}
+        }
+        if !self.current_page_text_field_active() {
+            return;
+        }
+        let mut actions = Vec::new();
+        for character in pasted_line(text).chars() {
+            match self.send_key_to_page(KeyCode::Char(character), KeyModifiers::NONE) {
+                None | Some(crate::application::AppAction::None) => {}
+                Some(action) => actions.push(action),
+            }
+        }
+        for action in actions {
             self.handle_action(action).await;
         }
     }
@@ -556,6 +714,71 @@ impl App {
     }
 }
 
+/// Windows terminals report AltGr as Ctrl+Alt; a symbol typed that way is
+/// a plain character, not a chord.
+fn strip_alt_gr(key: KeyCode, modifiers: KeyModifiers) -> (KeyCode, KeyModifiers) {
+    let alt_gr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    match key {
+        KeyCode::Char(character)
+            if modifiers.contains(alt_gr) && !character.is_ascii_alphanumeric() =>
+        {
+            (key, modifiers - alt_gr)
+        }
+        _ => (key, modifiers),
+    }
+}
+
+fn is_ctrl_c(key: KeyCode, modifiers: KeyModifiers) -> bool {
+    modifiers == KeyModifiers::CONTROL && matches!(key, KeyCode::Char('c' | 'C'))
+}
+
+/// `?` (fixed so it is always discoverable) or F1.
+fn is_help_key(key: KeyCode, modifiers: KeyModifiers) -> bool {
+    !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && (key == KeyCode::Char(crate::ui::HELP_KEY) || key == KeyCode::F(1))
+}
+
+/// The plain key a readline/less-style chord stands for outside text
+/// fields: Ctrl+N/P move by one, Ctrl+D/F and Ctrl+U/B by a page.
+fn chord_alias(
+    key: KeyCode,
+    modifiers: KeyModifiers,
+    keys: &crate::storage::Keybindings,
+) -> Option<KeyCode> {
+    let KeyCode::Char(character) = key else {
+        return None;
+    };
+    if modifiers != KeyModifiers::CONTROL {
+        return None;
+    }
+    let parse = crate::storage::Keybindings::parse_keycode;
+    match character.to_ascii_lowercase() {
+        'n' => Some(KeyCode::Down),
+        'p' => Some(KeyCode::Up),
+        'd' | 'f' => parse(&keys.page_down),
+        'u' | 'b' => parse(&keys.page_up),
+        _ => None,
+    }
+}
+
+/// The most characters one paste inserts; inserting is per character.
+const MAX_PASTE_CHARS: usize = 4096;
+
+/// Pasted text as one line: line breaks and tabs become spaces, other
+/// control characters are dropped and trailing line breaks are trimmed.
+fn pasted_line(text: &str) -> String {
+    text.trim_end_matches(['\r', '\n'])
+        .replace("\r\n", " ")
+        .chars()
+        .filter_map(|character| match character {
+            '\n' | '\r' | '\t' => Some(' '),
+            character if character.is_control() => None,
+            character => Some(character),
+        })
+        .take(MAX_PASTE_CHARS)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,7 +888,7 @@ mod tests {
         app.report_save_result("保存设置", Err(anyhow::anyhow!("permission denied")));
         assert_eq!(
             app.status_notice_text(),
-            Some("⚠ 保存设置失败：permission denied")
+            Some("保存设置失败：permission denied")
         );
 
         app.handle_input(KeyCode::Char('j'), KeyModifiers::NONE)
@@ -817,5 +1040,127 @@ mod tests {
 
         assert_eq!(app.sidebar.selected, NavItem::Live);
         assert!(matches!(app.current_page, Page::Live(_)));
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_quits_but_only_closes_a_focused_text_field() {
+        let (mut app, _rx) = minimal_app();
+        app.keybindings = crate::storage::Keybindings::default();
+        let mut page = crate::presentation::tui::SearchPage::new();
+        page.input_mode = true;
+        page.query = "draft".into();
+        app.current_page = Page::Search(page);
+
+        app.handle_input(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            .await;
+        assert!(!app.should_quit);
+        assert!(matches!(&app.current_page, Page::Search(page) if !page.input_mode));
+
+        app.handle_input(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            .await;
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn ctrl_chords_do_not_run_their_bare_letter() {
+        let (mut app, _rx) = minimal_app();
+        app.keybindings = crate::storage::Keybindings::default();
+        let mut page = crate::presentation::tui::VideoDetailPage::new("BV1".into(), 1);
+        page.loading = false;
+        app.current_page = Page::VideoDetail(Box::new(page));
+
+        // `c` opens the comment box; Ctrl+C must not, and Ctrl+Q must not quit.
+        app.handle_input(KeyCode::Char('q'), KeyModifiers::CONTROL)
+            .await;
+        assert!(!app.should_quit);
+        assert!(matches!(&app.current_page, Page::VideoDetail(page) if !page.input_mode));
+    }
+
+    #[test]
+    fn readline_chords_alias_list_keys() {
+        let keys = crate::storage::Keybindings::default();
+        let ctrl = KeyModifiers::CONTROL;
+        assert_eq!(
+            chord_alias(KeyCode::Char('n'), ctrl, &keys),
+            Some(KeyCode::Down)
+        );
+        assert_eq!(
+            chord_alias(KeyCode::Char('p'), ctrl, &keys),
+            Some(KeyCode::Up)
+        );
+        assert_eq!(
+            chord_alias(KeyCode::Char('d'), ctrl, &keys),
+            Some(KeyCode::PageDown)
+        );
+        assert_eq!(
+            chord_alias(KeyCode::Char('u'), ctrl, &keys),
+            Some(KeyCode::PageUp)
+        );
+        assert_eq!(chord_alias(KeyCode::Char('w'), ctrl, &keys), None);
+        assert_eq!(
+            chord_alias(KeyCode::Char('n'), KeyModifiers::ALT, &keys),
+            None
+        );
+    }
+
+    #[test]
+    fn alt_gr_symbols_are_plain_characters() {
+        let alt_gr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(
+            strip_alt_gr(KeyCode::Char('@'), alt_gr),
+            (KeyCode::Char('@'), KeyModifiers::NONE)
+        );
+        assert_eq!(
+            strip_alt_gr(KeyCode::Char('a'), alt_gr),
+            (KeyCode::Char('a'), alt_gr)
+        );
+    }
+
+    #[test]
+    fn pasted_text_becomes_one_line() {
+        assert_eq!(pasted_line("BV1xx411c7mD\n"), "BV1xx411c7mD");
+        assert_eq!(pasted_line("a\r\nb\tc\u{7}d"), "a b cd");
+        assert_eq!(
+            pasted_line(&"字".repeat(MAX_PASTE_CHARS + 5))
+                .chars()
+                .count(),
+            MAX_PASTE_CHARS
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_goes_to_the_search_box_and_never_runs_shortcuts() {
+        let (mut app, _rx) = minimal_app();
+        app.keybindings = crate::storage::Keybindings::default();
+        app.current_page = Page::Search(crate::presentation::tui::SearchPage::new());
+        app.handle_paste("q 测试\n").await;
+        assert!(!app.should_quit);
+        assert!(
+            matches!(&app.current_page, Page::Search(page) if page.input_mode && page.query == "q 测试")
+        );
+
+        let mut page = crate::presentation::tui::VideoDetailPage::new("BV1".into(), 1);
+        page.loading = false;
+        app.current_page = Page::VideoDetail(Box::new(page));
+        app.handle_paste("q").await;
+        assert!(!app.should_quit, "a paste outside a text field is dropped");
+    }
+
+    #[tokio::test]
+    async fn help_scrolls_with_list_keys_and_closes_on_others() {
+        let (mut app, _rx) = minimal_app();
+        app.keybindings = crate::storage::Keybindings::default();
+        app.handle_input(KeyCode::F(1), KeyModifiers::NONE).await;
+        assert!(app.show_help);
+        app.handle_input(KeyCode::Char('j'), KeyModifiers::NONE)
+            .await;
+        app.handle_input(KeyCode::Char('d'), KeyModifiers::CONTROL)
+            .await;
+        assert!(app.show_help);
+        assert_eq!(app.help_scroll, 11);
+        app.handle_input(KeyCode::Home, KeyModifiers::NONE).await;
+        assert_eq!(app.help_scroll, 0);
+        app.handle_input(KeyCode::Esc, KeyModifiers::NONE).await;
+        assert!(!app.show_help);
     }
 }

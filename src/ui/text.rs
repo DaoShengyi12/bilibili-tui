@@ -4,36 +4,6 @@
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Apply the readline-style shortcuts of a single-line input: Ctrl+U clears
-/// the line, Ctrl+W deletes the previous word. Other Ctrl/Alt chords are
-/// swallowed so they are not typed as letters. Returns `false` for keys
-/// without such modifiers, which the caller handles as plain input.
-pub fn apply_line_edit(buffer: &mut String, key: KeyCode, modifiers: KeyModifiers) -> bool {
-    let KeyCode::Char(character) = key else {
-        return false;
-    };
-    if modifiers.contains(KeyModifiers::CONTROL) {
-        match character.to_ascii_lowercase() {
-            'u' => buffer.clear(),
-            'w' => delete_previous_word(buffer),
-            _ => {}
-        }
-        return true;
-    }
-    modifiers.contains(KeyModifiers::ALT)
-}
-
-fn delete_previous_word(buffer: &mut String) {
-    let trimmed = buffer.trim_end_matches(char::is_whitespace).len();
-    buffer.truncate(trimmed);
-    let word_start = buffer
-        .char_indices()
-        .rev()
-        .find(|(_, character)| character.is_whitespace())
-        .map_or(0, |(index, character)| index + character.len_utf8());
-    buffer.truncate(word_start);
-}
-
 /// Edit a single-line input at a cursor kept as the number of characters
 /// after it, so text replaced from outside leaves the cursor at its end.
 /// Handles Left/Right/Home/End/Backspace/Delete, typed characters and the
@@ -116,6 +86,12 @@ pub fn edit_at_cursor(
     Some(false)
 }
 
+/// Whether `key` closes a text field: Esc, or the configured back key when
+/// it is not a character that the field should receive as text.
+pub fn is_input_cancel(key: KeyCode, keys: &crate::storage::Keybindings) -> bool {
+    key == KeyCode::Esc || (keys.matches_back(key) && !matches!(key, KeyCode::Char(_)))
+}
+
 /// `text` split at a cursor `chars_after` characters from the end.
 pub fn split_at_cursor(text: &str, chars_after: usize) -> (&str, &str) {
     let len = text.chars().count();
@@ -125,6 +101,61 @@ pub fn split_at_cursor(text: &str, chars_after: usize) -> (&str, &str) {
         .nth(cursor)
         .map_or(text.len(), |(byte, _)| byte);
     text.split_at(byte)
+}
+
+/// The visible part of a one-line input with a `▌` cursor, scrolled
+/// horizontally so the cursor stays within `width` columns. Text cut off
+/// on the left starts with `…`.
+pub fn input_with_cursor(text: &str, chars_after: usize, width: usize) -> String {
+    const CURSOR: char = '▌';
+    if width == 0 {
+        return String::new();
+    }
+    let (before, after) = split_at_cursor(text, chars_after);
+    // Columns left of the cursor; one more goes to `…` when text is cut.
+    let mut budget = width - 1;
+    let mut start = before.len();
+    let mut used = 0;
+    for (index, character) in before.char_indices().rev() {
+        let character_width = character.width().unwrap_or(0);
+        if used + character_width > budget {
+            break;
+        }
+        used += character_width;
+        start = index;
+    }
+    // A one-column box has room for the cursor only.
+    let cut = start > 0 && width > 1;
+    if start > 0 && !cut {
+        start = before.len();
+        used = 0;
+    }
+    if cut {
+        budget = budget.saturating_sub(1);
+        while used > budget {
+            let Some(character) = before[start..].chars().next() else {
+                break;
+            };
+            used -= character.width().unwrap_or(0);
+            start += character.len_utf8();
+        }
+    }
+    let mut line = String::with_capacity(text.len() + 4);
+    if cut {
+        line.push('…');
+    }
+    line.push_str(&before[start..]);
+    line.push(CURSOR);
+    let mut room = (width - 1).saturating_sub(used + usize::from(cut));
+    for character in after.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if character_width > room {
+            break;
+        }
+        room -= character_width;
+        line.push(character);
+    }
+    line
 }
 
 /// Number of terminal columns `text` occupies.
@@ -199,55 +230,6 @@ pub fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn line_edit_shortcuts_are_not_typed_as_letters() {
-        let mut buffer = "hello big world  ".to_string();
-        assert!(apply_line_edit(
-            &mut buffer,
-            KeyCode::Char('w'),
-            KeyModifiers::CONTROL
-        ));
-        assert_eq!(buffer, "hello big ");
-        assert!(apply_line_edit(
-            &mut buffer,
-            KeyCode::Char('w'),
-            KeyModifiers::CONTROL
-        ));
-        assert_eq!(buffer, "hello ");
-        assert!(apply_line_edit(
-            &mut buffer,
-            KeyCode::Char('x'),
-            KeyModifiers::ALT
-        ));
-        assert_eq!(buffer, "hello ");
-        assert!(apply_line_edit(
-            &mut buffer,
-            KeyCode::Char('u'),
-            KeyModifiers::CONTROL
-        ));
-        assert!(buffer.is_empty());
-
-        let mut chinese = "中文 评论".to_string();
-        apply_line_edit(&mut chinese, KeyCode::Char('w'), KeyModifiers::CONTROL);
-        assert_eq!(chinese, "中文 ");
-
-        assert!(!apply_line_edit(
-            &mut buffer,
-            KeyCode::Char('a'),
-            KeyModifiers::NONE
-        ));
-        assert!(!apply_line_edit(
-            &mut buffer,
-            KeyCode::Char('A'),
-            KeyModifiers::SHIFT
-        ));
-        assert!(!apply_line_edit(
-            &mut buffer,
-            KeyCode::Backspace,
-            KeyModifiers::CONTROL
-        ));
-    }
 
     #[test]
     fn cjk_titles_are_measured_in_columns() {
@@ -327,5 +309,22 @@ mod tests {
             KeyModifiers::NONE,
         );
         assert_eq!(text, "xab");
+    }
+
+    #[test]
+    fn input_cursor_stays_visible_in_a_narrow_box() {
+        assert_eq!(input_with_cursor("abc", 0, 10), "abc▌");
+        assert_eq!(input_with_cursor("abc", 1, 10), "ab▌c");
+        assert_eq!(input_with_cursor("abcdefgh", 0, 5), "…fgh▌");
+        assert_eq!(input_with_cursor("abcdefgh", 6, 5), "ab▌cd");
+        assert_eq!(input_with_cursor("中文输入法", 0, 6), "…入法▌");
+        assert_eq!(input_with_cursor("abc", 0, 0), "");
+        for width in 1..12 {
+            for after in 0..=5 {
+                let line = input_with_cursor("中a文b输入", after, width);
+                assert!(display_width(&line) <= width, "{line:?} wider than {width}");
+                assert!(line.contains('▌'));
+            }
+        }
     }
 }

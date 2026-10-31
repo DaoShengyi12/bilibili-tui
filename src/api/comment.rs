@@ -93,20 +93,16 @@ pub fn pagination_str(offset: Option<&str>) -> String {
     serde_json::json!({ "offset": offset.unwrap_or_default() }).to_string()
 }
 
-/// Comment list response
+/// `data` of the paged `/x/v2/reply/reply` endpoint.
 #[derive(Debug, Deserialize)]
 pub struct CommentData {
     pub page: Option<CommentPage>,
     pub replies: Option<Vec<CommentItem>>,
-    pub hots: Option<Vec<CommentItem>>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CommentPage {
-    pub num: Option<i32>,
-    pub size: Option<i32>,
     pub count: Option<i32>,
-    pub acount: Option<i32>,
 }
 
 /// Individual comment item
@@ -142,6 +138,15 @@ pub struct LevelInfo {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommentContent {
     pub message: Option<String>,
+    /// Pictures attached to the comment.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub pictures: Vec<CommentPicture>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommentPicture {
+    #[serde(default)]
+    pub img_src: String,
 }
 
 impl CommentItem {
@@ -194,6 +199,26 @@ impl CommentItem {
 
     pub fn reply_count(&self) -> i32 {
         self.rcount.unwrap_or(0)
+    }
+
+    /// Picture URLs of the comment, upgraded to https.
+    pub fn picture_urls(&self) -> Vec<String> {
+        self.content
+            .as_ref()
+            .map(|content| {
+                content
+                    .pictures
+                    .iter()
+                    .filter(|picture| !picture.img_src.is_empty())
+                    .map(|picture| {
+                        picture.img_src.strip_prefix("http://").map_or_else(
+                            || picture.img_src.clone(),
+                            |rest| format!("https://{rest}"),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -286,6 +311,25 @@ mod tests {
             pagination_str(Some(r#"{"type":1}"#)),
             r#"{"offset":"{\"type\":1}"}"#
         );
+    }
+
+    #[test]
+    fn comment_pictures_are_read_and_upgraded_to_https() {
+        let item: CommentItem = serde_json::from_value(serde_json::json!({
+            "rpid": 1, "oid": 1, "mid": 1, "parent": 0,
+            "content": {"message": "看图", "pictures": [
+                {"img_src": "http://i0.hdslb.com/a.jpg", "img_width": 10},
+                {"img_src": ""}
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(item.picture_urls(), ["https://i0.hdslb.com/a.jpg"]);
+        let plain: CommentItem = serde_json::from_value(serde_json::json!({
+            "rpid": 1, "oid": 1, "mid": 1, "parent": 0,
+            "content": {"message": "x", "pictures": null}
+        }))
+        .unwrap();
+        assert!(plain.picture_urls().is_empty());
     }
 
     #[test]

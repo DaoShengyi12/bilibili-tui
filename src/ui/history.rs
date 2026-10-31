@@ -1,6 +1,6 @@
 //! History page with watch history display in a grid layout with cover images
 
-use super::{Component, Theme, shortcut_footer};
+use super::{Component, Theme};
 use crate::api::history::{HistoryCursor, HistoryItem, HistoryKey};
 use crate::application::AppAction;
 use crate::storage::Keybindings;
@@ -412,7 +412,7 @@ impl Component for HistoryPage {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border_subtle))
             .title(Span::styled(
-                " 📜 观看历史 ",
+                " 观看历史 ",
                 Style::default()
                     .fg(theme.bilibili_pink)
                     .add_modifier(Modifier::BOLD),
@@ -472,6 +472,16 @@ impl Component for HistoryPage {
         keys: &crate::storage::Keybindings,
     ) -> Option<AppAction> {
         if self.mode == HistoryMode::Deleting {
+            // The request finishes on its own; only leaving stays possible.
+            if keys.matches_nav_next(key) {
+                return Some(AppAction::NavNext);
+            }
+            if keys.matches_nav_prev(key) {
+                return Some(AppAction::NavPrev);
+            }
+            if keys.matches_quit(key) {
+                return Some(AppAction::Quit);
+            }
             return None;
         }
         if self.mode == HistoryMode::ConfirmDelete {
@@ -572,9 +582,21 @@ impl Component for HistoryPage {
             }
             return None;
         }
+        if keys.matches_jump_top(key) {
+            self.selected = 0;
+            return None;
+        }
+        if keys.matches_jump_bottom(key) || keys.matches_load_more(key) {
+            self.selected = total.saturating_sub(1);
+            if total > 0 {
+                return Some(AppAction::LoadMoreHistory);
+            }
+            return None;
+        }
         if keys.matches_down(key) {
-            if self.selected + cols < total {
-                self.selected += cols;
+            // From the row above a short last row, land on the last card.
+            if total > 0 && self.selected / cols < (total - 1) / cols {
+                self.selected = (self.selected + cols).min(total - 1);
             }
             // Check if we need to load more
             if self.is_near_bottom(self.cached_visible_rows) {
@@ -853,24 +875,12 @@ impl HistoryPage {
             return;
         }
 
-        let help = shortcut_footer(
+        let help = super::hint_footer(
             theme,
             [
-                (
-                    format!(
-                        "{}/{}",
-                        keys.get_arrow_keys_display(),
-                        keys.get_nav_keys_display()
-                    ),
-                    "导航".into(),
-                    theme.fg_accent,
-                ),
+                (keys.confirm.clone(), "打开".into(), theme.success),
                 ("Space".into(), "选择".into(), theme.fg_accent),
-                ("Ctrl+A/Ctrl+R".into(), "全选/反选".into(), theme.fg_accent),
                 ("d".into(), "删除".into(), theme.info),
-                (keys.confirm.clone(), "详情".into(), theme.success),
-                (keys.open_up.clone(), "UP主".into(), theme.info),
-                (keys.refresh.clone(), "刷新".into(), theme.info),
                 (
                     "Esc".into(),
                     format!("取消 · 已选 {}", self.selected_keys.len()),

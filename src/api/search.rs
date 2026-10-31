@@ -270,7 +270,7 @@ impl SearchResultItem {
                     target: SearchTarget::Live { room_id },
                     title: text(item, "title"),
                     subtitle: text(item, "uname"),
-                    stats: format!("👁 {}", count(int(item, "online").unwrap_or(0))),
+                    stats: format!("人气 {}", count(int(item, "online").unwrap_or(0))),
                     badge: if live { "直播中" } else { "未开播" }.to_string(),
                     cover: item
                         .get("user_cover")

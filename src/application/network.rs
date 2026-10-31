@@ -21,6 +21,7 @@ use crate::api::{
     video::VideoInfo,
 };
 use crate::domain::playback::{PlayOrder, PlaylistItem, PlaylistSource};
+pub use crate::presentation::tui::CommentTarget;
 use crate::presentation::tui::DynamicTab;
 use crate::storage::Credentials;
 use futures_util::{StreamExt, stream};
@@ -149,26 +150,19 @@ pub enum NetworkCommand {
         req_id: u64,
         season_id: i64,
     },
-    /// The first page (`offset: None`) replaces the list, used when the
-    /// sort changes or after posting; later pages are appended.
-    LoadVideoComments {
+    /// Top-level comments of a comment area. The first page
+    /// (`offset: None`) replaces the list; later pages are appended.
+    LoadComments {
         req_id: u64,
-        aid: i64,
-        sort: CommentSort,
-        offset: Option<String>,
-    },
-    LoadDynamicComments {
-        req_id: u64,
-        dynamic_id: String,
-        oid: i64,
-        comment_type: i32,
+        target: CommentTarget,
         sort: CommentSort,
         offset: Option<String>,
     },
     LoadCommentReplies {
         req_id: u64,
-        aid: i64,
+        target: CommentTarget,
         root: i64,
+        page: i32,
     },
     LikeComment {
         oid: i64,
@@ -181,6 +175,7 @@ pub enum NetworkCommand {
         comment_type: i32,
         message: String,
         root: Option<i64>,
+        parent: Option<i64>,
     },
     LoadLiveDetail {
         req_id: u64,
@@ -275,7 +270,7 @@ pub enum NetworkEvent {
         req_id: u64,
         cvid: i64,
         article: ArticleData,
-        comments: Vec<CommentItem>,
+        comments: CommentBatch,
     },
     LiveLoaded {
         req_id: u64,
@@ -369,24 +364,20 @@ pub enum NetworkEvent {
         /// The server answered `-101`: the saved login no longer works.
         login_expired: bool,
     },
-    VideoCommentsLoaded {
+    CommentsLoaded {
         req_id: u64,
-        aid: i64,
-        sort: CommentSort,
-        append: bool,
-        batch: CommentBatch,
-    },
-    DynamicCommentsLoaded {
-        req_id: u64,
-        dynamic_id: String,
+        target: CommentTarget,
         sort: CommentSort,
         append: bool,
         batch: CommentBatch,
     },
     CommentRepliesLoaded {
         req_id: u64,
+        target: CommentTarget,
         root: i64,
+        page: i32,
         replies: Vec<CommentItem>,
+        has_more: bool,
     },
     CommentLiked {
         oid: i64,
@@ -582,8 +573,7 @@ impl NetworkCommand {
             Self::LoadDynamicDetail { .. } => "dynamic_detail",
             Self::LoadBangumiIndex { .. } => "bangumi_index",
             Self::LoadBangumiDetail { .. } => "bangumi_detail",
-            Self::LoadVideoComments { .. } => "video_comments",
-            Self::LoadDynamicComments { .. } => "dynamic_comments",
+            Self::LoadComments { .. } => "comments",
             Self::LoadCommentReplies { .. } => "comment_replies",
             Self::LoadLiveDetail { .. } => "live_detail",
             Self::ConnectLiveDanmaku { .. } => "live_danmaku",
@@ -629,8 +619,7 @@ impl NetworkCommand {
             | Self::LoadDynamicDetail { req_id, .. }
             | Self::LoadBangumiIndex { req_id }
             | Self::LoadBangumiDetail { req_id, .. }
-            | Self::LoadVideoComments { req_id, .. }
-            | Self::LoadDynamicComments { req_id, .. }
+            | Self::LoadComments { req_id, .. }
             | Self::LoadCommentReplies { req_id, .. }
             | Self::LoadLiveDetail { req_id, .. }
             | Self::ConnectLiveDanmaku { req_id, .. }
@@ -674,9 +663,10 @@ async fn handle_command(
             comment_type,
             message,
             root,
+            parent,
         } => Some(
             match api_client
-                .add_comment(oid, comment_type, &message, root, root)
+                .add_comment(oid, comment_type, &message, root, parent.or(root))
                 .await
             {
                 Ok(_) => NetworkEvent::CommentPosted { oid },
@@ -805,54 +795,43 @@ async fn handle_tracked_command(
             },
             Err(error) => failed(req_id, "live_qualities", error),
         },
-        NetworkCommand::LoadVideoComments {
+        NetworkCommand::LoadComments {
             req_id,
-            aid,
+            target,
             sort,
             offset,
         } => match api_client
-            .get_main_comments(aid, CommentType::Video.as_i32(), sort, offset.as_deref())
+            .get_main_comments(target.oid, target.comment_type, sort, offset.as_deref())
             .await
         {
-            Ok(batch) => NetworkEvent::VideoCommentsLoaded {
+            Ok(batch) => NetworkEvent::CommentsLoaded {
                 req_id,
-                aid,
+                target,
                 sort,
                 append: offset.is_some(),
                 batch,
             },
-            Err(error) => failed(req_id, "video_comments", error),
+            Err(error) => failed(req_id, "comments", error),
         },
-        NetworkCommand::LoadDynamicComments {
+        NetworkCommand::LoadCommentReplies {
             req_id,
-            dynamic_id,
-            oid,
-            comment_type,
-            sort,
-            offset,
+            target,
+            root,
+            page,
         } => match api_client
-            .get_main_comments(oid, comment_type, sort, offset.as_deref())
+            .get_comment_replies(target.oid, target.comment_type, root, page)
             .await
         {
-            Ok(batch) => NetworkEvent::DynamicCommentsLoaded {
+            Ok((replies, has_more)) => NetworkEvent::CommentRepliesLoaded {
                 req_id,
-                dynamic_id,
-                sort,
-                append: offset.is_some(),
-                batch,
+                target,
+                root,
+                page,
+                replies,
+                has_more,
             },
-            Err(error) => failed(req_id, "dynamic_comments", error),
+            Err(error) => failed(req_id, "comment_replies", error),
         },
-        NetworkCommand::LoadCommentReplies { req_id, aid, root } => {
-            match api_client.get_comment_replies(aid, root, 1).await {
-                Ok(data) => NetworkEvent::CommentRepliesLoaded {
-                    req_id,
-                    root,
-                    replies: data.replies.unwrap_or_default(),
-                },
-                Err(error) => failed(req_id, "comment_replies", error),
-            }
-        }
         NetworkCommand::LoadLiveDetail { req_id, room_id } => {
             let (room_info, history) = tokio::join!(
                 api_client.get_live_room_info(room_id),
@@ -1308,7 +1287,6 @@ async fn handle_tracked_command(
                         None,
                     )
                     .await
-                    .map(|batch| batch.comments)
                     .unwrap_or_default();
                 NetworkEvent::ArticleLoaded {
                     req_id,
@@ -1561,6 +1539,7 @@ mod tests {
                 comment_type: 1,
                 message: "hi".into(),
                 root: None,
+                parent: None,
             },
         ] {
             assert_eq!(command.request_key(), None);

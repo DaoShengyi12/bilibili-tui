@@ -81,6 +81,8 @@ pub struct LiveDetailPage {
     /// Typing a danmaku to send.
     pub input_mode: bool,
     pub input_buffer: String,
+    /// Characters after the cursor in `input_buffer`.
+    pub input_cursor: usize,
     pub quality_picker: Option<QualityPicker>,
     /// Transient message shown in the footer until the next key press.
     pub notice: Option<String>,
@@ -104,20 +106,24 @@ impl LiveDetailPage {
             history_loaded: false,
             input_mode: false,
             input_buffer: String::new(),
+            input_cursor: 0,
             quality_picker: None,
             notice: None,
         }
     }
 
     /// Whether keys go to the danmaku box or the quality picker.
+    /// Only the danmaku box takes every key; the quality picker leaves
+    /// help and stopping playback to the app.
     pub fn captures_keys(&self) -> bool {
-        self.input_mode || self.quality_picker.is_some()
+        self.input_mode
     }
 
     /// Reopen the danmaku box with a message that could not be sent.
     pub fn restore_danmaku_draft(&mut self, message: String, notice: String) {
         self.input_mode = true;
         self.input_buffer = message;
+        self.input_cursor = 0;
         self.notice = Some(notice);
     }
 
@@ -161,6 +167,10 @@ impl LiveDetailPage {
             }
         } else if keys.matches_up(key) {
             picker.selected = picker.selected.saturating_sub(1);
+        } else if keys.matches_jump_top(key) {
+            picker.selected = 0;
+        } else if keys.matches_jump_bottom(key) {
+            picker.selected = picker.qualities.len().saturating_sub(1);
         } else if keys.matches_confirm(key)
             && let Some(quality) = picker.qualities.get(picker.selected)
         {
@@ -180,23 +190,27 @@ impl LiveDetailPage {
     }
 
     fn handle_danmaku_input(&mut self, key: KeyCode, keys: &Keybindings) -> AppAction {
-        if keys.matches_back(key) {
+        if super::text::is_input_cancel(key, keys) {
+            // The draft stays for the next time the box opens.
             self.input_mode = false;
-            self.input_buffer.clear();
         } else if key == KeyCode::Enter {
             let message = self.input_buffer.trim().to_string();
             if !message.is_empty() {
                 self.input_mode = false;
                 self.input_buffer.clear();
+                self.input_cursor = 0;
                 return AppAction::SendLiveDanmaku {
                     room_id: self.room_id,
                     message,
                 };
             }
-        } else if key == KeyCode::Backspace {
-            self.input_buffer.pop();
-        } else if let KeyCode::Char(c) = key {
-            self.input_buffer.push(c);
+        } else {
+            super::text::edit_at_cursor(
+                &mut self.input_buffer,
+                &mut self.input_cursor,
+                key,
+                crossterm::event::KeyModifiers::NONE,
+            );
         }
         AppAction::None
     }
@@ -318,10 +332,13 @@ impl LiveDetailPage {
                 self.push_entry(format!("欢迎 {uname} 进入直播间"), false);
             }
             LiveMessage::Follow { uname, .. } => {
-                self.push_entry(format!("❤ {uname} 关注了主播"), true);
+                self.push_entry(format!("{} {uname} 关注了主播", super::icons::HEART), true);
             }
             LiveMessage::Share { uname, .. } => {
-                self.push_entry(format!("↗ {uname} 分享了直播间"), false);
+                self.push_entry(
+                    format!("{} {uname} 分享了直播间", super::icons::SHARE),
+                    false,
+                );
             }
             LiveMessage::Gift {
                 uname,
@@ -329,7 +346,10 @@ impl LiveDetailPage {
                 num,
                 ..
             } => {
-                self.push_entry(format!("🎁 {uname} 送出 {gift_name} ×{num}"), false);
+                self.push_entry(
+                    format!("{} {uname} 送出 {gift_name} ×{num}", super::icons::GIFT),
+                    false,
+                );
             }
             LiveMessage::Guard {
                 uname,
@@ -338,7 +358,11 @@ impl LiveDetailPage {
                 ..
             } => {
                 self.push_entry(
-                    format!("⚓ {uname} 开通了{} ×{num}", guard_name(guard_level)),
+                    format!(
+                        "{} {uname} 开通了{} ×{num}",
+                        super::icons::GUARD,
+                        guard_name(guard_level)
+                    ),
                     true,
                 );
             }
@@ -391,9 +415,9 @@ impl Component for LiveDetailPage {
 
         // Main block
         let title = if let Some(ref info) = self.room_info {
-            format!(" 📺 {} ", info.title)
+            format!(" {} ", info.title)
         } else {
-            " 📺 直播详情 ".to_string()
+            " 直播详情 ".to_string()
         };
 
         let block = Block::default()
@@ -437,7 +461,17 @@ impl Component for LiveDetailPage {
         modifiers: crossterm::event::KeyModifiers,
         keys: &Keybindings,
     ) -> Option<AppAction> {
-        if self.input_mode && super::text::apply_line_edit(&mut self.input_buffer, key, modifiers) {
+        if self.input_mode
+            && !super::text::is_input_cancel(key, keys)
+            && key != KeyCode::Enter
+            && super::text::edit_at_cursor(
+                &mut self.input_buffer,
+                &mut self.input_cursor,
+                key,
+                modifiers,
+            )
+            .is_some()
+        {
             self.notice = None;
             return Some(AppAction::None);
         }
@@ -462,7 +496,6 @@ impl Component for LiveDetailPage {
             })
         } else if keys.matches_send_danmaku(key) {
             self.input_mode = true;
-            self.input_buffer.clear();
             Some(AppAction::None)
         } else if keys.matches_live_quality(key) {
             self.quality_picker = Some(QualityPicker {
@@ -534,15 +567,19 @@ impl LiveDetailPage {
         self.render_entry_panel(frame, right_chunks[1], theme);
 
         if self.input_mode {
-            let input = Paragraph::new(format!("{}_", self.input_buffer))
-                .style(Style::default().fg(theme.fg_primary))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(theme.bilibili_pink))
-                        .title(" ✏️ 发送弹幕 "),
-                );
+            let input = Paragraph::new(super::text::input_with_cursor(
+                &self.input_buffer,
+                self.input_cursor,
+                usize::from(chunks[1].width.saturating_sub(2)),
+            ))
+            .style(Style::default().fg(theme.fg_primary))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.bilibili_pink))
+                    .title(" 发送弹幕 "),
+            );
             frame.render_widget(input, chunks[1]);
         }
 
@@ -554,26 +591,18 @@ impl LiveDetailPage {
                 theme,
                 [
                     ("Enter".to_string(), "发送".into(), theme.success),
-                    (keys.back.clone(), "取消".into(), theme.info),
+                    ("Esc".to_string(), "收起（保留草稿）".into(), theme.info),
+                    ("Ctrl+U".to_string(), "清空".into(), theme.fg_muted),
                 ],
             )
         } else {
-            shortcut_footer(
+            super::hint_footer(
                 theme,
                 [
-                    (
-                        format!("{}/{}", keys.confirm, keys.play),
-                        "播放".into(),
-                        theme.success,
-                    ),
-                    (keys.live_quality.clone(), "选画质".into(), theme.fg_accent),
-                    (keys.send_danmaku.clone(), "发弹幕".into(), theme.info),
-                    (keys.stop_playback.clone(), "停止播放".into(), theme.warning),
-                    (
-                        format!("{}/{}", keys.back, keys.quit),
-                        "返回".into(),
-                        theme.info,
-                    ),
+                    (keys.play.clone(), "播放".into(), theme.success),
+                    (keys.live_quality.clone(), "画质".into(), theme.fg_accent),
+                    (keys.send_danmaku.clone(), "弹幕".into(), theme.info),
+                    (keys.back.clone(), "返回".into(), theme.info),
                 ],
             )
         };
@@ -730,11 +759,17 @@ impl LiveDetailPage {
                 Span::styled(info.status_text(), Style::default().fg(status_color)),
             ]),
             Line::from(vec![
-                Span::styled("👁 ", Style::default().fg(theme.fg_muted)),
+                Span::styled(
+                    format!("{} ", super::icons::VIEWERS),
+                    Style::default().fg(theme.fg_muted),
+                ),
                 Span::styled(online_str, Style::default().fg(theme.fg_accent)),
             ]),
             Line::from(vec![
-                Span::styled("❤ ", Style::default().fg(theme.bilibili_pink)),
+                Span::styled(
+                    format!("{} ", super::icons::HEART),
+                    Style::default().fg(theme.bilibili_pink),
+                ),
                 Span::styled(
                     Self::format_attention(info.attention),
                     Style::default().fg(theme.bilibili_pink),
@@ -870,8 +905,12 @@ mod interaction_tests {
             page.handle_input(KeyCode::Char('v'), &keys),
             Some(AppAction::LoadLiveQualities(7))
         ));
-        assert!(page.captures_keys());
+        // The picker leaves `?` and the stop key to the app.
+        assert!(page.quality_picker.is_some() && !page.captures_keys());
         page.apply_qualities(vec![quality(10000), quality(400)]);
+        page.handle_input(KeyCode::End, &keys);
+        assert_eq!(page.quality_picker.as_ref().map(|p| p.selected), Some(1));
+        page.handle_input(KeyCode::Home, &keys);
         page.handle_input(KeyCode::Char('j'), &keys);
         let action = page.handle_input(KeyCode::Enter, &keys);
         assert!(matches!(

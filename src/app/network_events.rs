@@ -234,8 +234,8 @@ impl App {
                 if let Some(page) = find_page!(self, VideoDetail(page) if page.bvid == bvid) {
                     page.video_info = Some(video_info);
                     page.relation = relation;
-                    page.comment_sort = crate::api::comment::CommentSort::Hot;
-                    page.set_comments(comments);
+                    page.comments.reset_sort();
+                    page.comments.set_comments(comments);
                     page.related_videos = related_videos.clone();
                     page.related_card_grid.clear();
                     for video in &related_videos {
@@ -251,7 +251,6 @@ impl App {
                         .with_uploader_mid(video.owner.as_ref().and_then(|owner| owner.mid));
                         page.related_card_grid.add_card(card);
                     }
-                    page.loading_more_comments = false;
                     page.loading = false;
                     page.error_message = None;
                 }
@@ -416,8 +415,8 @@ impl App {
                     find_page!(self, DynamicDetail(page) if page.dynamic_id == dynamic_id)
                 {
                     page.dynamic_item = Some(dynamic_item);
-                    page.comment_sort = crate::api::comment::CommentSort::Hot;
-                    page.set_comments(comments);
+                    page.comments.reset_sort();
+                    page.comments.set_comments(comments);
                     page.image_urls = image_urls;
                     page.image_protocols = (0..page.image_urls.len()).map(|_| None).collect();
                     page.loading = false;
@@ -446,48 +445,33 @@ impl App {
                     page.set_season(season);
                 }
             }
-            network::NetworkEvent::VideoCommentsLoaded {
+            network::NetworkEvent::CommentsLoaded {
                 req_id,
-                aid,
+                target,
                 sort,
                 append,
                 batch,
             } => {
-                if !self.is_latest_request("video_comments", req_id) {
+                if !self.is_latest_request("comments", req_id) {
                     return;
                 }
-                if let Some(detail) = find_page!(self, VideoDetail(detail) if detail.aid == aid) {
-                    detail.apply_comment_batch(sort, append, batch);
-                }
-            }
-            network::NetworkEvent::DynamicCommentsLoaded {
-                req_id,
-                dynamic_id,
-                sort,
-                append,
-                batch,
-            } => {
-                if !self.is_latest_request("dynamic_comments", req_id) {
-                    return;
-                }
-                if let Some(detail) =
-                    find_page!(self, DynamicDetail(detail) if detail.dynamic_id == dynamic_id)
-                {
-                    detail.apply_comment_batch(sort, append, batch);
+                if let Some(panel) = self.comment_panel_mut(target) {
+                    panel.apply_batch(sort, append, batch);
                 }
             }
             network::NetworkEvent::CommentRepliesLoaded {
                 req_id,
+                target,
                 root,
+                page,
                 replies,
+                has_more,
             } => {
                 if !self.is_latest_request("comment_replies", req_id) {
                     return;
                 }
-                if let Some(page) =
-                    find_page!(self, VideoDetail(page) if page.expanded_comment == Some(root))
-                {
-                    page.apply_comment_replies(root, Some(replies));
+                if let Some(panel) = self.comment_panel_mut(target) {
+                    panel.apply_replies(root, page, replies, has_more);
                 }
             }
             network::NetworkEvent::CommentLiked { oid, rpid, liked } => {
@@ -600,6 +584,8 @@ impl App {
                     && page.room_id() == room_id
                 {
                     page.restore_danmaku_draft(message, format!("弹幕发送失败：{error}"));
+                } else {
+                    self.status_notice = Some(format!("弹幕发送失败：{error}"));
                 }
             }
             network::NetworkEvent::SessionRefreshed { credentials } => {
@@ -612,7 +598,7 @@ impl App {
                 }
             }
             network::NetworkEvent::ServerLogoutFailed { error } => {
-                self.status_notice = Some(format!("⚠ 已在本地退出，但服务端注销失败：{error}"));
+                self.status_notice = Some(format!("已在本地退出，但服务端注销失败：{error}"));
             }
             network::NetworkEvent::RequestCancelled { req_id, target } => {
                 if self.is_latest_request(target, req_id) {
@@ -669,21 +655,50 @@ impl App {
         }
     }
 
+    /// The comment panel showing `target`, on screen or in the back stack.
+    fn comment_panel_mut(
+        &mut self,
+        target: crate::presentation::tui::CommentTarget,
+    ) -> Option<&mut crate::presentation::tui::CommentPanel> {
+        std::iter::once(&mut self.current_page)
+            .chain(self.navigation_stack.iter_mut().rev())
+            .find_map(|page| match page {
+                Page::VideoDetail(page) if page.comment_target() == target => {
+                    Some(&mut page.comments)
+                }
+                Page::DynamicDetail(page) if page.comment_target() == Some(target) => {
+                    Some(&mut page.comments)
+                }
+                Page::ArticleDetail(page) if page.comment_target() == Some(target) => {
+                    Some(&mut page.comments)
+                }
+                _ => None,
+            })
+    }
+
+    /// Every panel of the comment area `oid` that holds `rpid`.
     fn apply_comment_like(&mut self, oid: i64, rpid: i64, liked: bool) {
         for page in std::iter::once(&mut self.current_page).chain(self.navigation_stack.iter_mut())
         {
-            let liked_comments = match page {
-                Page::VideoDetail(page) if page.aid == oid => &mut page.liked_comments,
-                Page::DynamicDetail(page) if page.comments.iter().any(|c| c.rpid == rpid) => {
-                    &mut page.liked_comments
+            let panel = match page {
+                Page::VideoDetail(page) if page.aid == oid => &mut page.comments,
+                Page::DynamicDetail(page)
+                    if page
+                        .comment_target()
+                        .is_some_and(|target| target.oid == oid) =>
+                {
+                    &mut page.comments
+                }
+                Page::ArticleDetail(page)
+                    if page
+                        .comment_target()
+                        .is_some_and(|target| target.oid == oid) =>
+                {
+                    &mut page.comments
                 }
                 _ => continue,
             };
-            if liked {
-                liked_comments.insert(rpid);
-            } else {
-                liked_comments.remove(&rpid);
-            }
+            panel.apply_like(rpid, liked);
         }
     }
 
@@ -697,53 +712,42 @@ impl App {
             }
             Page::DynamicDetail(page)
                 if page
-                    .dynamic_item
-                    .as_ref()
-                    .and_then(|item| item.comment_oid(&page.dynamic_id))
-                    == Some(oid) =>
+                    .comment_target()
+                    .is_some_and(|target| target.oid == oid) =>
             {
                 page.restore_comment_draft(message, notice)
             }
-            _ => {}
+            Page::ArticleDetail(page)
+                if page
+                    .comment_target()
+                    .is_some_and(|target| target.oid == oid) =>
+            {
+                page.restore_comment_draft(message, notice)
+            }
+            // The page is gone, so the draft cannot be shown again; say so
+            // instead of dropping it silently.
+            _ => self.status_notice = Some(format!("评论未发出（{notice}），已离开该页面")),
         }
     }
 
+    /// Reload the first page of the comment area a comment was posted to,
+    /// in the sort it is shown in, so the new comment shows up.
     fn reload_comments_after_post(&mut self, oid: i64) {
-        match &self.current_page {
-            Page::VideoDetail(page) if page.aid == oid => {
-                // The first page in the current sort replaces the list and
-                // supersedes any page in flight.
-                let (aid, sort) = (page.aid, page.comment_sort);
-                if let Page::VideoDetail(page) = &mut self.current_page {
-                    page.loading_more_comments = true;
-                }
-                self.request_video_comments(aid, sort, None);
-            }
-            Page::DynamicDetail(page)
-                if page
-                    .dynamic_item
-                    .as_ref()
-                    .and_then(|item| item.comment_oid(&page.dynamic_id))
-                    == Some(oid) =>
-            {
-                let dynamic_id = page.dynamic_id.clone();
-                let request = page.comment_target().map(|(oid, comment_type)| {
-                    crate::presentation::tui::CommentRequest {
-                        oid,
-                        comment_type,
-                        sort: page.comment_sort,
-                        offset: None,
-                    }
-                });
-                if let Some(request) = request {
-                    if let Page::DynamicDetail(page) = &mut self.current_page {
-                        page.loading_more_comments = true;
-                    }
-                    self.request_dynamic_comments(dynamic_id, request);
-                }
-            }
-            _ => {}
+        let target = match &self.current_page {
+            Page::VideoDetail(page) => Some(page.comment_target()),
+            Page::DynamicDetail(page) => page.comment_target(),
+            Page::ArticleDetail(page) => page.comment_target(),
+            _ => None,
         }
+        .filter(|target| target.oid == oid);
+        let Some(target) = target else {
+            return;
+        };
+        let Some(panel) = self.comment_panel_mut(target) else {
+            return;
+        };
+        let request = panel.begin_reload();
+        self.handle_comment_request(target, request);
     }
 
     /// Takes the page that owns `target` out of its loading state, wherever
@@ -842,25 +846,16 @@ impl App {
                     page.set_error(format!("加载番剧详情失败: {error}"));
                 }
             }
-            "video_comments" => {
-                if let Some(page) =
-                    find_page!(self, VideoDetail(page) if page.loading_more_comments)
+            "comments" | "comment_replies" => {
+                for page in
+                    std::iter::once(&mut self.current_page).chain(self.navigation_stack.iter_mut())
                 {
-                    page.apply_more_comments_error();
-                }
-            }
-            "dynamic_comments" => {
-                if let Some(page) =
-                    find_page!(self, DynamicDetail(page) if page.loading_more_comments)
-                {
-                    page.apply_more_comments_error();
-                }
-            }
-            "comment_replies" => {
-                if let Some(page) = find_page!(self, VideoDetail(page) if page.loading_replies)
-                    && let Some(root) = page.expanded_comment
-                {
-                    page.apply_comment_replies(root, None);
+                    match page {
+                        Page::VideoDetail(page) => page.comments.apply_error(),
+                        Page::DynamicDetail(page) => page.comments.apply_error(),
+                        Page::ArticleDetail(page) => page.comments.apply_error(),
+                        _ => {}
+                    }
                 }
             }
             "live_detail" => {
@@ -1086,6 +1081,7 @@ mod tests {
             comment_type: 1,
             message: "草稿".into(),
             root: None,
+            parent: None,
         })
         .await;
 
@@ -1257,35 +1253,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn more_comments_load_in_the_background() {
+    async fn comment_pages_reach_the_panel_and_failures_end_loading() {
         let (mut app, rx) = app();
         let mut page = crate::presentation::tui::VideoDetailPage::new("BV1test".into(), 7);
-        page.set_comments(crate::api::comment::CommentBatch {
-            comments: Vec::new(),
-            next_offset: Some("next".into()),
-        });
+        page.loading = false;
+        let target = page.comment_target();
         app.current_page = Page::VideoDetail(Box::new(page));
 
-        app.handle_action(AppAction::LoadMoreComments).await;
-        let Ok(NetworkCommand::LoadVideoComments {
-            req_id,
-            aid: 7,
-            offset: Some(offset),
-            ..
-        }) = rx.try_recv()
-        else {
+        app.handle_action(AppAction::Comment(
+            target,
+            crate::presentation::tui::PanelRequest::Comments {
+                sort: crate::api::comment::CommentSort::Hot,
+                offset: Some("next".into()),
+            },
+        ))
+        .await;
+        let Ok(NetworkCommand::LoadComments { req_id, .. }) = rx.try_recv() else {
             panic!("comments were not requested");
         };
-        assert_eq!(offset, "next");
-        assert!(matches!(&app.current_page, Page::VideoDetail(page) if page.loading_more_comments));
-
+        if let Page::VideoDetail(page) = &mut app.current_page {
+            page.comments.loading = true;
+        }
         app.handle_network_event(NetworkEvent::RequestCancelled {
             req_id,
-            target: "video_comments",
+            target: "comments",
         });
-        assert!(
-            matches!(&app.current_page, Page::VideoDetail(page) if !page.loading_more_comments)
-        );
+        assert!(matches!(&app.current_page, Page::VideoDetail(page) if !page.comments.loading));
+
+        let req_id = app.next_request_id("comments");
+        app.handle_network_event(NetworkEvent::CommentsLoaded {
+            req_id,
+            target,
+            sort: crate::api::comment::CommentSort::Hot,
+            append: false,
+            batch: crate::api::comment::CommentBatch {
+                comments: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "rpid": 5, "oid": 7, "mid": 1, "parent": 0
+                    }))
+                    .unwrap(),
+                ],
+                next_offset: None,
+            },
+        });
+        assert!(matches!(&app.current_page, Page::VideoDetail(page) if page.comments.len() == 1));
     }
 
     #[tokio::test]
@@ -1438,21 +1449,24 @@ mod tests {
         let (mut app, rx) = app();
         let mut page = crate::presentation::tui::VideoDetailPage::new("BV1test".into(), 9);
         page.loading = false;
-        page.comment_sort = crate::api::comment::CommentSort::Time;
+        page.comments.begin_sort_toggle();
         app.current_page = Page::VideoDetail(Box::new(page));
 
         app.handle_network_event(NetworkEvent::CommentPosted { oid: 9 });
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(NetworkCommand::LoadVideoComments {
-                aid: 9,
+            Ok(NetworkCommand::LoadComments {
+                target: crate::presentation::tui::CommentTarget {
+                    oid: 9,
+                    comment_type: 1
+                },
                 sort: crate::api::comment::CommentSort::Time,
                 offset: None,
                 ..
             })
         ));
-        assert!(matches!(&app.current_page, Page::VideoDetail(page) if page.loading_more_comments));
+        assert!(matches!(&app.current_page, Page::VideoDetail(page) if page.comments.loading));
     }
 
     #[tokio::test]

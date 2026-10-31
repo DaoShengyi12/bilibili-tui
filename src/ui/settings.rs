@@ -28,11 +28,11 @@ impl SettingsSection {
 
     pub fn label(&self) -> &'static str {
         match self {
-            SettingsSection::Theme => "🎨 主题",
-            SettingsSection::Danmaku => "💬 弹幕",
-            SettingsSection::Playback => "▶  播放",
-            SettingsSection::Keybindings => "⌨️ 快捷键",
-            SettingsSection::Account => "👤 账户",
+            SettingsSection::Theme => "主题",
+            SettingsSection::Danmaku => "弹幕",
+            SettingsSection::Playback => "播放与显示",
+            SettingsSection::Keybindings => "快捷键",
+            SettingsSection::Account => "账户",
         }
     }
 }
@@ -123,7 +123,7 @@ impl SettingsPage {
         let (label, _) = labels.get(index)?;
         (!shared.is_empty()).then(|| {
             format!(
-                "⚠ 「{label}」与「{}」使用同一按键，请确认不会冲突",
+                "「{label}」与「{}」使用同一按键，请确认不会冲突",
                 shared.join("」「")
             )
         })
@@ -166,7 +166,10 @@ impl Component for SettingsPage {
 
         // Header
         let header_line = Line::from(vec![
-            Span::styled("⚙️ ", Style::default().fg(theme.bilibili_pink)),
+            Span::styled(
+                format!("{} ", super::icons::SETTINGS),
+                Style::default().fg(theme.bilibili_pink),
+            ),
             Span::styled(
                 "设置",
                 Style::default()
@@ -211,46 +214,36 @@ impl Component for SettingsPage {
 
         // Help bar
         let help_line = if self.editing_keybind {
-            Line::from("请按新的快捷键 · Esc 取消")
+            Line::from("请按新的快捷键 · Backspace 恢复默认 · Esc 取消")
         } else if self.editing_danmaku {
             Line::from("输入新值 · Enter 保存 · Esc 取消")
         } else {
-            Line::from(vec![
-                Span::styled(" [", Style::default().fg(theme.fg_secondary)),
-                Span::styled(
+            let adjusts = matches!(
+                self.current_section,
+                SettingsSection::Danmaku | SettingsSection::Playback
+            );
+            let mut items = vec![
+                (
                     format!("{}{}", keys.section_prev, keys.section_next),
-                    Style::default()
-                        .fg(theme.fg_accent)
-                        .add_modifier(Modifier::BOLD),
+                    "切换分类".to_string(),
+                    theme.fg_accent,
                 ),
-                Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-                Span::styled("切换分类", Style::default().fg(theme.fg_secondary)),
-                Span::styled("  [", Style::default().fg(theme.fg_secondary)),
-                Span::styled(
+                (
                     format!("{}{}", keys.nav_up, keys.nav_down),
-                    Style::default()
-                        .fg(theme.fg_accent)
-                        .add_modifier(Modifier::BOLD),
+                    "选择".to_string(),
+                    theme.fg_accent,
                 ),
-                Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-                Span::styled("选择", Style::default().fg(theme.fg_secondary)),
-                Span::styled("  [", Style::default().fg(theme.fg_secondary)),
-                Span::styled(
-                    &keys.confirm,
-                    Style::default()
-                        .fg(theme.success)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-                Span::styled("确认", Style::default().fg(theme.fg_secondary)),
-                Span::styled("  [", Style::default().fg(theme.fg_secondary)),
-                Span::styled(
-                    &keys.nav_next_page,
-                    Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-                Span::styled("切页面", Style::default().fg(theme.fg_secondary)),
-            ])
+            ];
+            if adjusts {
+                items.push((
+                    format!("{}{}", keys.nav_left, keys.nav_right),
+                    "调整".to_string(),
+                    theme.fg_accent,
+                ));
+            }
+            items.push((keys.confirm.clone(), "确认".to_string(), theme.success));
+            items.push((keys.nav_next_page.clone(), "切页面".to_string(), theme.info));
+            super::hint_footer(theme, items)
         };
         let help = Paragraph::new(help_line).alignment(Alignment::Center);
         frame.render_widget(help, main_chunks[2]);
@@ -270,12 +263,20 @@ impl Component for SettingsPage {
                 self.editing_keybind = false;
                 return Some(AppAction::None);
             }
-            let Some(new_key) = crate::storage::Keybindings::keycode_to_string(key) else {
+            // Backspace restores the default, which is also the only way to
+            // get Esc back for a binding such as "返回".
+            let new_key = if key == KeyCode::Backspace {
+                crate::storage::Keybindings::default_binding(self.selected_keybind_index)
+            } else {
+                crate::storage::Keybindings::keycode_to_string(key)
+            };
+            let Some(new_key) = new_key else {
                 // Stay in capture mode; saving would write an unreadable key.
                 self.keybind_notice = Some("该按键无法保存，请换一个（Esc 取消）".to_string());
                 return Some(AppAction::None);
             };
-            self.keybind_notice = self.shared_key_notice(self.selected_keybind_index, key);
+            self.keybind_notice = crate::storage::Keybindings::parse_keycode(&new_key)
+                .and_then(|key| self.shared_key_notice(self.selected_keybind_index, key));
             self.keybindings
                 .update_by_index(self.selected_keybind_index, new_key);
             self.editing_keybind = false;
@@ -344,6 +345,17 @@ impl Component for SettingsPage {
         {
             return Some(self.adjust_playback(if keys.matches_right(key) { 1 } else { -1 }));
         }
+        // Left/Right step a danmaku value down or up, like Playback values.
+        if (keys.matches_left(key) || keys.matches_right(key))
+            && self.current_section == SettingsSection::Danmaku
+        {
+            self.adjust_danmaku(if keys.matches_right(key) { 1 } else { -1 });
+            return Some(AppAction::SaveDanmakuConfig(Box::new(self.danmaku.clone())));
+        }
+        if keys.matches_jump_top(key) || keys.matches_jump_bottom(key) {
+            self.jump_in_section(keys.matches_jump_bottom(key));
+            return Some(AppAction::None);
+        }
         if keys.matches_left(key) || keys.matches_right(key) {
             self.change_section(if keys.matches_right(key) { 1 } else { -1 });
             return Some(AppAction::None);
@@ -389,7 +401,8 @@ impl Component for SettingsPage {
                         (self.selected_danmaku_index + 1).min(Self::DANMAKU_ROWS - 1);
                 }
                 SettingsSection::Playback => {
-                    self.selected_playback_index = (self.selected_playback_index + 1).min(2);
+                    self.selected_playback_index =
+                        (self.selected_playback_index + 1).min(Self::PLAYBACK_ROWS - 1);
                 }
                 SettingsSection::Account => {}
             }
@@ -437,6 +450,21 @@ impl Component for SettingsPage {
 
 impl SettingsPage {
     const DANMAKU_ROWS: usize = 9;
+    const PLAYBACK_ROWS: usize = 4;
+
+    /// Select the first or last row of the current section.
+    fn jump_in_section(&mut self, to_end: bool) {
+        let last = |len: usize| if to_end { len.saturating_sub(1) } else { 0 };
+        match self.current_section {
+            SettingsSection::Theme => self.selected_theme_index = last(self.theme_choices.len()),
+            SettingsSection::Keybindings => {
+                self.selected_keybind_index = last(self.keybindings.get_all_labels().len())
+            }
+            SettingsSection::Danmaku => self.selected_danmaku_index = last(Self::DANMAKU_ROWS),
+            SettingsSection::Playback => self.selected_playback_index = last(Self::PLAYBACK_ROWS),
+            SettingsSection::Account => {}
+        }
+    }
 
     fn adjust_playback(&mut self, direction: i32) -> AppAction {
         match self.selected_playback_index {
@@ -447,6 +475,10 @@ impl SettingsPage {
             2 => {
                 self.minimal_mode = !self.minimal_mode;
                 AppAction::SaveMinimalMode(self.minimal_mode)
+            }
+            3 => {
+                let enabled = !super::icons::nerd_font();
+                AppAction::SaveNerdFontIcons(enabled)
             }
             _ => {
                 self.video_quality = self.video_quality.cycle(direction);
@@ -571,7 +603,7 @@ impl SettingsPage {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border_subtle))
             .title(Span::styled(
-                " 💬 弹幕设置 ",
+                " 弹幕设置 ",
                 Style::default()
                     .fg(theme.bilibili_pink)
                     .add_modifier(Modifier::BOLD),
@@ -640,7 +672,7 @@ impl SettingsPage {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border_subtle))
             .title(Span::styled(
-                " ▶  播放设置 ",
+                " 播放与显示 ",
                 Style::default()
                     .fg(theme.bilibili_pink)
                     .add_modifier(Modifier::BOLD),
@@ -662,10 +694,18 @@ impl SettingsPage {
                     "关闭"
                 }
             ),
+            format!(
+                "图标：{}",
+                if super::icons::nerd_font() {
+                    "Nerd Font"
+                } else {
+                    "纯文字（终端字体不是 Nerd Font 时选这个）"
+                }
+            ),
         ];
 
         let chunks = Layout::vertical([
-            Constraint::Length(3),
+            Constraint::Length(Self::PLAYBACK_ROWS as u16),
             Constraint::Length(1),
             Constraint::Min(0),
         ])
@@ -750,7 +790,7 @@ impl SettingsPage {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border_subtle))
             .title(Span::styled(
-                " 🎨 选择主题 ",
+                " 选择主题 ",
                 Style::default()
                     .fg(theme.bilibili_pink)
                     .add_modifier(Modifier::BOLD),
@@ -830,7 +870,7 @@ impl SettingsPage {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border_subtle))
             .title(Span::styled(
-                " ⌨️ 快捷键 ",
+                " 快捷键 ",
                 Style::default()
                     .fg(theme.bilibili_pink)
                     .add_modifier(Modifier::BOLD),
@@ -921,7 +961,7 @@ impl SettingsPage {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border_subtle))
             .title(Span::styled(
-                " 👤 账户 ",
+                " 账户 ",
                 Style::default()
                     .fg(theme.bilibili_pink)
                     .add_modifier(Modifier::BOLD),
@@ -1093,5 +1133,32 @@ mod tests {
             action,
             Some(AppAction::SaveVideoQuality(VideoQuality::Q4k))
         ));
+    }
+
+    #[test]
+    fn danmaku_values_step_both_ways_and_keys_can_return_to_default() {
+        let keys = crate::storage::Keybindings::default();
+        let mut page = SettingsPage {
+            current_section: SettingsSection::Danmaku,
+            selected_danmaku_index: 4,
+            ..SettingsPage::default()
+        };
+        let before = page.danmaku.duration;
+        page.handle_input(KeyCode::Left, &keys);
+        assert_eq!(page.danmaku.duration, (before - 1.0).clamp(3.0, 20.0));
+        page.handle_input(KeyCode::Right, &keys);
+        assert_eq!(page.danmaku.duration, before.clamp(3.0, 20.0));
+
+        page.current_section = SettingsSection::Keybindings;
+        page.handle_input(KeyCode::End, &keys);
+        let last = page.keybindings.get_all_labels().len() - 1;
+        assert_eq!(page.selected_keybind_index, last);
+        page.selected_keybind_index = 2; // 返回
+        page.handle_input(KeyCode::Enter, &keys);
+        page.handle_input(KeyCode::Char('b'), &keys);
+        assert_eq!(page.keybindings.back, "b");
+        page.handle_input(KeyCode::Enter, &keys);
+        page.handle_input(KeyCode::Backspace, &keys);
+        assert_eq!(page.keybindings.back, "Esc");
     }
 }

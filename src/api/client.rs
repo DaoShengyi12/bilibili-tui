@@ -1143,26 +1143,28 @@ impl ApiClient {
     }
 
     // Comment replies API
+    /// One page of replies under `root`, and whether more pages follow.
     pub async fn get_comment_replies(
         &self,
         oid: i64,
+        comment_type: i32,
         root: i64,
         pn: i32,
-    ) -> Result<super::comment::CommentData> {
+    ) -> Result<(Vec<super::comment::CommentItem>, bool)> {
         let url = format!(
-            "{}/x/v2/reply/reply?type=1&oid={}&root={}&ps=20&pn={}",
+            "{}/x/v2/reply/reply?type={comment_type}&oid={oid}&root={root}&ps=20&pn={pn}",
             BilibiliApiDomain::Main.as_str(),
-            oid,
-            root,
-            pn
         );
 
         let resp: ApiResponse<super::comment::CommentData> = self.get(&url).await?;
-        Ok(resp.data.unwrap_or(super::comment::CommentData {
+        let data = resp.data.unwrap_or(super::comment::CommentData {
             page: None,
             replies: None,
-            hots: None,
-        }))
+        });
+        let replies = data.replies.unwrap_or_default();
+        let total = data.page.as_ref().and_then(|page| page.count).unwrap_or(0);
+        let has_more = !replies.is_empty() && pn * 20 < total;
+        Ok((replies, has_more))
     }
 
     // Related Videos API
@@ -1945,5 +1947,32 @@ mod live_contract_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "contacts the live Bilibili API with saved credentials"]
+    async fn comment_replies_contract_pages_a_long_thread() {
+        let credentials = crate::storage::load_credentials().expect("saved credentials");
+        let client = ApiClient::with_cookies(&credentials);
+        let batch = client
+            .get_main_comments(170001, 1, crate::api::comment::CommentSort::Hot, None)
+            .await
+            .unwrap();
+        let root = batch
+            .comments
+            .iter()
+            .find(|comment| comment.reply_count() > 40)
+            .expect("a hot comment with many replies");
+        let (first, more) = client
+            .get_comment_replies(170001, 1, root.rpid, 1)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 20);
+        assert!(more);
+        let (second, _) = client
+            .get_comment_replies(170001, 1, root.rpid, 2)
+            .await
+            .unwrap();
+        assert!(!second.is_empty() && second[0].rpid != first[0].rpid);
     }
 }

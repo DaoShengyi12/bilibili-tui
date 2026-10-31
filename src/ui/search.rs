@@ -156,6 +156,12 @@ impl SearchPage {
         self.input_mode && !self.query.trim().is_empty() && !self.suggestions.is_empty()
     }
 
+    /// Focus the query box, as the search key does.
+    pub fn focus_input(&mut self) {
+        self.input_mode = true;
+        self.show_hot_list = self.hotwords_enabled;
+    }
+
     fn after_edit(&mut self) {
         self.show_hot_list = self.hotwords_enabled;
         self.suggestion_selected = None;
@@ -201,6 +207,8 @@ impl SearchPage {
         }
         self.kind = kind;
         self.grid.clear();
+        self.grid
+            .set_poster_layout(matches!(kind, SearchKind::Bangumi | SearchKind::Live));
         self.targets.clear();
         self.total_results = 0;
         self.error_message = None;
@@ -310,7 +318,7 @@ impl SearchPage {
             ));
 
         if self.hotword_loading {
-            let loading = Paragraph::new("⏳ 正在获取热搜...")
+            let loading = Paragraph::new("正在获取热搜...")
                 .style(Style::default().fg(theme.fg_secondary))
                 .alignment(Alignment::Center)
                 .block(block);
@@ -319,7 +327,7 @@ impl SearchPage {
         }
 
         if let Some(err) = &self.hotword_error {
-            let error_widget = Paragraph::new(format!("❌ {}", err))
+            let error_widget = Paragraph::new(err.to_string())
                 .style(Style::default().fg(theme.error))
                 .alignment(Alignment::Center)
                 .block(block);
@@ -374,10 +382,10 @@ impl SearchPage {
 }
 
 impl SearchPage {
-    /// `🔍 搜索 [视频] 用户 番剧 直播` with the current kind highlighted.
+    /// `搜索 [视频] 用户 番剧 直播` with the current kind highlighted.
     fn kind_tabs(&self, theme: &Theme) -> Line<'static> {
         let mut spans = vec![Span::styled(
-            " 🔍 搜索 ",
+            format!(" {} 搜索 ", super::icons::SEARCH),
             Style::default().fg(theme.bilibili_pink),
         )];
         for kind in SearchKind::ALL {
@@ -449,7 +457,7 @@ impl Component for SearchPage {
         } else if self.show_hot_list {
             self.draw_hot_list(frame, chunks[1], theme);
         } else if self.loading {
-            let loading = Paragraph::new("⏳ 搜索中...")
+            let loading = Paragraph::new("搜索中...")
                 .style(Style::default().fg(theme.warning))
                 .alignment(Alignment::Center)
                 .block(
@@ -464,7 +472,7 @@ impl Component for SearchPage {
                 );
             frame.render_widget(loading, chunks[1]);
         } else if let Some(error) = &self.error_message {
-            let error_widget = Paragraph::new(format!("❌ {}", error))
+            let error_widget = Paragraph::new(error.to_string())
                 .style(Style::default().fg(theme.error))
                 .alignment(Alignment::Center)
                 .block(
@@ -537,32 +545,16 @@ impl Component for SearchPage {
                 ],
             )
         } else {
-            shortcut_footer(
+            super::hint_footer(
                 theme,
                 [
-                    (
-                        format!(
-                            "{}/{}",
-                            keys.get_arrow_keys_display(),
-                            keys.get_nav_keys_display()
-                        ),
-                        "导航".into(),
-                        theme.fg_accent,
-                    ),
-                    (
-                        format!("{}/{}", keys.page_up, keys.page_down),
-                        "翻页".into(),
-                        theme.fg_accent,
-                    ),
                     (keys.confirm.clone(), "打开".into(), theme.success),
                     (
                         format!("{}/{}", keys.section_prev, keys.section_next),
                         "类型".into(),
                         theme.fg_accent,
                     ),
-                    (keys.open_up.clone(), "UP主".into(), theme.info),
                     (keys.search_focus.clone(), "搜索".into(), theme.info),
-                    (keys.nav_next_page.clone(), "切换".into(), theme.info),
                 ],
             )
         };
@@ -640,6 +632,10 @@ impl Component for SearchPage {
                 KeyCode::Esc => {
                     self.input_mode = false;
                     self.suggestions.clear();
+                    // Back to the results that were on screen, if any.
+                    if !self.grid.cards.is_empty() {
+                        self.show_hot_list = false;
+                    }
                     Some(AppAction::None)
                 }
                 _ if keys.matches_nav_next(key) => Some(AppAction::NavNext),
@@ -681,9 +677,18 @@ impl Component for SearchPage {
             if keys.matches_confirm(key) {
                 return self.search_selected_hotword();
             }
+            if keys.matches_back(key) && !self.grid.cards.is_empty() {
+                self.show_hot_list = false;
+                return Some(AppAction::None);
+            }
+            if keys.matches_jump_top(key) || keys.matches_jump_bottom(key) {
+                if let Some(last) = self.hotwords.len().checked_sub(1) {
+                    self.hot_selected = Some(if keys.matches_jump_top(key) { 0 } else { last });
+                }
+                return Some(AppAction::None);
+            }
             if keys.matches_search_focus(key) {
-                self.input_mode = true;
-                self.show_hot_list = self.hotwords_enabled;
+                self.focus_input();
                 return Some(AppAction::None);
             }
             if keys.matches_nav_next(key) {
@@ -699,7 +704,7 @@ impl Component for SearchPage {
         } else {
             if keys.matches_page_down(key) {
                 self.grid.move_page_down();
-                if self.grid.is_near_bottom(self.grid.cached_visible_rows) && !self.loading_more {
+                if self.grid.is_near_bottom() && !self.loading_more {
                     return Some(AppAction::LoadMoreSearch);
                 }
                 return Some(AppAction::None);
@@ -711,7 +716,7 @@ impl Component for SearchPage {
             if keys.matches_down(key) {
                 self.grid.move_down();
                 // Check for pagination
-                if self.grid.is_near_bottom(3) && !self.loading_more {
+                if self.grid.is_near_bottom() && !self.loading_more {
                     return Some(AppAction::LoadMoreSearch);
                 }
                 return Some(AppAction::None);
@@ -726,6 +731,17 @@ impl Component for SearchPage {
             }
             if keys.matches_left(key) {
                 self.grid.move_left();
+                return Some(AppAction::None);
+            }
+            if keys.matches_jump_top(key) {
+                self.grid.move_first();
+                return Some(AppAction::None);
+            }
+            if keys.matches_jump_bottom(key) || keys.matches_load_more(key) {
+                self.grid.move_last();
+                if !self.loading_more {
+                    return Some(AppAction::LoadMoreSearch);
+                }
                 return Some(AppAction::None);
             }
             if keys.matches_open_up(key)
@@ -832,7 +848,7 @@ impl Component for SearchPage {
             MouseEventKind::ScrollDown => {
                 if self.grid.move_down() {
                     // Only check pagination if actually moved
-                    if self.grid.is_near_bottom(3) && !self.loading_more {
+                    if self.grid.is_near_bottom() && !self.loading_more {
                         return Some(AppAction::LoadMoreSearch);
                     }
                 }

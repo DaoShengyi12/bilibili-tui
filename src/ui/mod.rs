@@ -1,11 +1,14 @@
 mod article_detail;
 mod bangumi;
 mod bangumi_detail;
+mod comments;
 mod dynamic;
 mod dynamic_detail;
 mod favorites;
+mod help;
 mod history;
 mod home;
+pub mod icons;
 mod live;
 mod live_detail;
 mod login;
@@ -21,9 +24,11 @@ mod video_detail;
 pub use article_detail::ArticleDetailPage;
 pub use bangumi::BangumiPage;
 pub use bangumi_detail::BangumiDetailPage;
+pub use comments::{CommentPanel, CommentTarget, PanelRequest};
 pub use dynamic::{DynamicPage, DynamicTab};
-pub use dynamic_detail::{CommentRequest, DynamicDetailPage};
+pub use dynamic_detail::DynamicDetailPage;
 pub use favorites::FavoritesPage;
+pub use help::{help_for, render_help};
 pub use history::HistoryPage;
 pub use home::HomePage;
 pub use live::LivePage;
@@ -118,6 +123,23 @@ pub fn shortcut_footer(
         spans.push(Span::styled(label, muted));
     }
     Line::from(spans)
+}
+
+/// Key that opens the full shortcut list. Fixed so it is always discoverable.
+pub const HELP_KEY: char = '?';
+
+/// The short footer shown on every page: the few keys used most there,
+/// followed by `?` for the full list.
+pub fn hint_footer(
+    theme: &Theme,
+    items: impl IntoIterator<Item = (String, String, Color)>,
+) -> Line<'static> {
+    shortcut_footer(
+        theme,
+        items
+            .into_iter()
+            .chain([(HELP_KEY.to_string(), "全部按键".to_string(), theme.fg_muted)]),
+    )
 }
 
 /// A one-line footer notice that replaces the shortcut hints until the next key.

@@ -18,17 +18,42 @@ pub enum NavItem {
 }
 
 impl NavItem {
-    pub fn label(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
-            NavItem::Home => "🏠 首页",
-            NavItem::Search => "🔍 搜索",
-            NavItem::Dynamic => "📺 动态",
-            NavItem::History => "📜 历史",
-            NavItem::Favorites => "⭐ 收藏夹",
-            NavItem::Live => "📡 直播",
-            NavItem::Bangumi => "🎬 番剧",
-            NavItem::MySpace => "👤 我的主页",
-            NavItem::Settings => "⚙️ 设置",
+            NavItem::Home => "首页",
+            NavItem::Search => "搜索",
+            NavItem::Dynamic => "动态",
+            NavItem::History => "历史",
+            NavItem::Favorites => "收藏夹",
+            NavItem::Live => "直播",
+            NavItem::Bangumi => "番剧",
+            NavItem::MySpace => "我的主页",
+            NavItem::Settings => "设置",
+        }
+    }
+
+    pub fn icon(&self) -> super::icons::Icon {
+        use super::icons;
+        match self {
+            NavItem::Home => icons::HOME,
+            NavItem::Search => icons::SEARCH,
+            NavItem::Dynamic => icons::DYNAMIC,
+            NavItem::History => icons::HISTORY,
+            NavItem::Favorites => icons::FAVORITE,
+            NavItem::Live => icons::LIVE,
+            NavItem::Bangumi => icons::BANGUMI,
+            NavItem::MySpace => icons::ACCOUNT,
+            NavItem::Settings => icons::SETTINGS,
+        }
+    }
+
+    /// The sidebar entry: icon and name, or the name alone without a
+    /// Nerd Font, since the text fallbacks would repeat the name.
+    pub fn label(&self) -> String {
+        if super::icons::nerd_font() {
+            format!("{} {}", self.icon(), self.name())
+        } else {
+            self.name().to_string()
         }
     }
 

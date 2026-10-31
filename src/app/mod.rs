@@ -56,6 +56,11 @@ pub struct App {
     /// Shown as a dialog when the saved login stopped working; Enter opens
     /// the login page.
     pub login_prompt: Option<String>,
+    /// The `?` shortcut list is open; scroll keys move it, any other key
+    /// closes it.
+    pub show_help: bool,
+    /// First visible row of the shortcut list, clamped while drawing.
+    pub help_scroll: u16,
     /// A cookie refresh is running; further `-101`s wait for it.
     session_refresh_in_flight: bool,
     /// A forced refresh was tried since the last successful one.
@@ -113,9 +118,10 @@ impl App {
             Ok(config) => (config, None),
             Err(error) => (
                 AppConfig::default(),
-                Some(format!("⚠ 配置文件读取失败，已改用默认设置：{error:#}")),
+                Some(format!("配置文件读取失败，已改用默认设置：{error:#}")),
             ),
         };
+        crate::ui::icons::set_nerd_font(config.nerd_font_icons);
         let (danmaku_config_tx, _) = watch::channel(config.danmaku.clone());
         let keybindings = config.keybindings.clone();
         let configured_theme_id = config.theme.clone();
@@ -147,9 +153,11 @@ impl App {
             config,
             keybindings,
             pending_home_notice: used_fallback
-                .then_some("⚠ 旧主题配置无效，请前往设置页重新选择主题".to_string()),
+                .then_some("旧主题配置无效，请前往设置页重新选择主题".to_string()),
             status_notice: config_notice,
             login_prompt: None,
+            show_help: false,
+            help_scroll: 0,
             session_refresh_in_flight: false,
             session_refresh_forced: false,
             network_worker_lost: std::cell::Cell::new(false),
@@ -190,7 +198,7 @@ impl App {
     /// Surface a failed save of settings or credentials as a status notice.
     fn report_save_result(&mut self, what: &str, result: anyhow::Result<()>) {
         if let Err(error) = result {
-            self.status_notice = Some(format!("⚠ {what}失败：{error:#}"));
+            self.status_notice = Some(format!("{what}失败：{error:#}"));
         }
     }
 

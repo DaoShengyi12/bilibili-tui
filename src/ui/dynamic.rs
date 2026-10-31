@@ -1,7 +1,7 @@
 //! Dynamic feed page with video card grid display
 
 use super::video_card::{VideoCard, VideoCardGrid};
-use super::{Component, Theme, shortcut_footer};
+use super::{Component, Theme};
 use crate::api::dynamic::DynamicItem;
 use crate::application::AppAction;
 use crate::storage::Keybindings;
@@ -241,16 +241,16 @@ fn dynamic_card(item: &DynamicItem) -> Option<VideoCard> {
                 String::new()
             };
             let label = if item.kind() == DynamicKind::Draw {
-                "📷 图片动态"
+                format!("{} 图片", super::icons::PICTURE)
             } else {
-                "📝 图文"
+                format!("{} 图文", super::icons::TEXT)
             };
             VideoCard::new(
                 None,
                 None,
                 format!("{}{count}", item.summary()),
                 author,
-                label.to_string(),
+                label,
                 String::new(),
                 item.cover(),
             )
@@ -260,7 +260,7 @@ fn dynamic_card(item: &DynamicItem) -> Option<VideoCard> {
             None,
             item.summary(),
             author,
-            "📰 专栏".to_string(),
+            format!("{} 专栏", super::icons::ARTICLE),
             String::new(),
             item.cover(),
         ),
@@ -272,11 +272,10 @@ fn dynamic_card(item: &DynamicItem) -> Option<VideoCard> {
                 live.title,
                 author,
                 if live.is_live {
-                    "🔴 直播中"
+                    format!("{} 直播中", super::icons::LIVE)
                 } else {
-                    "📺 直播"
-                }
-                .to_string(),
+                    format!("{} 未开播", super::icons::LIVE)
+                },
                 live.watched.unwrap_or_default(),
                 live.cover,
             )
@@ -293,7 +292,7 @@ fn dynamic_card(item: &DynamicItem) -> Option<VideoCard> {
                 None,
                 format!("{reason} // {orig_text}"),
                 author,
-                "↪ 转发".to_string(),
+                format!("{} 转发", super::icons::FORWARD),
                 String::new(),
                 item.cover(),
             )
@@ -303,7 +302,7 @@ fn dynamic_card(item: &DynamicItem) -> Option<VideoCard> {
             None,
             item.summary(),
             author,
-            "💬 动态".to_string(),
+            format!("{} 动态", super::icons::TEXT),
             String::new(),
             None,
         ),
@@ -386,7 +385,7 @@ impl Component for DynamicPage {
             .constraints([Constraint::Length(2), Constraint::Length(3)])
             .split(chunks[0]);
         let title = Paragraph::new(Line::from(vec![
-            Span::styled(" 📺 ", Style::default()),
+            Span::styled(format!(" {} ", super::icons::DYNAMIC), Style::default()),
             Span::styled(
                 "关注动态",
                 Style::default()
@@ -434,14 +433,14 @@ impl Component for DynamicPage {
 
         if self.loading {
             frame.render_widget(
-                Paragraph::new("⏳ 加载动态中...")
+                Paragraph::new("加载动态中...")
                     .style(Style::default().fg(theme.warning))
                     .alignment(Alignment::Center),
                 chunks[1],
             );
         } else if let Some(error) = &self.error_message {
             frame.render_widget(
-                Paragraph::new(format!("❌ {error}"))
+                Paragraph::new(error.to_string())
                     .style(Style::default().fg(theme.error))
                     .alignment(Alignment::Center),
                 chunks[1],
@@ -458,31 +457,15 @@ impl Component for DynamicPage {
         }
 
         frame.render_widget(
-            Paragraph::new(shortcut_footer(
+            Paragraph::new(super::hint_footer(
                 theme,
                 [
+                    (keys.confirm.clone(), "打开".into(), theme.success),
                     (
-                        format!("{}/{}", keys.nav_up, keys.nav_down),
-                        "选择动态".into(),
+                        format!("{}/{}", keys.tab_1, keys.tab_3),
+                        "标签".into(),
                         theme.fg_accent,
                     ),
-                    (
-                        format!("{}/{}", keys.page_up, keys.page_down),
-                        "翻页".into(),
-                        theme.fg_accent,
-                    ),
-                    (
-                        format!("{}/{}", keys.nav_left, keys.nav_right),
-                        "切换面板".into(),
-                        theme.fg_accent,
-                    ),
-                    (
-                        format!("{}/{}/{}", keys.tab_1, keys.tab_2, keys.tab_3),
-                        "切标签".into(),
-                        theme.info,
-                    ),
-                    (keys.confirm.clone(), "详情".into(), theme.success),
-                    (keys.open_up.clone(), "UP主".into(), theme.info),
                     (keys.refresh.clone(), "刷新".into(), theme.info),
                 ],
             ))
@@ -508,8 +491,45 @@ impl Component for DynamicPage {
             return Some(AppAction::NavPrev);
         }
 
+        // Tabs, UP switching and refresh work from either pane.
+        if keys.matches_tab_1(key) {
+            return Some(AppAction::SwitchDynamicTab(DynamicTab::All));
+        }
+        if keys.matches_tab_2(key) {
+            return Some(AppAction::SwitchDynamicTab(DynamicTab::Videos));
+        }
+        if keys.matches_tab_3(key) {
+            return Some(AppAction::SwitchDynamicTab(DynamicTab::Images));
+        }
+
+        if keys.matches_up_prev(key) {
+            if self.selected_up_index > 0 {
+                return Some(AppAction::SelectUpMaster(self.selected_up_index - 1));
+            }
+            return Some(AppAction::None);
+        }
+        if keys.matches_up_next(key) {
+            if self.selected_up_index < self.up_list.len() {
+                return Some(AppAction::SelectUpMaster(self.selected_up_index + 1));
+            }
+            return Some(AppAction::None);
+        }
+        if keys.matches_refresh(key) {
+            self.loading = true;
+            self.grid.clear();
+            return Some(AppAction::RefreshDynamic);
+        }
+
         if self.focus_up_list {
-            if keys.matches_down(key) {
+            if keys.matches_jump_top(key) {
+                if self.selected_up_index > 0 {
+                    return Some(AppAction::SelectUpMaster(0));
+                }
+            } else if keys.matches_jump_bottom(key) {
+                if self.selected_up_index < self.up_list.len() {
+                    return Some(AppAction::SelectUpMaster(self.up_list.len()));
+                }
+            } else if keys.matches_down(key) {
                 if self.selected_up_index < self.up_list.len() {
                     return Some(AppAction::SelectUpMaster(self.selected_up_index + 1));
                 }
@@ -527,7 +547,17 @@ impl Component for DynamicPage {
             return Some(AppAction::None);
         }
 
-        if keys.matches_left(key) {
+        // In the grid, Left moves until the first column, then opens the UP
+        // list; Esc opens it from anywhere.
+        if keys.matches_left(key) && !self.grid.at_first_column() {
+            self.grid.move_left();
+            return Some(AppAction::None);
+        }
+        if keys.matches_right(key) {
+            self.grid.move_right();
+            return Some(AppAction::None);
+        }
+        if keys.matches_left(key) || keys.matches_back(key) {
             self.focus_up_list = true;
             if self.loading || self.loading_more {
                 self.loading = false;
@@ -539,10 +569,7 @@ impl Component for DynamicPage {
 
         if keys.matches_page_down(key) {
             self.grid.move_page_down();
-            if self.grid.is_near_bottom(self.grid.cached_visible_rows)
-                && !self.loading_more
-                && self.has_more
-            {
+            if self.grid.is_near_bottom() && !self.loading_more && self.has_more {
                 return Some(AppAction::LoadMoreDynamic);
             }
             return Some(AppAction::None);
@@ -554,7 +581,7 @@ impl Component for DynamicPage {
 
         if keys.matches_down(key) {
             self.grid.move_down();
-            if self.grid.is_near_bottom(3) && !self.loading_more && self.has_more {
+            if self.grid.is_near_bottom() && !self.loading_more && self.has_more {
                 return Some(AppAction::LoadMoreDynamic);
             }
             return Some(AppAction::None);
@@ -563,16 +590,16 @@ impl Component for DynamicPage {
             self.grid.move_up();
             return Some(AppAction::None);
         }
-
-        // Direct tab access
-        if keys.matches_tab_1(key) {
-            return Some(AppAction::SwitchDynamicTab(DynamicTab::All));
+        if keys.matches_jump_top(key) {
+            self.grid.move_first();
+            return Some(AppAction::None);
         }
-        if keys.matches_tab_2(key) {
-            return Some(AppAction::SwitchDynamicTab(DynamicTab::Videos));
-        }
-        if keys.matches_tab_3(key) {
-            return Some(AppAction::SwitchDynamicTab(DynamicTab::Images));
+        if keys.matches_jump_bottom(key) || keys.matches_load_more(key) {
+            self.grid.move_last();
+            if !self.loading_more && self.has_more && !self.loading {
+                return Some(AppAction::LoadMoreDynamic);
+            }
+            return Some(AppAction::None);
         }
 
         // Open selected card
@@ -589,13 +616,6 @@ impl Component for DynamicPage {
                     .and_then(open_dynamic_action)
                     .unwrap_or(AppAction::None),
             );
-        }
-
-        // Refresh
-        if keys.matches_refresh(key) {
-            self.loading = true;
-            self.grid.clear();
-            return Some(AppAction::RefreshDynamic);
         }
 
         Some(AppAction::None)
@@ -640,7 +660,7 @@ impl Component for DynamicPage {
         match event.kind {
             MouseEventKind::ScrollDown => {
                 if self.grid.move_down()
-                    && self.grid.is_near_bottom(3)
+                    && self.grid.is_near_bottom()
                     && !self.loading_more
                     && self.has_more
                 {

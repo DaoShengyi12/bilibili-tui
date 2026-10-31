@@ -1,4 +1,4 @@
-use super::{Component, Theme, VideoCard, VideoCardGrid, shortcut_footer};
+use super::{Component, Theme, VideoCard, VideoCardGrid};
 use crate::api::{
     favorite::{FavoriteFolder, FavoriteOrder, FavoriteResourceData},
     space::{RelationStat, SpaceInfo, SpaceVideoData, SpaceVideoOrder},
@@ -237,6 +237,10 @@ impl UpPage {
     }
 }
 
+fn pair_keys(a: &str, b: &str) -> String {
+    format!("{a}/{b}")
+}
+
 impl Component for UpPage {
     fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, keys: &Keybindings) {
         let chunks = Layout::default()
@@ -264,17 +268,20 @@ impl Component for UpPage {
             PlayOrder::Reverse => "倒序播放",
             PlayOrder::Shuffle => "随机播放",
         };
-        let tabs = Tabs::new(vec!["1 投稿", "2 收藏夹"])
-            .select(if self.tab == UpTab::Videos { 0 } else { 1 })
-            .highlight_style(Style::default().fg(theme.bilibili_pink))
-            .block(Block::default().borders(Borders::ALL).title(format!(
-                " {} · {play_order} ",
-                if self.tab == UpTab::Videos {
-                    sort
-                } else {
-                    favorite_sort
-                }
-            )));
+        let tabs = Tabs::new(vec![
+            format!("{} 投稿", keys.tab_1),
+            format!("{} 收藏夹", keys.tab_2),
+        ])
+        .select(if self.tab == UpTab::Videos { 0 } else { 1 })
+        .highlight_style(Style::default().fg(theme.bilibili_pink))
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " {} · {play_order} ",
+            if self.tab == UpTab::Videos {
+                sort
+            } else {
+                favorite_sort
+            }
+        )));
         frame.render_widget(tabs, chunks[1]);
 
         if self.loading {
@@ -310,31 +317,18 @@ impl Component for UpPage {
             );
         }
 
-        let mut shortcuts = vec![
-            ("1/2".into(), "投稿/收藏夹".into(), theme.info),
+        let shortcuts = [
             (
-                format!("{}/{}", keys.page_up, keys.page_down),
-                "翻页".into(),
-                theme.fg_accent,
+                pair_keys(&keys.tab_1, &keys.tab_2),
+                "投稿/收藏夹".into(),
+                theme.info,
             ),
-            (keys.comment_sort.clone(), "排序".into(), theme.info),
-            (keys.play_order.clone(), "顺序/倒序/随机".into(), theme.info),
-            (keys.play.clone(), "连播".into(), theme.success),
             (keys.confirm.clone(), "打开".into(), theme.success),
+            (keys.play.clone(), "连播".into(), theme.success),
             (keys.back.clone(), "返回".into(), theme.info),
         ];
-        if self.is_sidebar_page {
-            shortcuts.insert(
-                0,
-                (
-                    format!("{}/{}", keys.nav_next_page, keys.nav_prev_page),
-                    "切换页面".into(),
-                    theme.info,
-                ),
-            );
-        }
         frame.render_widget(
-            Paragraph::new(shortcut_footer(theme, shortcuts)).alignment(Alignment::Center),
+            Paragraph::new(super::hint_footer(theme, shortcuts)).alignment(Alignment::Center),
             chunks[3],
         );
     }
@@ -414,6 +408,10 @@ impl Component for UpPage {
                 self.folder_selected += 1;
             } else if keys.matches_up(key) && self.folder_selected > 0 {
                 self.folder_selected -= 1;
+            } else if keys.matches_jump_top(key) {
+                self.folder_selected = 0;
+            } else if keys.matches_jump_bottom(key) {
+                self.folder_selected = self.folders.len().saturating_sub(1);
             } else if keys.matches_confirm(key)
                 && let Some(folder) = self.folders.get(self.folder_selected)
             {
@@ -459,7 +457,7 @@ impl Component for UpPage {
         }
         if keys.matches_page_down(key) {
             grid.move_page_down();
-            if grid.is_near_bottom(grid.cached_visible_rows) && !loading_more {
+            if grid.is_near_bottom() && !loading_more {
                 if tab == UpTab::Videos && grid.cards.len() < video_total as usize {
                     return Some(AppAction::LoadMoreUpVideos);
                 }
@@ -473,9 +471,19 @@ impl Component for UpPage {
             grid.move_page_up();
             return Some(AppAction::None);
         }
-        if keys.matches_down(key) {
-            grid.move_down();
-            if grid.is_near_bottom(grid.cached_visible_rows) && !loading_more {
+        if keys.matches_jump_top(key) {
+            grid.move_first();
+            return Some(AppAction::None);
+        }
+        let jump_to_end = keys.matches_jump_bottom(key) || keys.matches_load_more(key);
+        if jump_to_end {
+            grid.move_last();
+        }
+        if keys.matches_down(key) || jump_to_end {
+            if !jump_to_end {
+                grid.move_down();
+            }
+            if grid.is_near_bottom() && !loading_more {
                 if tab == UpTab::Videos && grid.cards.len() < video_total as usize {
                     return Some(AppAction::LoadMoreUpVideos);
                 }

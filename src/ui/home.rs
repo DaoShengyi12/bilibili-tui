@@ -1,6 +1,6 @@
 //! Homepage with video recommendations in a grid layout with cover images
 
-use super::{Component, SearchPage, Theme, shortcut_footer};
+use super::{Component, SearchPage, Theme};
 use crate::api::recommend::HomeFeed;
 use crate::api::recommend::VideoItem;
 use crate::application::AppAction;
@@ -133,14 +133,14 @@ impl HomePage {
 
         if self.loading {
             frame.render_widget(
-                Paragraph::new("⏳ 加载中…")
+                Paragraph::new("加载中…")
                     .style(Style::default().fg(theme.warning))
                     .alignment(Alignment::Center),
                 chunks[1],
             );
         } else if let Some(error) = &self.error_message {
             frame.render_widget(
-                Paragraph::new(format!("❌ {error}"))
+                Paragraph::new(error.to_string())
                     .style(Style::default().fg(theme.error))
                     .alignment(Alignment::Center),
                 chunks[1],
@@ -157,25 +157,10 @@ impl HomePage {
         }
 
         let notice = self.footer_notice.take();
-        let mut help = shortcut_footer(
+        let mut help = super::hint_footer(
             theme,
             [
-                (
-                    format!("{}/{}", keys.nav_up, keys.nav_down),
-                    "选择视频".into(),
-                    theme.fg_accent,
-                ),
-                (
-                    format!("{} / {}", keys.page_up, keys.page_down),
-                    "翻页".into(),
-                    theme.fg_accent,
-                ),
-                (
-                    format!("{}/{}", keys.nav_left, keys.nav_right),
-                    "切换面板".into(),
-                    theme.fg_accent,
-                ),
-                (keys.confirm.clone(), "播放".into(), theme.success),
+                (keys.confirm.clone(), "打开".into(), theme.success),
                 (keys.search_focus.clone(), "搜索".into(), theme.info),
                 (keys.refresh.clone(), "刷新".into(), theme.info),
             ],
@@ -195,6 +180,8 @@ impl HomePage {
     const DEFAULT_COLUMNS: usize = 1;
     /// 卡片高度
     const CARD_HEIGHT: u16 = 8;
+    /// 卡片最小宽度，宽屏时据此排成多列
+    const MIN_CARD_WIDTH: u16 = 64;
     /// 预取缓冲行数（可见区域之外额外下载）
     const PREFETCH_BUFFER_ROWS: usize = 2;
     /// 初始可见行数回退值（首次渲染前使用）
@@ -411,6 +398,22 @@ impl HomePage {
         }
     }
 
+    /// Select `index`, clamped to the loaded cards, and scroll to it.
+    fn select_index(&mut self, index: usize) {
+        if let Some(last) = self.videos.len().checked_sub(1) {
+            self.selected_index = index.min(last);
+            self.update_scroll(self.cached_visible_rows.max(1));
+        }
+    }
+
+    /// Whether Left from the content should move the focus to the menu.
+    fn left_reaches_menu(&self) -> bool {
+        if self.selected_source == 0 {
+            return self.search.show_hot_list || self.search.grid.at_first_column();
+        }
+        self.selected_index.is_multiple_of(self.columns.max(1))
+    }
+
     fn move_page(&mut self, down: bool) -> bool {
         let Some(last_index) = self.videos.len().checked_sub(1) else {
             return false;
@@ -472,7 +475,7 @@ impl HomePage {
 
     fn source_label(&self, index: usize) -> String {
         if index == 0 {
-            "🔍 搜索".to_string()
+            format!("{} 搜索", super::icons::SEARCH)
         } else {
             HomeFeed::ALL[index - 1].label().to_string()
         }
@@ -480,6 +483,17 @@ impl HomePage {
 
     fn source_feed(&self, index: usize) -> Option<HomeFeed> {
         (index > 0).then(|| HomeFeed::ALL[index - 1])
+    }
+
+    /// The action that shows the selected source without leaving the menu:
+    /// a feed loads, the search pane appears unfocused.
+    fn show_selected_source(&mut self) -> AppAction {
+        match self.source_feed(self.selected_source) {
+            Some(feed) if feed != self.feed || self.needs_reload() => {
+                AppAction::SwitchHomeFeed(feed)
+            }
+            _ => AppAction::None,
+        }
     }
 
     pub fn begin_feed_load(&mut self, feed: HomeFeed) {
@@ -558,14 +572,16 @@ impl Component for HomePage {
             return Some(AppAction::NavPrev);
         }
         if self.focus_sources {
-            if keys.matches_down(key) {
-                self.selected_source = (self.selected_source + 1) % self.source_count();
-            } else if keys.matches_up(key) {
-                self.selected_source = if self.selected_source == 0 {
-                    self.source_count() - 1
+            if keys.matches_down(key) || keys.matches_up(key) {
+                let count = self.source_count();
+                self.selected_source = if keys.matches_down(key) {
+                    (self.selected_source + 1) % count
                 } else {
-                    self.selected_source - 1
+                    (self.selected_source + count - 1) % count
                 };
+                // Moving through the menu shows each source at once; the
+                // focus stays in the menu so the next key keeps moving.
+                return Some(self.show_selected_source());
             } else if keys.matches_right(key) || keys.matches_confirm(key) {
                 if self.selected_source == 0 {
                     self.begin_search();
@@ -583,7 +599,20 @@ impl Component for HomePage {
             return Some(AppAction::None);
         }
 
-        if keys.matches_left(key) {
+        // Left moves through the grid and hands the focus to the menu from
+        // the first column; Esc returns to the menu from anywhere.
+        let to_menu =
+            keys.matches_back(key) || (keys.matches_left(key) && self.left_reaches_menu());
+        if !to_menu && keys.matches_left(key) {
+            if self.selected_source == 0 {
+                return self.search.handle_input(key, keys);
+            }
+            if self.selected_index > 0 {
+                self.select_index(self.selected_index - 1);
+            }
+            return Some(AppAction::None);
+        }
+        if to_menu {
             self.focus_sources = true;
             if self.selected_source == 0 || self.loading || self.loading_more {
                 self.loading = false;
@@ -595,7 +624,29 @@ impl Component for HomePage {
         if self.selected_source == 0 {
             return self.search.handle_input(key, keys);
         }
+        // Settings stay reachable while a feed loads.
+        if keys.matches_open_settings(key) {
+            return Some(AppAction::SwitchToSettings);
+        }
+        if keys.matches_next_theme(key) {
+            return Some(AppAction::NextTheme);
+        }
         if self.loading {
+            return Some(AppAction::None);
+        }
+        if keys.matches_jump_top(key) {
+            self.select_index(0);
+            return Some(AppAction::None);
+        }
+        if keys.matches_jump_bottom(key) || keys.matches_load_more(key) {
+            self.select_index(usize::MAX);
+            if self.is_near_bottom(self.cached_visible_rows) && !self.loading_more {
+                return Some(AppAction::LoadMoreRecommendations);
+            }
+            return Some(AppAction::None);
+        }
+        if keys.matches_right(key) {
+            self.select_index(self.selected_index + 1);
             return Some(AppAction::None);
         }
         if keys.matches_page_down(key) {
@@ -611,11 +662,11 @@ impl Component for HomePage {
         }
         if keys.matches_down(key) {
             if !self.videos.is_empty() {
-                let new_idx = self.selected_index + self.columns;
-                if new_idx < self.videos.len() {
-                    self.selected_index = new_idx;
+                // From the row above a short last row, land on the last card.
+                let columns = self.columns.max(1);
+                if self.selected_index / columns < (self.videos.len() - 1) / columns {
+                    self.select_index(self.selected_index + columns);
                 }
-                self.update_scroll(self.cached_visible_rows);
                 if self.is_near_bottom(self.cached_visible_rows) && !self.loading_more {
                     return Some(AppAction::LoadMoreRecommendations);
                 }
@@ -674,13 +725,12 @@ impl Component for HomePage {
             match event.kind {
                 MouseEventKind::ScrollDown => {
                     self.selected_source = (self.selected_source + 1) % self.source_count();
+                    return Some(self.show_selected_source());
                 }
                 MouseEventKind::ScrollUp => {
-                    self.selected_source = if self.selected_source == 0 {
-                        self.source_count() - 1
-                    } else {
-                        self.selected_source - 1
-                    };
+                    let count = self.source_count();
+                    self.selected_source = (self.selected_source + count - 1) % count;
+                    return Some(self.show_selected_source());
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
                     let row = event.row.saturating_sub(panes[0].y + 1) as usize;
@@ -688,10 +738,8 @@ impl Component for HomePage {
                         self.selected_source = row;
                         if row == 0 {
                             self.begin_search();
-                        } else if let Some(feed) = self.source_feed(row)
-                            && feed != self.feed
-                        {
-                            return Some(AppAction::SwitchHomeFeed(feed));
+                        } else {
+                            return Some(self.show_selected_source());
                         }
                     }
                 }
@@ -778,8 +826,14 @@ impl Component for HomePage {
 
 impl HomePage {
     fn render_grid(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let columns = super::video_card::columns_for_width(area.width, Self::MIN_CARD_WIDTH);
+        if columns != self.columns {
+            self.columns = columns;
+            self.scroll_row = self.selected_row();
+        }
         let visible_rows = self.visible_rows(area.height);
         self.cached_visible_rows = visible_rows;
+        self.update_scroll(visible_rows);
 
         let row_constraints: Vec<Constraint> = (0..visible_rows)
             .map(|_| Constraint::Min(self.card_height))
@@ -881,9 +935,14 @@ impl HomePage {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        let cover_width = (inner.height * 7 / 2).min(inner.width / 2);
         let card_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .constraints([
+                Constraint::Length(cover_width),
+                Constraint::Length(1),
+                Constraint::Min(20),
+            ])
             .split(inner);
 
         // Cover area - render with StatefulImage
@@ -896,9 +955,11 @@ impl HomePage {
             // Loading placeholder with spinner animation hint
             let is_pending = self.pending_downloads.contains(&video_idx);
             let placeholder_text = if is_pending {
-                "📺 加载中..."
+                "…"
+            } else if self.videos[video_idx].cover_failed {
+                "无封面"
             } else {
-                "📺"
+                ""
             };
             let placeholder = Paragraph::new(placeholder_text)
                 .style(Style::default().fg(theme.fg_secondary))
@@ -907,7 +968,7 @@ impl HomePage {
         }
 
         // Video info with enhanced styling
-        let info_area = card_chunks[1];
+        let info_area = card_chunks[2];
         let card = &self.videos[video_idx];
 
         let title = card.video.title.as_deref().unwrap_or("无标题");
@@ -915,8 +976,9 @@ impl HomePage {
         let views = card.video.format_views();
         let duration = card.video.format_duration();
 
-        let max_title_width = (info_area.width as usize).saturating_sub(2);
-        let display_title = super::text::truncate_to_width(title, max_title_width, "...");
+        let title_lines = usize::from(info_area.height.saturating_sub(2)).max(1);
+        let display_title =
+            super::video_card::clamp_lines(title, usize::from(info_area.width), title_lines);
 
         // Multi-styled info text
         let title_style = if is_selected {
@@ -950,22 +1012,23 @@ impl HomePage {
             .and_then(|stat| stat.reply)
             .map(format_count)
             .unwrap_or_else(|| "-".to_string());
-        let info_text = Text::from(vec![
-            Line::from(Span::styled(&display_title, title_style)),
-            Line::from(vec![
-                Span::styled("UP  ", meta_style),
-                Span::styled(author, Style::default().fg(theme.bilibili_cyan)),
-                Span::styled(format!("  ·  {follower} 关注"), meta_style),
-            ]),
-            Line::from(vec![
-                Span::styled(format!("▶ {views}"), meta_style),
-                Span::styled(format!("   弹幕 {danmaku}"), meta_style),
-                Span::styled(format!("   评论 {replies}"), meta_style),
-                Span::styled(format!("   {duration}"), Style::default().fg(theme.success)),
-            ]),
-        ]);
+        let mut lines: Vec<Line> = display_title
+            .into_iter()
+            .map(|line| Line::styled(line, title_style))
+            .collect();
+        lines.resize(title_lines, Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled(author, Style::default().fg(theme.bilibili_cyan)),
+            Span::styled(format!("  {follower} 粉丝"), meta_style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} {views}", super::icons::PLAY), meta_style),
+            Span::styled(format!("  {} {danmaku}", super::icons::DANMAKU), meta_style),
+            Span::styled(format!("  {} {replies}", super::icons::COMMENT), meta_style),
+            Span::styled(format!("  {duration}"), Style::default().fg(theme.success)),
+        ]));
 
-        let info = Paragraph::new(info_text).wrap(Wrap { trim: true });
+        let info = Paragraph::new(lines);
         frame.render_widget(info, info_area);
     }
 }
@@ -1005,6 +1068,44 @@ mod tests {
         });
         assert!(!page.pending_downloads.contains(&0));
         assert!(page.videos[0].cover_failed);
+    }
+
+    #[test]
+    fn keyboard_reaches_every_card_of_a_multi_column_feed() {
+        let mut page = HomePage::new();
+        let videos = (1..=10)
+            .map(|id| {
+                serde_json::from_value(serde_json::json!({"id": id, "bvid": format!("BV{id}")}))
+                    .unwrap()
+            })
+            .collect();
+        page.apply_recommendations(page.feed(), videos);
+        page.focus_sources = false;
+        page.columns = 3;
+        page.cached_visible_rows = 10;
+        let keys = Keybindings::default();
+
+        page.handle_input(KeyCode::Right, &keys);
+        assert_eq!(page.selected_index, 1);
+        page.handle_input(KeyCode::Left, &keys);
+        assert_eq!(page.selected_index, 0);
+        assert!(!page.focus_sources);
+        page.handle_input(KeyCode::Left, &keys);
+        assert!(
+            page.focus_sources,
+            "Left from the first column opens the menu"
+        );
+
+        page.focus_sources = false;
+        page.selected_index = 7;
+        page.handle_input(KeyCode::Down, &keys);
+        assert_eq!(page.selected_index, 9, "Down lands on the short last row");
+        page.handle_input(KeyCode::Home, &keys);
+        assert_eq!(page.selected_index, 0);
+        page.handle_input(KeyCode::Char('G'), &keys);
+        assert_eq!(page.selected_index, 9);
+        page.handle_input(KeyCode::Esc, &keys);
+        assert!(page.focus_sources, "Esc returns to the menu");
     }
 
     #[test]
