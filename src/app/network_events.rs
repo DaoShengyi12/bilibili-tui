@@ -248,7 +248,11 @@ impl App {
                             video.format_duration(),
                             video.cover_url(),
                         )
-                        .with_uploader_mid(video.owner.as_ref().and_then(|owner| owner.mid));
+                        .with_uploader_mid(video.owner.as_ref().and_then(|owner| owner.mid))
+                        .with_count_values(
+                            video.stat.as_ref().and_then(|stat| stat.danmaku),
+                            video.stat.as_ref().and_then(|stat| stat.reply),
+                        );
                         page.related_card_grid.add_card(card);
                     }
                     page.loading = false;

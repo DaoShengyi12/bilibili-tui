@@ -1,6 +1,6 @@
 //! Favorite-folder and favorite-resource API models.
 
-use super::serde_util::null_as_default;
+use super::serde_util::{lenient_optional_i64, null_as_default};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +44,28 @@ impl FavoriteOrder {
 
 #[cfg(test)]
 mod tests {
-    use super::FavoriteOrder;
+    use super::{FavoriteCountInfo, FavoriteOrder, SeasonStat, WatchLaterStat};
+
+    #[test]
+    fn card_counts_accept_numbers_strings_null_and_absence() {
+        let info: FavoriteCountInfo = serde_json::from_value(serde_json::json!({
+            "play": 1, "danmaku": 2, "collect": 3, "reply": "45"
+        }))
+        .unwrap();
+        assert_eq!(info.reply, Some(45));
+        let info: FavoriteCountInfo =
+            serde_json::from_value(serde_json::json!({"play": 1})).unwrap();
+        assert_eq!(info.reply, None);
+        let stat: SeasonStat =
+            serde_json::from_value(serde_json::json!({"view": 1, "danmaku": null, "reply": 6}))
+                .unwrap();
+        assert_eq!((stat.danmaku, stat.reply), (None, Some(6)));
+        let stat: WatchLaterStat = serde_json::from_value(
+            serde_json::json!({"view": 1, "danmaku": 7, "reply": {"unexpected": true}}),
+        )
+        .unwrap();
+        assert_eq!((stat.danmaku, stat.reply), (Some(7), None));
+    }
 
     #[test]
     fn favorite_sort_matches_web_query_values() {
@@ -142,6 +163,8 @@ pub struct FavoriteCountInfo {
     pub play: Option<i64>,
     pub danmaku: Option<i64>,
     pub collect: Option<i64>,
+    #[serde(default, deserialize_with = "lenient_optional_i64")]
+    pub reply: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -165,6 +188,10 @@ pub struct WatchLaterItem {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WatchLaterStat {
     pub view: Option<i64>,
+    #[serde(default, deserialize_with = "lenient_optional_i64")]
+    pub danmaku: Option<i64>,
+    #[serde(default, deserialize_with = "lenient_optional_i64")]
+    pub reply: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -204,6 +231,10 @@ pub struct SeasonArchive {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SeasonStat {
     pub view: Option<i64>,
+    #[serde(default, deserialize_with = "lenient_optional_i64")]
+    pub danmaku: Option<i64>,
+    #[serde(default, deserialize_with = "lenient_optional_i64")]
+    pub reply: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

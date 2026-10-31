@@ -220,15 +220,20 @@ fn dynamic_card(item: &DynamicItem) -> Option<VideoCard> {
     use crate::api::dynamic::DynamicKind;
     let author = item.author_name().to_string();
     let card = match item.kind() {
-        DynamicKind::Video => VideoCard::new(
-            Some(item.video_bvid()?.to_string()),
-            None,
-            item.summary(),
-            author,
-            format!("▶ {}", item.video_play()),
-            item.video_duration().to_string(),
-            item.cover(),
-        ),
+        DynamicKind::Video => {
+            let danmaku = Some(item.video_danmaku().to_string());
+            let replies = item.comment_count().map(super::video_card::format_count);
+            VideoCard::new(
+                Some(item.video_bvid()?.to_string()),
+                None,
+                item.summary(),
+                author,
+                item.video_play().to_string(),
+                item.video_duration().to_string(),
+                item.cover(),
+            )
+            .with_counts(danmaku, replies)
+        }
         DynamicKind::Draw | DynamicKind::Opus => {
             let images = if item.kind() == DynamicKind::Draw {
                 item.draw_images().len()
@@ -337,10 +342,13 @@ impl Default for DynamicPage {
 
 impl DynamicPage {
     fn draw_up_list(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        // Borders, the highlight symbol and the update marker take six columns.
+        let name_width = usize::from(area.width.saturating_sub(6));
         let mut items = vec![ListItem::new("全部")];
         items.extend(self.up_list.iter().map(|user| {
             let marker = if user.has_update { "● " } else { "  " };
-            ListItem::new(format!("{marker}{}", user.uname))
+            let name = super::text::truncate_to_width(&user.uname, name_width, "…");
+            ListItem::new(format!("{marker}{name}"))
         }));
         let list = List::new(items)
             .block(
@@ -368,7 +376,10 @@ impl Component for DynamicPage {
     fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, keys: &Keybindings) {
         let panes = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .constraints([
+                Constraint::Length(super::video_card::MENU_PANE_WIDTH),
+                Constraint::Min(30),
+            ])
             .split(area);
         self.draw_up_list(frame, panes[0], theme);
 
@@ -625,7 +636,10 @@ impl Component for DynamicPage {
         use crossterm::event::MouseEventKind;
         let panes = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .constraints([
+                Constraint::Length(super::video_card::MENU_PANE_WIDTH),
+                Constraint::Min(30),
+            ])
             .split(area);
         let position = ratatui::layout::Position::new(event.column, event.row);
 

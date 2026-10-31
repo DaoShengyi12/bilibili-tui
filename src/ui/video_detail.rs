@@ -67,8 +67,7 @@ pub struct VideoDetailPage {
 
 impl VideoDetailPage {
     pub fn new(bvid: String, aid: i64) -> Self {
-        let mut related_card_grid = VideoCardGrid::new_list();
-        related_card_grid.card_height = 6;
+        let related_card_grid = VideoCardGrid::new_list();
 
         Self {
             bvid,
@@ -522,6 +521,15 @@ impl VideoDetailPage {
         }
     }
 
+    /// Comments on the left, related videos on the right. The right column
+    /// takes 40% of the page but no more than one home feed card, so a wide
+    /// screen gives the extra room to comments instead of stretching cards.
+    fn content_columns(area: Rect) -> [Rect; 2] {
+        let related_width = (area.width.saturating_mul(2) / 5)
+            .min(super::video_card::list_card_width(area.width).saturating_add(2));
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(related_width)]).areas(area)
+    }
+
     fn render_comments(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let focused = self.focus == DetailFocus::Comments;
         self.comments.render(frame, area, focused, theme);
@@ -717,9 +725,7 @@ impl Component for VideoDetailPage {
             frame.render_widget(error_widget, chunks[1]);
         } else if !self.recommendations_enabled {
             if self.has_multiple_pages() {
-                let content =
-                    Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-                        .split(chunks[1]);
+                let content = Self::content_columns(chunks[1]);
                 self.render_comments(frame, content[0], theme);
                 self.render_episodes(frame, content[1], theme);
             } else {
@@ -727,13 +733,7 @@ impl Component for VideoDetailPage {
             }
         } else {
             // Comments and Related split
-            let content_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(60), // Comments
-                    Constraint::Percentage(40), // Related + Episodes
-                ])
-                .split(chunks[1]);
+            let content_chunks = Self::content_columns(chunks[1]);
 
             self.render_comments(frame, content_chunks[0], theme);
 
@@ -1080,10 +1080,7 @@ impl Component for VideoDetailPage {
                     return None;
                 }
 
-                let content_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                    .split(chunks[1]);
+                let content_chunks = Self::content_columns(chunks[1]);
 
                 if !self.recommendations_enabled {
                     return None;
@@ -1422,5 +1419,26 @@ mod minimal_mode_tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(!content.contains("相关推荐"));
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn related_column_is_no_wider_than_a_home_feed_card_on_wide_screens() {
+        let wide = Rect::new(0, 0, 240, 50);
+        let [comments, related] = VideoDetailPage::content_columns(wide);
+        assert_eq!(
+            related.width,
+            super::super::video_card::list_card_width(240) + 2
+        );
+        assert!(related.width < 240 * 2 / 5);
+        assert_eq!(comments.width + related.width, 240);
+
+        let narrow = Rect::new(0, 0, 120, 40);
+        let [_, related] = VideoDetailPage::content_columns(narrow);
+        assert_eq!(related.width, 48, "narrow screens keep the 40% column");
     }
 }

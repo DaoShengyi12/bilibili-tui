@@ -1,5 +1,6 @@
 //! Homepage with video recommendations in a grid layout with cover images
 
+use super::video_card::format_count;
 use super::{Component, SearchPage, Theme};
 use crate::api::recommend::HomeFeed;
 use crate::api::recommend::VideoItem;
@@ -11,7 +12,7 @@ use ratatui::{
     prelude::*,
     widgets::*,
 };
-use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -179,9 +180,9 @@ impl HomePage {
     /// 默认列数
     const DEFAULT_COLUMNS: usize = 1;
     /// 卡片高度
-    const CARD_HEIGHT: u16 = 8;
+    const CARD_HEIGHT: u16 = super::video_card::LIST_CARD_HEIGHT;
     /// 卡片最小宽度，宽屏时据此排成多列
-    const MIN_CARD_WIDTH: u16 = 64;
+    const MIN_CARD_WIDTH: u16 = super::video_card::LIST_CARD_MIN_WIDTH;
     /// 预取缓冲行数（可见区域之外额外下载）
     const PREFETCH_BUFFER_ROWS: usize = 2;
     /// 初始可见行数回退值（首次渲染前使用）
@@ -521,7 +522,10 @@ impl Component for HomePage {
     fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, keys: &Keybindings) {
         let panes = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .constraints([
+                Constraint::Length(super::video_card::MENU_PANE_WIDTH),
+                Constraint::Min(30),
+            ])
             .split(area);
         self.draw_sources(frame, panes[0], theme);
 
@@ -716,7 +720,10 @@ impl Component for HomePage {
     fn handle_mouse(&mut self, event: MouseEvent, area: Rect) -> Option<AppAction> {
         let panes = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .constraints([
+                Constraint::Length(super::video_card::MENU_PANE_WIDTH),
+                Constraint::Min(30),
+            ])
             .split(area);
         let position = ratatui::layout::Position::new(event.column, event.row);
 
@@ -836,7 +843,7 @@ impl HomePage {
         self.update_scroll(visible_rows);
 
         let row_constraints: Vec<Constraint> = (0..visible_rows)
-            .map(|_| Constraint::Min(self.card_height))
+            .map(|_| Constraint::Length(self.card_height))
             .collect();
 
         let rows = Layout::default()
@@ -900,144 +907,38 @@ impl HomePage {
         is_selected: bool,
         theme: &Theme,
     ) {
-        // Enhanced border styling
-        let (border_style, border_type) = if is_selected {
-            (
-                Style::default()
-                    .fg(theme.border_focused)
-                    .add_modifier(Modifier::BOLD),
-                BorderType::Rounded,
-            )
+        let placeholder = if self.pending_downloads.contains(&video_idx) {
+            "…"
+        } else if self.videos[video_idx].cover_failed {
+            "无封面"
         } else {
-            (
-                Style::default().fg(theme.border_unfocused),
-                BorderType::Rounded,
-            )
+            ""
         };
-
-        let title_span = if is_selected {
-            Span::styled(
-                " ▶ ",
-                Style::default()
-                    .fg(theme.fg_accent)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::raw("")
+        let card = &mut self.videos[video_idx];
+        let video = &card.video;
+        let count = |value: Option<i64>| value.map_or_else(|| "-".to_string(), format_count);
+        let follower = count(video.owner.as_ref().and_then(|owner| owner.follower));
+        let danmaku = count(video.stat.as_ref().and_then(|stat| stat.danmaku));
+        let replies = count(video.stat.as_ref().and_then(|stat| stat.reply));
+        let views = video.format_views();
+        let duration = video.format_duration();
+        let content = super::video_card::CardContent {
+            title: video.title.as_deref().unwrap_or("无标题"),
+            author: video.author_name(),
+            follower: Some(&follower),
+            views: &views,
+            counts: Some((&danmaku, &replies)),
+            duration: &duration,
         };
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(border_type)
-            .border_style(border_style)
-            .title(title_span);
-
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        let cover_width = (inner.height * 7 / 2).min(inner.width / 2);
-        let card_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(cover_width),
-                Constraint::Length(1),
-                Constraint::Min(20),
-            ])
-            .split(inner);
-
-        // Cover area - render with StatefulImage
-        let cover_area = card_chunks[0];
-        if let Some(cover) = &mut self.videos[video_idx].cover {
-            // Render actual image using StatefulImage
-            let image_widget = StatefulImage::new();
-            frame.render_stateful_widget(image_widget, cover_area, cover);
-        } else {
-            // Loading placeholder with spinner animation hint
-            let is_pending = self.pending_downloads.contains(&video_idx);
-            let placeholder_text = if is_pending {
-                "…"
-            } else if self.videos[video_idx].cover_failed {
-                "无封面"
-            } else {
-                ""
-            };
-            let placeholder = Paragraph::new(placeholder_text)
-                .style(Style::default().fg(theme.fg_secondary))
-                .alignment(Alignment::Center);
-            frame.render_widget(placeholder, cover_area);
-        }
-
-        // Video info with enhanced styling
-        let info_area = card_chunks[2];
-        let card = &self.videos[video_idx];
-
-        let title = card.video.title.as_deref().unwrap_or("无标题");
-        let author = card.video.author_name();
-        let views = card.video.format_views();
-        let duration = card.video.format_duration();
-
-        let title_lines = usize::from(info_area.height.saturating_sub(2)).max(1);
-        let display_title =
-            super::video_card::clamp_lines(title, usize::from(info_area.width), title_lines);
-
-        // Multi-styled info text
-        let title_style = if is_selected {
-            Style::default()
-                .fg(theme.fg_primary)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.fg_secondary)
-        };
-
-        let meta_style = Style::default().fg(theme.fg_secondary);
-
-        let follower = card
-            .video
-            .owner
-            .as_ref()
-            .and_then(|owner| owner.follower)
-            .map(format_count)
-            .unwrap_or_else(|| "-".to_string());
-        let danmaku = card
-            .video
-            .stat
-            .as_ref()
-            .and_then(|stat| stat.danmaku)
-            .map(format_count)
-            .unwrap_or_else(|| "-".to_string());
-        let replies = card
-            .video
-            .stat
-            .as_ref()
-            .and_then(|stat| stat.reply)
-            .map(format_count)
-            .unwrap_or_else(|| "-".to_string());
-        let mut lines: Vec<Line> = display_title
-            .into_iter()
-            .map(|line| Line::styled(line, title_style))
-            .collect();
-        lines.resize(title_lines, Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled(author, Style::default().fg(theme.bilibili_cyan)),
-            Span::styled(format!("  {follower} 粉丝"), meta_style),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled(format!("{} {views}", super::icons::PLAY), meta_style),
-            Span::styled(format!("  {} {danmaku}", super::icons::DANMAKU), meta_style),
-            Span::styled(format!("  {} {replies}", super::icons::COMMENT), meta_style),
-            Span::styled(format!("  {duration}"), Style::default().fg(theme.success)),
-        ]));
-
-        let info = Paragraph::new(lines);
-        frame.render_widget(info, info_area);
-    }
-}
-
-fn format_count(value: i64) -> String {
-    if value >= 10_000 {
-        format!("{:.1}万", value as f64 / 10_000.0)
-    } else {
-        value.to_string()
+        super::video_card::render_wide_card(
+            frame,
+            area,
+            card.cover.as_mut(),
+            placeholder,
+            &content,
+            is_selected,
+            theme,
+        );
     }
 }
 

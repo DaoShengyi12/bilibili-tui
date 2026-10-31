@@ -1,3 +1,4 @@
+use super::video_card::format_count;
 use super::{Component, Theme, VideoCard, VideoCardGrid};
 use crate::api::favorite::{
     CollectedFolder, FavoriteFolder, FavoriteResourceData, FavoriteSource, SeasonArchivesData,
@@ -132,9 +133,12 @@ impl FavoritesPage {
             let uploader_mid = item.owner.as_ref().map(|owner| owner.mid);
             let views = item
                 .stat
+                .as_ref()
                 .and_then(|stat| stat.view)
                 .map(format_count)
                 .unwrap_or_else(|| "-".to_string());
+            let danmaku = item.stat.as_ref().and_then(|stat| stat.danmaku);
+            let replies = item.stat.as_ref().and_then(|stat| stat.reply);
             self.videos.add_card(
                 VideoCard::new(
                     Some(item.bvid),
@@ -145,7 +149,8 @@ impl FavoritesPage {
                     format_duration(item.duration.unwrap_or_default()),
                     item.pic,
                 )
-                .with_uploader_mid(uploader_mid),
+                .with_uploader_mid(uploader_mid)
+                .with_count_values(danmaku, replies),
             );
         }
     }
@@ -175,9 +180,12 @@ impl FavoritesPage {
             let uploader_mid = item.upper.as_ref().map(|upper| upper.mid);
             let views = item
                 .cnt_info
+                .as_ref()
                 .and_then(|count| count.play)
                 .map(format_count)
                 .unwrap_or_else(|| "-".to_string());
+            let danmaku = item.cnt_info.as_ref().and_then(|count| count.danmaku);
+            let replies = item.cnt_info.as_ref().and_then(|count| count.reply);
             self.videos.add_card(
                 VideoCard::new(
                     Some(bvid),
@@ -188,7 +196,8 @@ impl FavoritesPage {
                     format_duration(item.duration.unwrap_or_default()),
                     item.cover,
                 )
-                .with_uploader_mid(uploader_mid),
+                .with_uploader_mid(uploader_mid)
+                .with_count_values(danmaku, replies),
             );
         }
         self.finish_load();
@@ -209,18 +218,24 @@ impl FavoritesPage {
         for item in data.archives {
             let views = item
                 .stat
+                .as_ref()
                 .and_then(|stat| stat.view)
                 .map(format_count)
                 .unwrap_or_else(|| "-".to_string());
-            self.videos.add_card(VideoCard::new(
-                Some(item.bvid),
-                Some(item.aid),
-                item.title,
-                author.clone(),
-                views,
-                format_duration(item.duration.unwrap_or_default()),
-                item.pic,
-            ));
+            let danmaku = item.stat.as_ref().and_then(|stat| stat.danmaku);
+            let replies = item.stat.as_ref().and_then(|stat| stat.reply);
+            self.videos.add_card(
+                VideoCard::new(
+                    Some(item.bvid),
+                    Some(item.aid),
+                    item.title,
+                    author.clone(),
+                    views,
+                    format_duration(item.duration.unwrap_or_default()),
+                    item.pic,
+                )
+                .with_count_values(danmaku, replies),
+            );
         }
         self.finish_load();
     }
@@ -275,7 +290,10 @@ impl Component for FavoritesPage {
     fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, keys: &Keybindings) {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .constraints([
+                Constraint::Length(super::video_card::MENU_PANE_WIDTH),
+                Constraint::Min(30),
+            ])
             .split(area);
         let mut items = vec![
             ListItem::new("其他收藏").style(
@@ -292,11 +310,13 @@ impl Component for FavoritesPage {
                     .add_modifier(Modifier::BOLD),
             ),
         );
+        // Borders and the highlight symbol take four columns.
+        let label_width = usize::from(chunks[0].width.saturating_sub(4));
         items.extend(self.created.iter().map(|folder| {
-            ListItem::new(format!(
-                "  {}  ({})",
-                folder.title,
-                folder.media_count.unwrap_or_default()
+            ListItem::new(folder_label(
+                &folder.title,
+                folder.media_count.unwrap_or_default(),
+                label_width,
             ))
         }));
         items.push(
@@ -307,10 +327,10 @@ impl Component for FavoritesPage {
             ),
         );
         items.extend(self.collected.iter().map(|folder| {
-            ListItem::new(format!(
-                "  {}  ({})",
-                folder.title,
-                folder.media_count.unwrap_or_default()
+            ListItem::new(folder_label(
+                &folder.title,
+                folder.media_count.unwrap_or_default(),
+                label_width,
             ))
         }));
         let state_index = if self.selected_source == 0 {
@@ -483,7 +503,10 @@ impl Component for FavoritesPage {
         let position = Position::new(event.column, event.row);
         let panes = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .constraints([
+                Constraint::Length(super::video_card::MENU_PANE_WIDTH),
+                Constraint::Min(30),
+            ])
             .split(area);
         let video_parts = Layout::default()
             .direction(Direction::Vertical)
@@ -560,21 +583,34 @@ impl Component for FavoritesPage {
     }
 }
 
-fn format_count(value: i64) -> String {
-    if value >= 10_000 {
-        format!("{:.1}万", value as f64 / 10_000.0)
-    } else {
-        value.to_string()
-    }
-}
-
 fn format_duration(seconds: i64) -> String {
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// A folder entry that fits in `width` columns. A long title is cut with
+/// "…" so the item count stays visible.
+fn folder_label(title: &str, count: impl std::fmt::Display, width: usize) -> String {
+    let count = format!("  ({count})");
+    let title_width = width
+        .saturating_sub(2)
+        .saturating_sub(super::text::display_width(&count));
+    format!(
+        "  {}{count}",
+        super::text::truncate_to_width(title, title_width, "…")
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_folder_titles_are_cut_and_keep_the_item_count() {
+        let label = folder_label("一个名字特别特别特别长的收藏夹标题", 1234, 28);
+        assert!(super::super::text::display_width(&label) <= 28);
+        assert!(label.ends_with("…  (1234)"), "{label}");
+        assert_eq!(folder_label("默认收藏夹", 5, 28), "  默认收藏夹  (5)");
+    }
 
     #[test]
     fn items_without_bvid_do_not_make_paging_request_empty_pages() {

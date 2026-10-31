@@ -70,6 +70,35 @@ mod tests {
     use serde::Deserialize;
 
     #[test]
+    fn video_dynamic_comment_count_tolerates_drift() {
+        let item = |stat: serde_json::Value| -> DynamicItem {
+            serde_json::from_value(serde_json::json!({
+                "id_str": "1",
+                "type": "DYNAMIC_TYPE_AV",
+                "modules": {"module_stat": stat}
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            item(serde_json::json!({"comment": {"count": 12}})).comment_count(),
+            Some(12)
+        );
+        assert_eq!(
+            item(serde_json::json!({"comment": {"count": "34"}})).comment_count(),
+            Some(34)
+        );
+        assert_eq!(
+            item(serde_json::json!({"comment": {"count": null}})).comment_count(),
+            None
+        );
+        assert_eq!(
+            item(serde_json::json!({"comment": {"count": "x"}})).comment_count(),
+            None
+        );
+        assert_eq!(item(serde_json::json!(null)).comment_count(), None);
+    }
+
+    #[test]
     fn video_and_opus_dynamics_comment_on_basic_comment_target() {
         let video: DynamicItem = serde_json::from_value(serde_json::json!({
             "id_str": "1262563193572556921",
@@ -344,6 +373,21 @@ pub struct DynamicBasic {
 pub struct DynamicModules {
     pub module_author: Option<ModuleAuthor>,
     pub module_dynamic: Option<ModuleDynamic>,
+    #[serde(default)]
+    pub module_stat: Option<ModuleStat>,
+}
+
+/// Interaction counts under a dynamic.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModuleStat {
+    #[serde(default)]
+    pub comment: Option<StatCount>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatCount {
+    #[serde(default, deserialize_with = "super::serde_util::lenient_optional_i64")]
+    pub count: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -702,6 +746,15 @@ impl DynamicItem {
             .and_then(|a| a.stat.as_ref())
             .and_then(|s| s.danmaku.as_deref())
             .unwrap_or("-")
+    }
+
+    /// Comments under the dynamic; for a video dynamic, the video's replies.
+    pub fn comment_count(&self) -> Option<i64> {
+        self.modules
+            .as_ref()
+            .and_then(|m| m.module_stat.as_ref())
+            .and_then(|s| s.comment.as_ref())
+            .and_then(|c| c.count)
     }
 
     pub fn video_duration(&self) -> &str {

@@ -67,6 +67,8 @@ pub struct RelatedVideoOwner {
 pub struct RelatedVideoStat {
     pub view: Option<i64>,
     pub danmaku: Option<i64>,
+    #[serde(default, deserialize_with = "super::serde_util::lenient_optional_i64")]
+    pub reply: Option<i64>,
 }
 
 impl RelatedVideoItem {

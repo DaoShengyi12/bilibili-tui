@@ -42,6 +42,24 @@ where
     })
 }
 
+/// Read an optional display-only count sent as a number, a numeric string
+/// or `null`. Anything else is `None` instead of an error, so drift in a
+/// count never fails the whole response. Pair with `#[serde(default)]`.
+pub fn lenient_optional_i64<'de, D>(deserializer: D) -> std::result::Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::Number(value)) => value
+                .as_i64()
+                .or_else(|| value.as_f64().map(|value| value as i64)),
+            Some(serde_json::Value::String(value)) => value.trim().parse().ok(),
+            _ => None,
+        },
+    )
+}
+
 /// Decode a list item by item, skipping entries that no longer match `T`.
 ///
 /// A missing or `null` list is empty. A list whose every entry fails is an

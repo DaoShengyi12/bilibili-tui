@@ -1,3 +1,4 @@
+use super::video_card::format_count;
 use super::{Component, Theme, VideoCard, VideoCardGrid};
 use crate::api::{
     favorite::{FavoriteFolder, FavoriteOrder, FavoriteResourceData},
@@ -504,14 +505,6 @@ impl Component for UpPage {
             return Some(AppAction::OpenVideoDetail(bvid.clone(), aid));
         }
         Some(AppAction::None)
-    }
-}
-
-fn format_count(value: i64) -> String {
-    if value >= 10_000 {
-        format!("{:.1}万", value as f64 / 10_000.0)
-    } else {
-        value.to_string()
     }
 }
 
